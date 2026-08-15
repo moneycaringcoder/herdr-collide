@@ -47,11 +47,12 @@ expensive work happens, which is what keeps the comparison cheap as the number o
 In the sidebar, each workspace picks up a short badge next to its branch name:
 
 ```
-  api      feature/api    ✘ 2
-  ui       feature/ui     ✘ 2
-  docs     docs/readme    ⧉ 1
-  spike    spike/parser   ⚠ 4.1k
-  notes    notes/inbox
+  api       feature/api     ✘ 2
+  ui        feature/ui      ✘ 2
+  docs      docs/readme     ? 1
+  spike     spike/parser    ⚠ 4.2k
+  vendored  vendor/import   ? 1
+  deploy    chore/bump
 ```
 
 `✘ 2` means two files are predicted to conflict and `⧉ 1` means one file is shared but merges cleanly.
@@ -68,38 +69,46 @@ Worktrees are grouped by repository, and every pairing that shares anything is l
 ```
 collide · shared files
 
-repo /home/you/repos/app
-  api [feature/api] @claude  ✘ 2
-  ui [feature/ui] @codex  ✘ 2
-  docs [docs/readme] @claude  ⧉ 1
-  spike [spike/parser] @pi  ⚠ 4.1k
-  salvage [no branch] (no agent)
-      degraded: `wip/salvage` has no commits yet — unborn branch, so this
-      checkout has no commit and is not paired with its siblings.
+repo /tmp/collide-demo/app
+  api [feature/api] (no agent)  ✘ 2
+  app [main] (no agent)
+  docs [docs/readme] (no agent)  ? 1
+  salvage [wip/salvage] (no agent)
+      degraded: `wip/salvage` does not exist, so this checkout has no commit —
+      left out of pairing: there is nothing to merge against.
+  spike [spike/parser] (no agent)  runaway  ⚠ 4.2k
+  ui [feature/ui] (no agent)  ✘ 2
+  vendored [vendor/import] (no agent)  ? 1
+      degraded: no common ancestor with `refs/heads/main` — so there is no range
+      to measure against, and only uncommitted work is counted.
 
   api <-> ui
     ✘ conflict  src/collide.rs
     ✘ conflict  src/git.rs
     ⧉ overlap   src/model.rs
 
+  api <-> vendored
+    ? unknown   README.md
+
+  docs <-> vendored
+    ? unknown   README.md
+
   api <-> docs
     ⧉ overlap   README.md
-
-  ui <-> docs
-    ? unknown   …e-core/src/analysis/pairing/heuristics/very_long_module_name.rs
-
-repo /home/you/repos/infra
-  deploy [chore/bump] @codex
 
 legend
   ✘  conflict predicted on merge
   ⧉  same file, merges clean
   ?  conflict prediction unavailable
+  ⚠  runaway change set (f = files)
 ```
 
-Conflicts sort above overlaps, long paths are trimmed from the left so the informative tail survives,
-a checkout that could only be read in part says which part and why, and the view reflows down to very
-narrow panes.
+That block is a capture from a real run against a six-worktree fixture, not a mock-up — which is why
+`vendored` is there: it is an orphan branch with no common ancestor, so its pairings honestly say
+`? unknown` rather than guessing. Pairings sort worst first, long paths are trimmed from the left so
+the informative tail survives, a checkout that could only be read in part says which part and what
+follows from it, and the view reflows down to very narrow panes — at 40 columns the badge is the last
+thing given up, not the first.
 
 ## Install
 

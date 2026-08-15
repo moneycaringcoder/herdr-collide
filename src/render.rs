@@ -550,10 +550,12 @@ fn explain_reason(reason: &str) -> String {
             "left out of pairing: its HEAD is broken, so there is nothing to merge against"
         }
         git::DEGRADED_MISSING_BASE_REF => {
-            "the base ref does not resolve here, so only uncommitted work is counted"
+            "so the committed half of this change set could not be measured, and \
+             only uncommitted work is counted"
         }
         git::DEGRADED_NO_MERGE_BASE => {
-            "no common ancestor with the base ref, so only uncommitted work is counted"
+            "so there is no range to measure against, and only uncommitted work \
+             is counted"
         }
         git::DEGRADED_UNMERGED => {
             "this side is snapshotted with its conflict markers still in place, so any \
