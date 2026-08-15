@@ -17,7 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::model::{Checkout, FileVerdict, Pairing, RepoKey, Report, Severity, WorkspaceStatus};
+use crate::git;
+use crate::model::{
+    ChangeSet, Checkout, FileVerdict, Pairing, RepoKey, Report, Severity, WorkspaceStatus,
+};
 use crate::Result;
 
 /// A badge sits in the sidebar next to a branch name. Six display columns is
@@ -44,7 +47,9 @@ const NO_AGENT: &str = "(no agent)";
 /// `"    "` + mark + `" "` + an eight-column verdict word + `"  "`.
 const FILE_PREFIX_COLUMNS: usize = 16;
 
-const DEGRADED_NOTE: &str = "degraded: no branch reported for this checkout \u{2014} it is a \
+/// Last resort, used only when the report carries no change set at all for a
+/// checkout, so there is no reason code to explain.
+const NO_BRANCH_NOTE: &str = "degraded: no branch reported for this checkout \u{2014} it is a \
      detached HEAD, or the worktree branch lookup failed.";
 
 // ---------------------------------------------------------------------------
@@ -57,19 +62,21 @@ const DEGRADED_NOTE: &str = "degraded: no branch reported for this checkout \u{2
 /// A clean workspace renders the empty string, which the daemon treats as
 /// "clear the badge" rather than "write an empty badge".
 pub fn badge(status: &WorkspaceStatus) -> String {
-    let (mark, count) = match status.severity {
+    // A runaway is measured in change-set size, not in shared files: the whole
+    // point of the severity is a workspace that has grown huge on its own,
+    // usually sharing nothing at all with its siblings.
+    let (mark, magnitude) = match status.severity {
         Severity::Clean => return String::new(),
-        Severity::Conflict => (CONFLICT_MARK, status.conflict_count),
-        Severity::Runaway => (RUNAWAY_MARK, status.overlap_count),
-        Severity::Overlap => (OVERLAP_MARK, status.overlap_count),
+        Severity::Conflict => (CONFLICT_MARK, status.conflict_count as u64),
+        Severity::Runaway => (RUNAWAY_MARK, status.lines_changed),
+        Severity::Overlap => (OVERLAP_MARK, status.overlap_count as u64),
     };
 
-    // A runaway with nothing shared has no count worth printing; the mark alone
-    // is the whole message.
-    let text = if count == 0 {
+    // Zero has nothing to say; the mark alone is the whole message.
+    let text = if magnitude == 0 {
         mark.to_string()
     } else {
-        format!("{mark} {}", abbreviate(count as u64))
+        format!("{mark} {}", abbreviate(magnitude))
     };
 
     // Belt and braces: `abbreviate` is bounded at four columns, so this only
@@ -152,8 +159,8 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
         for checkout in &group {
             let status = status_by_id.get(checkout.workspace_id.as_str()).copied();
             push_line(&mut out, &worktree_line(checkout, status), width);
-            if checkout.branch.is_none() {
-                push_wrapped(&mut out, "      ", "      ", DEGRADED_NOTE, width);
+            for note in degraded_notes(report.change_set(&checkout.workspace_id), checkout) {
+                push_wrapped(&mut out, "      ", "      ", &note, width);
             }
         }
 
@@ -184,6 +191,27 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
                 display_label(&pairing.right_workspace_id, &checkout_by_id),
             );
             push_line(&mut out, &pair_head, width);
+
+            // A side with a merge in progress is snapshotted from files that
+            // still contain conflict markers, so every verdict below was
+            // computed against that. Saying "conflict" without saying that
+            // would be a warning the user cannot weigh.
+            for side in [&pairing.left_workspace_id, &pairing.right_workspace_id] {
+                if !is_unmerged(report.change_set(side)) {
+                    continue;
+                }
+                let label = display_label(side, &checkout_by_id);
+                push_wrapped(
+                    &mut out,
+                    "    ",
+                    "    ",
+                    &format!(
+                        "advisory: a merge is in progress in {label}, so these verdicts were \
+                         computed from a tree that still contains conflict markers."
+                    ),
+                    width,
+                );
+            }
 
             let mut files: Vec<&crate::model::SharedFile> = pairing.shared.iter().collect();
             // Conflicts first, then the ones we could not decide, then plain
@@ -291,6 +319,86 @@ fn worktree_line(checkout: &Checkout, status: Option<&WorkspaceStatus>) -> Strin
         }
     }
     line
+}
+
+/// Why this checkout could only be read in part, one note per reason.
+///
+/// `git` writes `degraded_reason` as `code: human text`, joined with `"; "`
+/// when there is more than one. The codes are the stable half, so each is
+/// matched and turned into a full explanation; git's own text is kept because
+/// it names the branch or ref involved. An unrecognised code falls through to
+/// git's text verbatim rather than being swallowed.
+fn degraded_notes(change_set: Option<&ChangeSet>, checkout: &Checkout) -> Vec<String> {
+    let Some(change_set) = change_set else {
+        // No change set at all: the only signal left is the missing branch.
+        return if checkout.branch.is_none() {
+            vec![NO_BRANCH_NOTE.to_string()]
+        } else {
+            Vec::new()
+        };
+    };
+
+    if !change_set.degraded {
+        return Vec::new();
+    }
+
+    let Some(reason) = change_set.degraded_reason.as_deref() else {
+        return vec!["degraded: this checkout could only be read in part.".to_string()];
+    };
+
+    reason
+        .split("; ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| format!("degraded: {}.", explain_reason(part)))
+        .collect()
+}
+
+/// Splits one `code: detail` reason and expands the code into a consequence the
+/// reader can act on.
+fn explain_reason(reason: &str) -> String {
+    let (code, detail) = match reason.split_once(": ") {
+        Some((code, detail)) => (code, detail.trim()),
+        None => (reason, ""),
+    };
+
+    let consequence = match code {
+        git::DEGRADED_UNBORN => {
+            "unborn branch, so this checkout has no commit and is not paired with its siblings"
+        }
+        git::DEGRADED_BROKEN_HEAD => {
+            "broken HEAD, so this checkout has no commit and is not paired with its siblings"
+        }
+        git::DEGRADED_MISSING_BASE_REF => {
+            "the base ref does not resolve here, so only uncommitted work is counted"
+        }
+        git::DEGRADED_NO_MERGE_BASE => {
+            "no common ancestor with the base ref, so only uncommitted work is counted"
+        }
+        git::DEGRADED_UNMERGED => {
+            "this side is snapshotted with its conflict markers still in place, so any \
+             prediction involving it is advisory"
+        }
+        // An unfamiliar code is still worth showing; it is git's own wording.
+        _ => return reason.to_string(),
+    };
+
+    if detail.is_empty() {
+        consequence.to_string()
+    } else {
+        format!("{detail} \u{2014} {consequence}")
+    }
+}
+
+fn is_unmerged(change_set: Option<&ChangeSet>) -> bool {
+    change_set
+        .and_then(|set| set.degraded_reason.as_deref())
+        .map(|reason| {
+            reason
+                .split("; ")
+                .any(|part| part.trim_start().starts_with(git::DEGRADED_UNMERGED))
+        })
+        .unwrap_or(false)
 }
 
 fn verdict_rank(verdict: FileVerdict) -> u8 {

@@ -278,6 +278,47 @@ impl Fixture {
         (a, b)
     }
 
+    /// A worktree stopped mid-merge, with an unmerged index and conflict
+    /// markers on disk. `write-tree` cannot run against the raw copied index in
+    /// this state, so it is the case the snapshot path has to survive.
+    pub fn merge_in_progress_worktree(&self, name: &str) -> PathBuf {
+        // Build the branch to merge in through a scratch worktree, then drop
+        // the worktree and keep the branch.
+        let source = self.root.join(format!("{name}-source"));
+        self.git(
+            &self.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("{name}-source"),
+                source.to_str().unwrap(),
+                "main",
+            ],
+        );
+        self.write(&source, "conflict.txt", "FROM-SOURCE\nbeta\ngamma\n");
+        self.commit_all(&source, "source edits line 1");
+        self.git(
+            &self.repo,
+            &["worktree", "remove", "--force", source.to_str().unwrap()],
+        );
+
+        let path = self.worktree(name, name);
+        self.write(&path, "conflict.txt", "FROM-TARGET\nbeta\ngamma\n");
+        self.commit_all(&path, "target edits line 1");
+        let (code, _out, _err) = self.try_git(
+            &path,
+            &["merge", "--no-edit", &format!("{name}-source")],
+        );
+        assert_ne!(code, 0, "the fixture merge was supposed to conflict");
+        assert!(
+            path.join(".git").exists(),
+            "worktree {name} lost its gitlink"
+        );
+        path
+    }
+
     /// Two worktrees that each added the same new path with different content.
     pub fn add_add_pair(&self) -> (PathBuf, PathBuf) {
         let a = self.worktree("addadd-a", "addadd-a");

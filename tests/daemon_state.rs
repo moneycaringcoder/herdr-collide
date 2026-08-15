@@ -4,6 +4,7 @@
 //! spawn a daemon: every case either short-circuits before the spawn or records
 //! a pid that is already live (our own test process).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,10 +12,34 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use collide::config::{self, Config, DEFAULT_BASE_REF, MAX_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS};
-use collide::daemon;
+use collide::daemon::{self, BadgeOp};
+use collide::model::{Severity, WorkspaceStatus};
 
 fn owned(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| arg.to_string()).collect()
+}
+
+fn status(
+    workspace_id: &str,
+    severity: Severity,
+    conflicts: usize,
+    overlaps: usize,
+) -> WorkspaceStatus {
+    WorkspaceStatus {
+        workspace_id: workspace_id.to_string(),
+        severity,
+        overlap_count: overlaps,
+        conflict_count: conflicts,
+        runaway: severity == Severity::Runaway,
+        lines_changed: 0,
+    }
+}
+
+fn lit(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(id, token)| (id.to_string(), token.to_string()))
+        .collect()
 }
 
 /// The state and config dirs come from process-global env vars, so these tests
@@ -247,6 +272,132 @@ fn interval_argument_overrides_the_default_and_is_clamped() {
     // A value the user typed themselves fails loudly, unlike a config file.
     assert!(config::load_with_args(&["--interval".to_string()]).is_err());
     assert!(config::load_with_args(&["--interval".to_string(), "soon".to_string()]).is_err());
+}
+
+#[test]
+fn a_severity_flip_clears_the_old_token_before_setting_the_new_one() {
+    // Tokens are a merge patch, so a name we do not mention stays lit. Without
+    // the clear, herdr renders two badges for one workspace.
+    let plan = daemon::badge_plan(
+        &lit(&[("w6", "collide_overlap")]),
+        &[status("w6", Severity::Conflict, 2, 0)],
+    );
+
+    match plan.as_slice() {
+        [BadgeOp::Clear {
+            workspace_id,
+            token,
+        }, BadgeOp::Set {
+            workspace_id: set_id,
+            token: set_token,
+            text,
+        }] => {
+            assert_eq!(workspace_id, "w6");
+            assert_eq!(token, "collide_overlap");
+            assert_eq!(set_id, "w6");
+            assert_eq!(*set_token, "collide_conflict");
+            // Text is render::badge's to author; the daemon only carries it.
+            assert_eq!(text, "\u{2718} 2");
+        }
+        other => panic!("expected clear-then-set, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unchanged_severity_is_re_set_so_the_ttl_never_lapses() {
+    let plan = daemon::badge_plan(
+        &lit(&[("w6", "collide_conflict")]),
+        &[status("w6", Severity::Conflict, 2, 0)],
+    );
+
+    assert_eq!(
+        plan,
+        vec![BadgeOp::Set {
+            workspace_id: "w6".to_string(),
+            token: "collide_conflict",
+            text: "\u{2718} 2".to_string(),
+        }],
+        "no redundant clear, but the write still refreshes the TTL"
+    );
+}
+
+#[test]
+fn a_clean_workspace_is_cleared_rather_than_given_an_empty_badge() {
+    // render::badge renders clean as the empty string, and an empty token value
+    // would occupy the sidebar row with nothing at all.
+    let plan = daemon::badge_plan(
+        &lit(&[("w6", "collide_conflict")]),
+        &[status("w6", Severity::Clean, 0, 0)],
+    );
+
+    assert_eq!(
+        plan,
+        vec![BadgeOp::Clear {
+            workspace_id: "w6".to_string(),
+            token: "collide_conflict".to_string(),
+        }]
+    );
+
+    // And a workspace that was never lit costs no calls at all.
+    assert!(daemon::badge_plan(&HashMap::new(), &[status("w6", Severity::Clean, 0, 0)]).is_empty());
+}
+
+#[test]
+fn a_workspace_that_left_the_report_is_cleared() {
+    let plan = daemon::badge_plan(
+        &lit(&[("w6", "collide_conflict"), ("w7", "collide_overlap")]),
+        &[status("w6", Severity::Conflict, 1, 0)],
+    );
+
+    assert!(
+        plan.contains(&BadgeOp::Clear {
+            workspace_id: "w7".to_string(),
+            token: "collide_overlap".to_string(),
+        }),
+        "a closed workspace must not keep its badge until the TTL expires: {plan:?}"
+    );
+    // w6 is still reported, so it is refreshed rather than cleared.
+    assert!(!plan.contains(&BadgeOp::Clear {
+        workspace_id: "w6".to_string(),
+        token: "collide_conflict".to_string(),
+    }));
+}
+
+#[test]
+fn one_workspaces_severity_does_not_disturb_another() {
+    let plan = daemon::badge_plan(
+        &lit(&[("w6", "collide_overlap")]),
+        &[
+            status("w6", Severity::Conflict, 1, 0),
+            status("w7", Severity::Overlap, 0, 3),
+            status("w8", Severity::Clean, 0, 0),
+        ],
+    );
+
+    let sets: Vec<&BadgeOp> = plan
+        .iter()
+        .filter(|op| matches!(op, BadgeOp::Set { .. }))
+        .collect();
+    assert_eq!(sets.len(), 2, "clean draws nothing, the other two draw");
+    assert!(!plan.iter().any(|op| matches!(
+        op,
+        BadgeOp::Clear { workspace_id, .. } if workspace_id == "w7" || workspace_id == "w8"
+    )));
+}
+
+#[test]
+fn only_notes_that_are_new_since_the_last_cycle_are_reported() {
+    // A note repeats every cycle for as long as its cause lasts, and at a 5s
+    // interval that is a wall of identical lines.
+    let previous = owned(&["w1: not a repo", "w2: timed out"]);
+    let current = owned(&["w1: not a repo", "w3: prediction failed"]);
+
+    assert_eq!(
+        daemon::new_notes(&previous, &current),
+        owned(&["w3: prediction failed"])
+    );
+    assert!(daemon::new_notes(&current, &current).is_empty());
+    assert_eq!(daemon::new_notes(&[], &current), current);
 }
 
 #[test]

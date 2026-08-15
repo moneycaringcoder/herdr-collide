@@ -1112,6 +1112,51 @@ impl Drop for Predictor {
     }
 }
 
+/// Removes scratch directories left behind by collide processes that are no
+/// longer running.
+///
+/// `Predictor::drop` is the normal cleanup path, but a SIGKILLed daemon never
+/// runs it. Each scratch directory is named `collide-<pid>-<seq>`, so a
+/// directory whose pid is gone is provably garbage. Directories belonging to a
+/// live process — including this one, and including a concurrently running
+/// second collide — are never touched.
+pub fn sweep_scratch() {
+    let root = config::state_dir().join("scratch");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let self_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("collide-") else {
+            continue;
+        };
+        let Some(Ok(pid)) = rest.split('-').next().map(str::parse::<u32>) else {
+            continue;
+        };
+        if pid == self_pid || process_is_alive(pid) {
+            continue;
+        }
+        let _ = fs::remove_dir_all(entry.path());
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // Signal 0 performs the permission and existence checks without delivering
+    // anything. EPERM means the process exists but belongs to someone else, so
+    // only ESRCH proves it is gone.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    // Without a portable liveness check, never reclaim: leaking a scratch
+    // directory is strictly better than deleting a live run's objects.
+    true
+}
+
 /// A temp index that removes itself, `.lock` sibling included. git leaves an
 /// `index.lock` behind if it dies mid-write, and a stale lock next to a temp
 /// index would break the next snapshot that happened to reuse the name.

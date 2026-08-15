@@ -22,13 +22,15 @@ In the sidebar, each workspace picks up a short badge next to its branch name:
   api      feature/api    ✘ 2
   ui       feature/ui     ✘ 2
   docs     docs/readme    ⧉ 1
-  spike    spike/parser   ⚠
+  spike    spike/parser   ⚠ 4.1k
   notes    notes/inbox
 ```
 
-`✘ 2` means two files are predicted to conflict, `⧉ 1` means one file is shared but merges cleanly, and
-`⚠` marks a runaway change set. A clean workspace shows nothing at all. Counts abbreviate once they get
-long — `1.2k`, `12k`, `1.2M` — so a badge never grows wide enough to push the branch name off the row.
+`✘ 2` means two files are predicted to conflict and `⧉ 1` means one file is shared but merges cleanly.
+`⚠ 4.1k` is a runaway: 4100 changed lines in one worktree, which is a count of the change set rather
+than of shared files — a runaway agent is usually one that shares nothing with anybody. A clean
+workspace shows nothing at all. Numbers abbreviate once they get long — `1.2k`, `12k`, `1.2M` — so a
+badge never grows wide enough to push the branch name off the row.
 
 The full picture lives in the **Collide: shared files** overlay pane, which redraws on an interval:
 
@@ -37,12 +39,17 @@ collide · shared files
 
 repo /home/you/repos/app
   api [feature/api] @claude  ✘ 2
+      degraded: a merge is in progress — this side is snapshotted with its
+      conflict markers still in place, so any prediction involving it is
+      advisory.
   salvage [no branch] (no agent)
-      degraded: no branch reported for this checkout — it is a detached HEAD, or
-      the worktree branch lookup failed.
+      degraded: `wip/salvage` has no commits yet — unborn branch, so this
+      checkout has no commit and is not paired with its siblings.
   ui [feature/ui] @codex  ✘ 2
 
   api <-> ui
+    advisory: a merge is in progress in api, so these verdicts were computed
+    from a tree that still contains conflict markers.
     ✘ conflict  src/collide.rs
     ✘ conflict  src/git.rs
     ? unknown   …e-core/src/analysis/pairing/heuristics/very_long_module_name.rs
@@ -55,7 +62,8 @@ legend
 ```
 
 Conflicts sort above overlaps, long paths are trimmed from the left so the informative tail survives,
-and the view reflows down to very narrow panes.
+a checkout that could only be read in part says which part and why, and the view reflows down to very
+narrow panes.
 
 ## Install
 
@@ -199,7 +207,8 @@ badge down.
 - **`interval_seconds`** — how often the badge updater and the detail pane refresh. Default 5, clamped
   to 1–3600. `--interval <SECS>` overrides it for a single run.
 - **`runaway_files`** / **`runaway_lines`** — a workspace is flagged as a runaway once its change set
-  passes either threshold. Defaults 40 files and 2000 changed lines.
+  passes either threshold. Defaults 40 files and 2000 changed lines. The badge reports the changed-line
+  count, so `runaway_lines` is also the number the `⚠` badge is measured against.
 - **`ignore_suffixes`** — paths ending in any of these never count as a change. Lockfiles overlap
   constantly and mean nothing, so they are excluded by default. Setting the key replaces the whole
   list rather than adding to it.
@@ -240,17 +249,20 @@ Worth knowing before you trust it:
   not before. A five-second badge is a five-second-old badge.
 - **Conflict prediction is a prediction.** It merges the two sides' current state in a temporary index
   and reports what git says *now*. Commit, rebase, or keep typing and the answer can change. A worktree
-  with a merge already in progress is trickier still: its snapshot can contain conflict markers, so
-  treat those results as advisory.
+  with a merge already in progress is trickier still: its snapshot is staged from files that still
+  contain conflict markers. The detail pane labels those pairings `advisory:` and names the side
+  responsible, rather than presenting the verdict as if the trees were clean.
 - **Lockfiles are ignored by default.** `Cargo.lock`, `package-lock.json`, and friends overlap in
   almost every pair of worktrees and almost never mean anything. If you want them counted, override
   `ignore_suffixes`.
 - **Non-UTF-8 paths are rendered lossily.** Git reports raw bytes; anything that is not valid UTF-8 is
   replaced before display, so such a path may render differently from how it appears on disk.
-- **A checkout can be readable only in part.** A detached HEAD, an unborn branch, or a branch deleted
-  underneath a worktree limits what can be compared. Rather than quietly reporting such a checkout as
-  clean, the detail pane marks it degraded and says so, and a pair whose prediction could not run is
-  shown as `? unknown` instead of being downgraded to a plain overlap.
+- **A checkout can be readable only in part.** An unborn branch, a branch deleted underneath a
+  worktree, a base ref that does not resolve, or two histories with no common ancestor all limit what
+  can be compared. Rather than quietly reporting such a checkout as clean, the detail pane marks it
+  `degraded:` and states which of those it was and what the consequence is — excluded from pairing, or
+  counted on uncommitted work only. A pair whose prediction could not run is shown as `? unknown`
+  instead of being downgraded to a plain overlap.
 - **Linux and macOS only.** The daemon relies on Unix process and signal behaviour, and the plugin
   declares those two platforms.
 - **Repository identity across linked worktrees is observed rather than specified.** It holds for

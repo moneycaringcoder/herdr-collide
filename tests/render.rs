@@ -16,6 +16,9 @@ use collide::model::{
     SharedFile, WorkspaceStatus,
 };
 use collide::render::{abbreviate, badge, detail, detail_at, BADGE_COLUMNS};
+// Only the degradation reason codes: the tests build the strings git would
+// write, so that a renamed code fails here rather than silently rendering raw.
+use collide::git;
 
 // ---------------------------------------------------------------------------
 // Test-local display width
@@ -101,6 +104,24 @@ fn status(id: &str, severity: Severity, overlaps: usize, conflicts: usize) -> Wo
     }
 }
 
+/// A runaway is measured in changed lines, so it needs its own constructor.
+fn runaway(id: &str, lines_changed: u64) -> WorkspaceStatus {
+    WorkspaceStatus {
+        lines_changed,
+        ..status(id, Severity::Runaway, 0, 0)
+    }
+}
+
+/// A change set that carries nothing but a degradation reason, in the
+/// `code: detail` form `git::change_set` writes.
+fn degraded(reason: &str) -> ChangeSet {
+    ChangeSet {
+        degraded: true,
+        degraded_reason: Some(reason.to_string()),
+        ..ChangeSet::default()
+    }
+}
+
 fn shared(path: &str, verdict: FileVerdict) -> SharedFile {
     SharedFile {
         path: path.to_string(),
@@ -162,7 +183,27 @@ fn a_clean_workspace_renders_no_badge() {
 fn each_severity_gets_its_own_mark() {
     assert_eq!(badge(&status("w", Severity::Overlap, 3, 0)), "\u{29c9} 3");
     assert_eq!(badge(&status("w", Severity::Conflict, 5, 2)), "\u{2718} 2");
-    assert_eq!(badge(&status("w", Severity::Runaway, 4, 0)), "\u{26a0} 4");
+    // A runaway counts changed lines, not shared files.
+    assert_eq!(badge(&runaway("w", 4_100)), "\u{26a0} 4.1k");
+}
+
+#[test]
+fn a_runaway_reports_change_set_size_not_shared_files() {
+    // The severity exists to catch a workspace that has grown huge on its own,
+    // which is usually one sharing nothing at all with its siblings. Reporting
+    // its overlap count would print `⚠ 0` for exactly the case it is for.
+    let alone = WorkspaceStatus {
+        lines_changed: 4_100,
+        ..status("w", Severity::Runaway, 0, 0)
+    };
+    assert_eq!(badge(&alone), "\u{26a0} 4.1k");
+
+    // And where both numbers exist, the size is the one that shows.
+    let sharing = WorkspaceStatus {
+        lines_changed: 12_000,
+        ..status("w", Severity::Runaway, 4, 0)
+    };
+    assert_eq!(badge(&sharing), "\u{26a0} 12k");
 }
 
 #[test]
@@ -179,9 +220,9 @@ fn the_badge_carries_no_colour() {
 
 #[test]
 fn a_severity_with_no_count_renders_the_mark_alone() {
-    // A runaway is about change-set size, so it can be flagged with nothing
-    // shared. Printing `⚠ 0` would read as "zero problems".
-    assert_eq!(badge(&status("w", Severity::Runaway, 0, 0)), "\u{26a0}");
+    // Printing `⚠ 0` would read as "zero problems", which is the opposite of
+    // what the mark is there to say.
+    assert_eq!(badge(&runaway("w", 0)), "\u{26a0}");
     assert_eq!(badge(&status("w", Severity::Conflict, 0, 0)), "\u{2718}");
 }
 
@@ -213,6 +254,7 @@ fn abbreviation_reaches_the_badge() {
         badge(&status("w", Severity::Conflict, 0, 4_100)),
         "\u{2718} 4.1k"
     );
+    assert_eq!(badge(&runaway("w", 1_200_000)), "\u{26a0} 1.2M");
 }
 
 #[test]
@@ -245,7 +287,13 @@ fn the_badge_never_exceeds_its_column_budget() {
         Severity::Conflict,
     ] {
         for count in counts {
-            let text = badge(&status("w", severity, count, count));
+            // Every numeric field at once, so no severity can read a field
+            // that was left at zero and pass by accident.
+            let status = WorkspaceStatus {
+                lines_changed: count as u64,
+                ..status("w", severity, count, count)
+            };
+            let text = badge(&status);
             assert!(
                 columns(&text) <= BADGE_COLUMNS,
                 "badge {text:?} is {} columns for {severity:?}/{count}",
@@ -309,7 +357,16 @@ fn each_worktree_shows_its_branch_and_agent() {
 
 #[test]
 fn a_degraded_checkout_says_why() {
-    let text = detail(&report());
+    let mut report = report();
+    report.changes.push((
+        "w3".to_string(),
+        degraded(&format!(
+            "{}: `wip/salvage` has no commits yet",
+            git::DEGRADED_UNBORN
+        )),
+    ));
+
+    let text = detail(&report);
     let worktree = line_index(&text, "salvage [no branch]");
     let note = line_index(&text, "degraded:");
     assert_eq!(
@@ -317,8 +374,122 @@ fn a_degraded_checkout_says_why() {
         worktree + 1,
         "the reason follows the worktree it explains"
     );
-    assert!(flatten(&text).contains("detached HEAD"), "{text}");
-    assert!(flatten(&text).contains("branch lookup failed"), "{text}");
+
+    let flat = flatten(&text);
+    // git's own wording survives, because it names the branch involved...
+    assert!(flat.contains("`wip/salvage` has no commits yet"), "{text}");
+    // ...and the consequence is spelled out rather than left to the reader.
+    assert!(flat.contains("unborn branch"), "{text}");
+    assert!(flat.contains("not paired with its siblings"), "{text}");
+    // The machine-readable code itself is not user-facing text.
+    assert!(!text.contains(git::DEGRADED_UNBORN), "{text}");
+}
+
+#[test]
+fn every_degradation_code_gets_a_real_explanation() {
+    // Each code must produce a distinct explanation. A missing arm would fall
+    // through to git's raw text, which reads as an internal error string.
+    let cases = [
+        (git::DEGRADED_UNBORN, "no commit"),
+        (git::DEGRADED_BROKEN_HEAD, "no commit"),
+        (git::DEGRADED_MISSING_BASE_REF, "only uncommitted work"),
+        (git::DEGRADED_NO_MERGE_BASE, "only uncommitted work"),
+        (git::DEGRADED_UNMERGED, "advisory"),
+    ];
+
+    for (code, expected) in cases {
+        let mut report = report();
+        report
+            .changes
+            .push(("w3".to_string(), degraded(&format!("{code}: some detail"))));
+        let flat = flatten(&detail(&report));
+        assert!(
+            flat.contains("some detail"),
+            "{code}: git's detail was dropped"
+        );
+        assert!(flat.contains(expected), "{code}: no explanation in {flat}");
+        assert!(!flat.contains(code), "{code}: raw code reached the view");
+    }
+}
+
+#[test]
+fn several_reasons_each_get_their_own_note() {
+    let mut report = report();
+    report.changes.push((
+        "w3".to_string(),
+        degraded(&format!(
+            "{}: a merge is in progress; {}: `origin/HEAD` does not resolve",
+            git::DEGRADED_UNMERGED,
+            git::DEGRADED_MISSING_BASE_REF
+        )),
+    ));
+    let text = detail(&report);
+    assert_eq!(
+        text.matches("degraded:").count(),
+        2,
+        "both reasons must be shown:\n{text}"
+    );
+}
+
+#[test]
+fn an_unrecognised_reason_is_shown_verbatim_rather_than_swallowed() {
+    let mut report = report();
+    report.changes.push((
+        "w3".to_string(),
+        degraded("some-future-code: a thing we do not know about yet"),
+    ));
+    let flat = flatten(&detail(&report));
+    assert!(flat.contains("a thing we do not know about yet"), "{flat}");
+}
+
+#[test]
+fn a_merge_in_progress_marks_the_pairing_advisory() {
+    // A conflict warning computed from a tree full of conflict markers is not
+    // the same claim as one computed from clean trees, and the user cannot
+    // weigh it unless the view says so.
+    let mut report = report();
+    report.changes.push((
+        "w1".to_string(),
+        degraded(&format!(
+            "{}: a merge is in progress",
+            git::DEGRADED_UNMERGED
+        )),
+    ));
+
+    let text = detail(&report);
+    let flat = flatten(&text);
+    assert!(flat.contains("advisory:"), "{text}");
+    assert!(flat.contains("conflict markers"), "{text}");
+    assert!(flat.contains("merge is in progress in api"), "{text}");
+
+    // It belongs with the pairing it qualifies, above the verdicts it qualifies.
+    let pair = line_index(&text, "api <-> ui");
+    let advisory = line_index(&text, "advisory:");
+    let first_verdict = line_index(&text, "src/collide.rs");
+    assert!(pair < advisory && advisory < first_verdict, "{text}");
+}
+
+#[test]
+fn a_clean_pairing_gets_no_advisory() {
+    let mut report = report();
+    report.changes.push((
+        "w1".to_string(),
+        degraded(&format!(
+            "{}: `origin/HEAD` gone",
+            git::DEGRADED_MISSING_BASE_REF
+        )),
+    ));
+    assert!(!detail(&report).contains("advisory:"));
+}
+
+#[test]
+fn a_checkout_with_no_change_set_falls_back_to_the_missing_branch() {
+    // The base fixture carries no change sets at all, which is what the daemon
+    // produces when the whole git pass failed.
+    let text = detail(&report());
+    let flat = flatten(&text);
+    assert!(flat.contains("detached HEAD"), "{text}");
+    assert!(flat.contains("branch lookup failed"), "{text}");
 }
 
 #[test]
@@ -326,8 +497,13 @@ fn a_healthy_checkout_gets_no_degraded_note() {
     let mut report = report();
     report.checkouts.retain(|c| c.branch.is_some());
     report.statuses.retain(|s| s.workspace_id != "w3");
+    // A change set that is present and fine must not produce a note either.
+    report
+        .changes
+        .push(("w1".to_string(), ChangeSet::default()));
     let text = detail(&report);
     assert!(!text.contains("degraded:"), "{text}");
+    assert!(!text.contains("advisory:"), "{text}");
 }
 
 #[test]

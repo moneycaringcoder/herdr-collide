@@ -80,8 +80,23 @@ impl Herdr {
     /// One `session.snapshot` call, reduced to the git-backed workspaces.
     /// Workspaces with no `worktree` key are not repos and are skipped.
     pub fn checkouts(&mut self) -> Result<Vec<Checkout>> {
-        let snapshot = self.call("session.snapshot", json!({}))?;
-        Ok(reduce_snapshot(&snapshot))
+        let result = self.call("session.snapshot", json!({}))?;
+        // The payload is `{"type":"session_snapshot","snapshot":{...}}`; the
+        // arrays live one level down, under `snapshot`. Verified against a live
+        // 0.8.0 server — reading them off the result object silently yields no
+        // workspaces at all, which looks exactly like an idle session.
+        //
+        // Absent `snapshot` is an error rather than a fallback: an empty
+        // checkout list is indistinguishable from an idle session, so a
+        // protocol change here would make the plugin quietly report nothing at
+        // all instead of failing.
+        let snapshot = result.get("snapshot").ok_or_else(|| {
+            format!(
+                "session.snapshot returned no `snapshot` object (result type `{}`)",
+                text(&result, "type").unwrap_or("missing")
+            )
+        })?;
+        Ok(reduce_snapshot(snapshot))
     }
 
     /// Sets one badge token on a workspace, with a TTL so it self-clears if
@@ -252,7 +267,10 @@ fn reduce_snapshot(snapshot: &Value) -> Vec<Checkout> {
         }
     };
     for agent in array(snapshot, "agents") {
-        let name = text(agent, "name").or_else(|| text(agent, "agent_session"));
+        // `name` is the user's own label for the agent ("gitsmith"); `agent` is
+        // the program ("claude"). `agent_session` is an object on the wire, not
+        // a string, so it is no use as a display name.
+        let name = text(agent, "name").or_else(|| text(agent, "agent"));
         record_agent(text(agent, "workspace_id"), name);
     }
     for pane in array(snapshot, "panes") {

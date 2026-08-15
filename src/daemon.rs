@@ -100,7 +100,25 @@ pub fn run(config: &Config) -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     spawn_signal_thread(Arc::clone(&active), Arc::clone(&stopping))?;
 
+    // A daemon that is SIGKILLed never runs `Predictor::drop`, and unlike a
+    // one-shot run it gets killed often enough for the leftovers to add up.
+    crate::git::sweep_scratch();
+
+    // gather_for derives its own integration ref (collide.rs calls
+    // git::integration_ref per checkout), so a configured base_ref does not
+    // reach git yet. Say so once rather than letting the setting look effective.
+    if config.base_ref != config::DEFAULT_BASE_REF {
+        eprintln!(
+            "collide: base_ref `{}` is not honoured yet — the analysis pass derives its own \
+             integration ref",
+            config.base_ref
+        );
+    }
+
     let mut client: Option<Herdr> = None;
+    // Notes repeat every cycle for as long as their cause lasts, so only the
+    // ones that are new since the last cycle are worth printing.
+    let mut reported_notes: Vec<String> = Vec::new();
     loop {
         if stopping.load(Ordering::SeqCst) {
             // The signal thread owns shutdown from here: it clears state over
@@ -119,7 +137,7 @@ pub fn run(config: &Config) -> Result<()> {
             }
         }
         if let Some(connected) = client.as_mut() {
-            if let Err(err) = refresh(connected, config, &active) {
+            if let Err(err) = refresh(connected, config, &active, &mut reported_notes) {
                 eprintln!("collide: refresh failed: {err}");
                 // Only a transport failure is worth redialling for; an error
                 // envelope means the server is fine and answered us.
@@ -133,87 +151,173 @@ pub fn run(config: &Config) -> Result<()> {
     }
 }
 
-/// One cycle: snapshot, analyse, push.
+/// One cycle: snapshot, gather, push.
+///
+/// The gathering is `collide::gather_for` rather than a hand-rolled
+/// `change_set` + `analyse` pass. `analyse` alone deliberately leaves every
+/// shared file `Unknown` when `predict_conflicts` is set and expects the caller
+/// to run predictions and fold them back through `apply_predictions`; a caller
+/// that skips that step can escalate a badge to overlap but never to conflict,
+/// which is the entire headline feature. `gather_for` also re-derives repo
+/// identity from git, so two checkouts are only compared when their
+/// `--git-common-dir` really matches.
+///
+/// `gather_for` rather than `gather` because `gather` opens its own socket
+/// connection: this way the daemon keeps one client, its retry, and its ability
+/// to tell a transport failure from an error envelope.
 fn refresh(
     client: &mut Herdr,
     config: &Config,
     active: &Mutex<HashMap<String, String>>,
+    reported_notes: &mut Vec<String>,
 ) -> Result<()> {
     let checkouts = client.checkouts()?;
+    let cycle = crate::collide::gather_for(checkouts, config)?;
 
-    let mut changes = Vec::with_capacity(checkouts.len());
-    for checkout in &checkouts {
-        match crate::git::change_set(
-            &checkout.checkout_path,
-            &config.base_ref,
-            config.git_timeout,
-        ) {
-            Ok(change_set) => changes.push((checkout.workspace_id.clone(), change_set)),
-            // One unreadable repo must not blank every other workspace's badge.
-            Err(err) => eprintln!(
-                "collide: change set for {} failed: {err}",
-                checkout.checkout_path.display()
-            ),
-        }
+    for note in new_notes(reported_notes, &cycle.notes) {
+        eprintln!("collide: {note}");
     }
+    reported_notes.clone_from(&cycle.notes);
 
-    let report = crate::collide::analyse(&checkouts, &changes, config);
-    push(client, config, &report, active);
+    push(client, config, &cycle.report.statuses, active);
     Ok(())
 }
 
-/// Pushes one cycle's statuses. Errors are reported per workspace and the cycle
-/// continues: a swallowed push failure renders as a blank badge with nothing to
-/// debug, and one bad workspace must not cost every other one its badge.
-fn push(
-    client: &mut Herdr,
-    config: &Config,
-    report: &crate::model::Report,
-    active: &Mutex<HashMap<String, String>>,
-) {
-    let ttl_ms = config.ttl_ms();
-    let mut lit: HashMap<String, String> = HashMap::new();
+/// Notes that were not already reported on the previous cycle. A note repeats
+/// for as long as its cause lasts — a workspace that is not a repo produces one
+/// every 5 seconds — so only the new ones are worth printing.
+pub fn new_notes(previous: &[String], current: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|note| !previous.contains(note))
+        .cloned()
+        .collect()
+}
 
-    for status in &report.statuses {
+/// One badge call to make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BadgeOp {
+    Clear {
+        workspace_id: String,
+        token: String,
+    },
+    Set {
+        workspace_id: String,
+        token: &'static str,
+        text: String,
+    },
+}
+
+/// Turns "what is lit now" plus "what this cycle found" into the calls that
+/// close the gap. Pure, so the ordering rules below are testable without a
+/// socket:
+///
+/// * A severity flip clears the old token name *before* setting the new one.
+///   Tokens are a merge patch, so an unmentioned name stays lit and herdr would
+///   render two badges for one workspace.
+/// * `render::badge` is the single author of badge text, and it renders a clean
+///   workspace as the empty string. An empty value is a clear, never a draw:
+///   setting it would occupy the row with nothing.
+/// * A workspace that dropped out of the report — closed, or no longer a repo —
+///   is cleared rather than left to expire.
+pub fn badge_plan(
+    active: &HashMap<String, String>,
+    statuses: &[crate::model::WorkspaceStatus],
+) -> Vec<BadgeOp> {
+    let mut ops = Vec::new();
+    let mut wanted: HashMap<&str, &'static str> = HashMap::new();
+
+    for status in statuses {
+        let text = crate::render::badge(status);
         let token = status.severity.token_name();
-        let previous = lock(active).get(&status.workspace_id).cloned();
-        if previous.as_deref() != Some(token) {
-            if let Some(previous) = previous {
-                report_error(
-                    client.clear_badge(&status.workspace_id, &previous),
-                    &status.workspace_id,
-                    &previous,
-                    "clear",
-                );
+        let previous = active.get(&status.workspace_id).map(String::as_str);
+        let next = if text.is_empty() { None } else { Some(token) };
+
+        if let Some(previous) = previous {
+            if Some(previous) != next {
+                ops.push(BadgeOp::Clear {
+                    workspace_id: status.workspace_id.clone(),
+                    token: previous.to_string(),
+                });
             }
         }
-        // `render::badge` is the single author of badge text; a clean status
-        // renders empty, which the loop below treats as "clear", never "draw".
-        let text = crate::render::badge(status);
-        if report_error(
-            client.set_badge(&status.workspace_id, token, &text, ttl_ms),
-            &status.workspace_id,
-            token,
-            "set",
-        ) {
-            lit.insert(status.workspace_id.clone(), token.to_string());
+        if let Some(token) = next {
+            wanted.insert(status.workspace_id.as_str(), token);
+            ops.push(BadgeOp::Set {
+                workspace_id: status.workspace_id.clone(),
+                token,
+                // Re-sent every cycle even when unchanged: the TTL is what makes
+                // the badge self-heal, and it only refreshes on a write.
+                text,
+            });
         }
     }
 
-    // Workspaces that dropped out of the report (closed, or no longer a repo)
-    // keep their badge until the TTL expires unless we clear it now.
-    let stale: Vec<(String, String)> = lock(active)
+    let mut stale: Vec<(&String, &String)> = active
         .iter()
-        .filter(|(workspace_id, _)| !lit.contains_key(*workspace_id))
-        .map(|(workspace_id, token)| (workspace_id.clone(), token.clone()))
+        .filter(|(workspace_id, _)| !wanted.contains_key(workspace_id.as_str()))
+        .filter(|(workspace_id, _)| {
+            // Already cleared above by the severity-flip branch.
+            !statuses.iter().any(|s| &s.workspace_id == *workspace_id)
+        })
         .collect();
+    // A HashMap iterates in an arbitrary order; sorting keeps the plan
+    // reproducible for both tests and logs.
+    stale.sort();
     for (workspace_id, token) in stale {
-        report_error(
-            client.clear_badge(&workspace_id, &token),
-            &workspace_id,
-            &token,
-            "clear",
-        );
+        ops.push(BadgeOp::Clear {
+            workspace_id: workspace_id.clone(),
+            token: token.clone(),
+        });
+    }
+
+    ops
+}
+
+/// Executes a badge plan. Errors are reported per call and the cycle continues:
+/// a swallowed push failure renders as a blank badge with nothing to debug, and
+/// one bad workspace must not cost every other one its badge.
+fn push(
+    client: &mut Herdr,
+    config: &Config,
+    statuses: &[crate::model::WorkspaceStatus],
+    active: &Mutex<HashMap<String, String>>,
+) {
+    let ttl_ms = config.ttl_ms();
+    let plan = badge_plan(&lock(active).clone(), statuses);
+    let mut lit: HashMap<String, String> = HashMap::new();
+
+    for op in plan {
+        match op {
+            BadgeOp::Clear {
+                workspace_id,
+                token,
+            } => {
+                // A failed clear is forgotten rather than retried next cycle:
+                // the TTL expires it within three cycles anyway, and retrying
+                // forever would hammer a workspace that no longer exists.
+                report_error(
+                    client.clear_badge(&workspace_id, &token),
+                    &workspace_id,
+                    &token,
+                    "clear",
+                );
+            }
+            BadgeOp::Set {
+                workspace_id,
+                token,
+                text,
+            } => {
+                if report_error(
+                    client.set_badge(&workspace_id, token, &text, ttl_ms),
+                    &workspace_id,
+                    token,
+                    "set",
+                ) {
+                    lit.insert(workspace_id, token.to_string());
+                }
+            }
+        }
     }
 
     *lock(active) = lit;
