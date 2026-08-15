@@ -224,7 +224,17 @@ fn a_path_with_a_newline_is_neutralised_but_not_split() {
 fn two_different_non_utf8_paths_do_not_collapse_into_one() {
     let fixture = Fixture::new("non-utf8");
     let wt = fixture.worktree("wt", "wt");
-    let (first, second) = fixture.distinct_invalid_utf8_untracked(&wt);
+    let Some((first, second)) = fixture.distinct_invalid_utf8_untracked(&wt) else {
+        // APFS and HFS+ enforce valid UTF-8 in filenames, so on macOS these two
+        // files cannot exist and the collision this guards against cannot
+        // arise. The byte-level half of the same guarantee is covered
+        // everywhere by `the_digest_distinguishes_two_paths_from_captured_bytes`.
+        eprintln!(
+            "skipped: this filesystem refuses invalid UTF-8 filenames, \
+             so the on-disk half of this case cannot be built here"
+        );
+        return;
+    };
     assert_ne!(first, second);
 
     let bytes = status_bytes(&fixture, &wt, false);
@@ -806,4 +816,38 @@ fn repo_key_is_shared_by_worktrees_and_differs_across_repos() {
 
     assert_eq!(main_key, wt_key, "worktrees of one repo share a key");
     assert_ne!(main_key, foreign_key);
+}
+
+/// The platform-independent half of the case above.
+///
+/// macOS refuses to create a file whose name is not valid UTF-8, so the on-disk
+/// test cannot run there — but the parser is the part that has to get this
+/// right, and it can be driven from bytes directly. These are real
+/// `status --porcelain=v2 -z -uall` bytes, captured on ext4 from a worktree
+/// holding `\xff.txt` and `\xfe.txt`: two files whose names differ only in the
+/// byte that has to be replaced.
+#[test]
+fn the_digest_distinguishes_two_paths_from_captured_bytes() {
+    let captured: &[u8] = b"? \xfe.txt\0? \xff.txt\0";
+
+    let rendered = paths_of(&parse_status_v2(captured));
+    assert_eq!(rendered.len(), 2, "{rendered:?}");
+    assert!(
+        rendered.iter().all(|p| p.contains('\u{FFFD}')),
+        "the invalid byte must be replaced for display: {rendered:?}"
+    );
+    assert_ne!(
+        rendered[0], rendered[1],
+        "two different files rendered as one path, so they would be reported as \
+         shared when neither worktree has the other's file: {rendered:?}"
+    );
+
+    // Stable across calls, or `status` output and `merge-tree` output would
+    // stop matching each other for the same file.
+    assert_eq!(paths_of(&parse_status_v2(captured)), rendered);
+
+    // And a path that needs no replacement is left completely alone — the
+    // disambiguating suffix must not appear on ordinary names.
+    let plain = paths_of(&parse_status_v2(b"? src/main.rs\0"));
+    assert_eq!(plain, vec!["src/main.rs".to_string()]);
 }

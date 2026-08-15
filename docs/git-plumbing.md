@@ -547,6 +547,21 @@ worktree per cycle: `rev-parse --show-toplevel` and
 - **A stat-dirty but content-identical filtered path can be reported as
   conflicting.** See "What that costs, and the one case it gets wrong".
 
+## Filename encoding differs by platform
+
+macOS (APFS and HFS+) enforces valid UTF-8 in filenames and answers `EILSEQ`;
+Linux filesystems accept any byte except `/` and NUL. So the case where two
+files' names differ only in an invalid byte — the one the path digest exists to
+keep apart — **cannot be constructed on macOS at all**. Observed on CI: the
+fixture that creates `\xff.txt` fails there with
+`Os { code: 92, message: "Illegal byte sequence" }`.
+
+The on-disk test therefore skips itself, loudly, where the filesystem refuses
+the names, and the parser half is covered everywhere from captured bytes
+instead. Do not "fix" that skip by dropping the case: it is a real difference
+between the two supported platforms, and on macOS the bug it guards against
+cannot happen.
+
 ## Unverified
 
 Cold-cache timings; `feature.manyFiles`, split index and untracked-cache

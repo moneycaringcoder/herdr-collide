@@ -605,8 +605,15 @@ impl Fixture {
     /// their raw byte names. Replacing the bad bytes maps both onto the same
     /// display string, so anything that keys on that string alone reports two
     /// worktrees as sharing a file neither of them has.
+    ///
+    /// Returns `None` when the filesystem refuses the names outright. macOS's
+    /// APFS and HFS+ enforce valid UTF-8 in filenames and answer `EILSEQ`,
+    /// where ext4 and friends take any byte but `/` and NUL. That is a real
+    /// difference between the platforms this plugin supports, not a flaw in the
+    /// test, so the caller skips the on-disk half rather than the suite failing
+    /// on a machine where the situation cannot arise.
     #[cfg(unix)]
-    pub fn distinct_invalid_utf8_untracked(&self, cwd: &Path) -> (Vec<u8>, Vec<u8>) {
+    pub fn distinct_invalid_utf8_untracked(&self, cwd: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
@@ -616,9 +623,11 @@ impl Fixture {
         let second = b"\xfe.txt".to_vec();
         for (name, body) in [(&first, "first\n"), (&second, "second\nsecond\n")] {
             let path = cwd.join(OsStr::from_bytes(name));
-            std::fs::write(&path, body).expect("write invalid-utf8 name");
+            if std::fs::write(&path, body).is_err() {
+                return None;
+            }
         }
-        (first, second)
+        Some((first, second))
     }
 
     /// Files that `.gitignore` covers, which must never enter a change set.
