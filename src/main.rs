@@ -41,11 +41,36 @@ fn main() {
     }
 }
 
+/// Options that take a value, and so must never be mistaken for the verb.
+const VALUED: [&str; 2] = ["--interval", "--base-ref"];
+
+/// The verb is the first argument that is not an option or an option's value,
+/// so `collide --base-ref origin/main --once` works as readily as
+/// `collide --once --base-ref origin/main`. Ordering that matters is a papercut
+/// nobody should have to learn.
+fn verb_of(args: &[String]) -> &str {
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        let name = arg.split('=').next().unwrap_or(arg);
+        if VALUED.contains(&name) {
+            // `--interval=5` carries its value; bare `--interval 5` does not.
+            skip_value = !arg.contains('=');
+            continue;
+        }
+        return arg;
+    }
+    "--once"
+}
+
 fn run(args: &[String]) -> Result<()> {
-    let verb = args.first().map(String::as_str).unwrap_or("--once");
+    let verb = verb_of(args);
     match verb {
-        "--once" => analysis::run_once(&config::load()?),
-        "--json" => analysis::run_json(&config::load()?),
+        "--once" => analysis::run_once(&config::load_with_args(args)?),
+        "--json" => analysis::run_json(&config::load_with_args(args)?),
         "--watch" => render::run_watch(&config::load_with_args(args)?),
         "--enable" => daemon::enable(args),
         "--disable" => daemon::disable(),
@@ -63,5 +88,39 @@ fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => Err(format!("unknown verb `{other}`\n\n{USAGE}").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verb_of;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_verb_is_found_whatever_the_order() {
+        assert_eq!(verb_of(&args(&["--once"])), "--once");
+        assert_eq!(verb_of(&args(&["--json", "--interval", "5"])), "--json");
+        assert_eq!(verb_of(&args(&["--interval", "5", "--json"])), "--json");
+        assert_eq!(verb_of(&args(&["--interval=5", "--json"])), "--json");
+        assert_eq!(
+            verb_of(&args(&["--base-ref", "origin/main", "--watch"])),
+            "--watch"
+        );
+    }
+
+    #[test]
+    fn no_arguments_means_a_one_shot_report() {
+        assert_eq!(verb_of(&args(&[])), "--once");
+        // Options alone still leave the default verb in place.
+        assert_eq!(verb_of(&args(&["--interval", "5"])), "--once");
+    }
+
+    #[test]
+    fn an_option_value_is_never_mistaken_for_a_verb() {
+        // A value that looks like a verb must still be treated as a value.
+        assert_eq!(verb_of(&args(&["--base-ref", "--json"])), "--once");
     }
 }
