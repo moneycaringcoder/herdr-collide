@@ -542,11 +542,12 @@ fn explain_reason(reason: &str) -> String {
     };
 
     let consequence = match code {
-        git::DEGRADED_UNBORN => {
-            "unborn branch, so this checkout has no commit and is not paired with its siblings"
-        }
+        // Both of these follow a git message that already says the checkout
+        // has no commit, so the explanation states the consequence rather than
+        // repeating the cause back at the reader.
+        git::DEGRADED_UNBORN => "left out of pairing: there is nothing to merge against",
         git::DEGRADED_BROKEN_HEAD => {
-            "broken HEAD, so this checkout has no commit and is not paired with its siblings"
+            "left out of pairing: its HEAD is broken, so there is nothing to merge against"
         }
         git::DEGRADED_MISSING_BASE_REF => {
             "the base ref does not resolve here, so only uncommitted work is counted"

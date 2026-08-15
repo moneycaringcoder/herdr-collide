@@ -608,8 +608,10 @@ fn a_degraded_checkout_says_why() {
     // git's own wording survives, because it names the branch involved...
     assert!(flat.contains("`wip/salvage` has no commits yet"), "{text}");
     // ...and the consequence is spelled out rather than left to the reader.
-    assert!(flat.contains("unborn branch"), "{text}");
-    assert!(flat.contains("not paired with its siblings"), "{text}");
+    // The consequence, not the cause: git's half already said "no commits yet",
+    // and an explanation that repeats it back reads as a stutter in the pane.
+    assert!(flat.contains("left out of pairing"), "{text}");
+    assert!(flat.contains("nothing to merge against"), "{text}");
     // The machine-readable code itself is not user-facing text.
     assert!(!text.contains(git::DEGRADED_UNBORN), "{text}");
 }
@@ -619,8 +621,8 @@ fn every_degradation_code_gets_a_real_explanation() {
     // Each code must produce a distinct explanation. A missing arm would fall
     // through to git's raw text, which reads as an internal error string.
     let cases = [
-        (git::DEGRADED_UNBORN, "no commit"),
-        (git::DEGRADED_BROKEN_HEAD, "no commit"),
+        (git::DEGRADED_UNBORN, "left out of pairing"),
+        (git::DEGRADED_BROKEN_HEAD, "left out of pairing"),
         (git::DEGRADED_MISSING_BASE_REF, "only uncommitted work"),
         (git::DEGRADED_NO_MERGE_BASE, "only uncommitted work"),
         (git::DEGRADED_UNMERGED, "advisory"),
