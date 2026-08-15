@@ -1,7 +1,18 @@
+<div align="center">
+
+<img src="docs/img/logo.svg" alt="" width="96" height="96">
+
 # collide
 
-A [herdr](https://github.com/moneycaringcoder/herdr) plugin that warns you when two agents are about to
-step on each other.
+**Warns you when two agents in different git worktrees of one repository are about to step on each
+other — and whether their edits merely overlap or will actually conflict.**
+
+[![CI](https://github.com/moneycaringcoder/herdr-collide/actions/workflows/ci.yml/badge.svg)](https://github.com/moneycaringcoder/herdr-collide/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![herdr](https://img.shields.io/badge/herdr-%E2%89%A5%200.7.5-8b949e.svg)](https://herdr.dev)
+[![read-only](https://img.shields.io/badge/your%20repos-never%20written%20to-2da44e.svg)](#how-it-works)
+
+</div>
 
 Running several coding agents at once usually means several git worktrees of the same repository, one
 per herdr workspace. That works right up until two of them start editing the same file, and you find
@@ -13,6 +24,14 @@ the first visible sign that an agent has wandered off.
 
 It never writes to your repositories. Every git invocation is read-only, passes `--no-optional-locks`
 so it cannot contend with an agent's own git commands, and stages nothing through your real index.
+
+## Overlap is not conflict
+
+Most tools would stop at "you both touched `src/api.rs`". That is usually a false alarm — two agents
+editing opposite ends of one file merge without complaint. `collide` asks git what the merge would
+actually do, so a warning means something:
+
+<img src="docs/img/verdicts.svg" alt="Two worktrees editing the same file at different lines merge cleanly and are reported as an overlap; two worktrees rewriting the same line are reported as a conflict." width="100%">
 
 ## What it looks like
 
@@ -243,9 +262,26 @@ repository.
 
 For each checkout, `collide` reads a change set — staged, unstaged, untracked, conflicted, and
 committed since the merge base — with read-only git plumbing. Pairs of checkouts within a repository
-are then intersected: a pair with no files in common cannot conflict and is dropped for free. Survivors
-go through conflict prediction in two phases, a cheap boolean pass over every remaining pair and an
-expensive pass that recovers paths only for the pairs the first pass flagged.
+are then intersected: a pair with no files in common cannot conflict and is dropped for free.
+Survivors go through conflict prediction. Uncommitted work on either side is first captured as a tree
+through a throwaway index, so a prediction covers what the agents have actually written rather than
+only what they have committed.
+
+```mermaid
+flowchart LR
+    S["session.snapshot<br/><small>one round trip</small>"] --> G["group by repository<br/><small>canonical git-common-dir</small>"]
+    G --> C["change set per checkout<br/><small>dirty + committed since base</small>"]
+    C --> I{"share<br/>files?"}
+    I -- no --> D["dropped for free"]
+    I -- yes --> M["merge-tree<br/><small>uncommitted work snapshotted first</small>"]
+    M --> V["verdict per file<br/><small>overlap or conflict</small>"]
+    V --> B["badge, with a TTL"]
+    V --> P["detail pane"]
+```
+
+There used to be a cheaper first pass here — `merge-tree --quiet` as a boolean oracle, fifteen times
+faster — until it was found reporting clean for merges that genuinely conflict. It is not used at any
+stage now; [docs/git-plumbing.md](docs/git-plumbing.md) records exactly when it lies.
 
 The result is one badge per workspace, pushed with a TTL of roughly three refresh intervals. That TTL
 is what makes the display self-healing: if the updater is killed, herdr expires the badges on its own

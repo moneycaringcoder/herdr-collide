@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="collide">
+  <title>collide</title>
+  <!--
+    Two worktrees of one repository, drawn as overlapping squares. The mark is
+    the intersection: the region both sides are touching, which is the only
+    thing this plugin cares about. Colours are mid-tone on purpose so the mark
+    reads on both a light and a dark background without a second variant.
+  -->
+  <g fill="none" stroke="#8b949e" stroke-width="6" stroke-linejoin="round">
+    <rect x="14" y="14" width="66" height="66" rx="10"/>
+    <rect x="48" y="48" width="66" height="66" rx="10"/>
+  </g>
+  <!-- The overlap, and the collision inside it. -->
+  <rect x="48" y="48" width="32" height="32" fill="#ff8080" fill-opacity="0.18"/>
+  <g stroke="#ff8080" stroke-width="7" stroke-linecap="round">
+    <line x1="55" y1="55" x2="73" y2="73"/>
+    <line x1="73" y1="55" x2="55" y2="73"/>
+  </g>
+</svg>

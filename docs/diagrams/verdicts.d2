@@ -1,0 +1,89 @@
+# The distinction the whole plugin exists to make: two agents touching one file
+# is not the same as two agents breaking it. Rendered to docs/img/verdicts.svg.
+#
+# No unicode marks in labels — d2's bundled font has no glyph for them and they
+# render as tofu.
+
+direction: right
+
+classes: {
+  node: {
+    shape: rectangle
+    style: {
+      stroke: "#8b949e"
+      font-color: "#57606a"
+      fill: transparent
+      stroke-width: 2
+    }
+  }
+  base: {
+    shape: rectangle
+    style: {
+      stroke: "#8b949e"
+      font-color: "#57606a"
+      stroke-dash: 4
+      fill: transparent
+      stroke-width: 2
+    }
+  }
+  overlap: {
+    shape: rectangle
+    style: {
+      stroke: "#d9a441"
+      font-color: "#9a6700"
+      fill: transparent
+      stroke-width: 3
+      bold: true
+    }
+  }
+  conflict: {
+    shape: rectangle
+    style: {
+      stroke: "#e05252"
+      font-color: "#b32222"
+      fill: transparent
+      stroke-width: 3
+      bold: true
+    }
+  }
+}
+
+# Neutral edges: the colour in this diagram should only ever mean a verdict.
+(** -> **)[*]: {
+  style.stroke: "#8b949e"
+  style.stroke-width: 2
+}
+
+clean: {
+  label: "same file, different lines"
+  style.stroke: transparent
+  style.fill: transparent
+  style.font-color: "#57606a"
+
+  base: "src/api.rs\nat the merge base" { class: base }
+  a: "worktree A\nedits line 40" { class: node }
+  b: "worktree B\nedits line 900" { class: node }
+  out: "OVERLAP\nboth touched it, merges clean" { class: overlap }
+
+  base -> a
+  base -> b
+  a -> out
+  b -> out
+}
+
+broken: {
+  label: "same file, same lines"
+  style.stroke: transparent
+  style.fill: transparent
+  style.font-color: "#57606a"
+
+  base: "src/model.rs\nat the merge base" { class: base }
+  a: "worktree A\nrewrites line 12" { class: node }
+  b: "worktree B\nrewrites line 12" { class: node }
+  out: "CONFLICT\nwill not merge" { class: conflict }
+
+  base -> a
+  base -> b
+  a -> out
+  b -> out
+}
