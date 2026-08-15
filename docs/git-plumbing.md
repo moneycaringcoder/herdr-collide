@@ -90,9 +90,11 @@ The worktree's change set is the union of the two.
 ### Committed state
 
 ```sh
-git -C <repo> merge-tree --write-tree --quiet <oidA> <oidB>          # boolean
 git -C <repo> merge-tree --write-tree -z --name-only <oidA> <oidB>   # paths
 ```
+
+This is the only form that may be used. `--quiet` looks like a cheap boolean
+oracle for the same question and is not one — see "The --quiet trap" below.
 
 Do **not** pass `--merge-base` here. Without it, merge-tree resolves multiple
 bases recursively, which is more accurate on criss-cross histories than any
@@ -106,12 +108,61 @@ Exit codes:
 | 1 | conflicts **or** a fatal argument error |
 | 128 | unrelated histories, invalid object name |
 
-**The trap:** a bad ref also exits 1, with empty stdout and a message on stderr —
-indistinguishable from "conflict" by exit code, and `--quiet` erases the stdout
-signal. Mitigation, mandatory: pre-resolve with
-`git rev-parse --verify -q '<rev>^{commit}'` and `git cat-file -e '<oid>^{commit}'`,
-pass only 40-hex OIDs, and on exit 1 treat it as a conflict **only if stdout is
-non-empty**.
+**The argument trap:** a bad ref also exits 1, with empty stdout and a message on
+stderr — indistinguishable from "conflict" by exit code. Mitigation, mandatory:
+pre-resolve with `git rev-parse --verify -q '<rev>^{commit}'` and
+`git cat-file -e '<oid>^{commit}'`, pass only 40-hex OIDs, and on exit 1 treat it
+as a conflict **only if stdout is non-empty**. A real merge always prints at
+least the merged tree OID, so empty stdout means the arguments were rejected.
+
+An empty conflicted-file list is **not** a clean merge. git's own documentation
+warns that some directory-rename conflicts produce no individual conflicted
+file. The exit status is the authority; the file list only attributes the
+conflict to paths.
+
+### The --quiet trap
+
+`git merge-tree --write-tree --quiet` **reports clean for merges that genuinely
+conflict**. Verified on git 2.53.0. It must not be used as a mergeability
+oracle, and collide no longer runs it.
+
+The rule, established by bisecting a real failing pair down to a minimal case:
+
+> `--quiet` stops as soon as it has processed a directory that **both** sides
+> modified, and reports the whole merge clean if it has not seen a conflict by
+> then. merge-ort walks paths in reverse-sorted order, so "by then" means
+> "paths sorting after that directory". Any conflict on a path sorting *before*
+> a both-sides-modified directory is silently lost.
+
+Minimal reproducer — base has `README.md` and `docs/{a,b}.md`; both sides edit
+`README.md` incompatibly, and each side additionally edits a *different* file
+inside `docs/`:
+
+```sh
+git merge-tree --write-tree --quiet     --merge-base=$BASE $T1 $T2  # exit 0  WRONG
+git merge-tree --write-tree -z --name-only --merge-base=$BASE $T1 $T2  # exit 1, CONFLICT in README.md
+```
+
+Confirmed behaviour, each direction tested:
+
+| shape | agrees with `--name-only`? |
+|---|---|
+| conflict only, no other changes | yes |
+| one-sided extra edit on **one** side only | yes |
+| one-sided extra edits on both sides, but in **different** directories | yes |
+| one-sided extra edits on both sides at the **top level** | yes |
+| both-sides-touched directory sorts **before** the conflicting path | yes |
+| both-sides-touched directory sorts **after** the conflicting path | **no — conflict lost** |
+| as above, but a second conflict sorts after that directory | yes (the later conflict is seen) |
+
+This is why flat, hand-built fixtures all pass while real worktrees fail: every
+real repository has subdirectories, and two agents working in one repo routinely
+touch the same directory. Independent of `merge.conflictstyle`, and reproducible
+with `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`.
+
+`tests/conflict_detection.rs` pins both halves: that collide reports the
+conflict, and that git still exhibits the disagreement, so the regression test
+cannot quietly go vacuous.
 
 `-z` output framing: `<tree-oid> NUL`, then conflicted-file fields, then an
 empty field ending the file section, then message records of
@@ -120,17 +171,21 @@ in `-z` mode emits exactly one field, so `fields.len() == 1` means clean. The
 human message carries a trailing newline — trim it.
 
 Key off the machine-stable conflict-type tokens, never the prose:
-`CONFLICT (contents)`, `CONFLICT (rename/rename)`, `CONFLICT (modify/delete)`,
-`CONFLICT (add/add)`.
+`CONFLICT (contents)`, `CONFLICT (rename/rename)`, `CONFLICT (modify/delete)`.
+Note that an add/add conflict reports the token `CONFLICT (contents)`; only the
+human message says "add/add", so there is no `CONFLICT (add/add)` token to match.
 
-`--write-tree` writes loose objects into the real ODB. `--quiet` writes **zero**
-(verified). To keep the phase-2 run from growing the user's ODB, redirect:
+`--write-tree` writes loose objects into the real ODB. Redirect them, always:
 
 ```sh
 GIT_OBJECT_DIRECTORY=$TMP/odb \
 GIT_ALTERNATE_OBJECT_DIRECTORIES=<repo>/.git/objects \
 git -C <repo> merge-tree --write-tree -z --name-only <a> <b>
 ```
+
+The same redirection is required for the temp-index snapshot below: `git add`
+writes blobs too, so without it the plugin grows the user's object store on
+every refresh.
 
 ### Uncommitted state
 
@@ -160,7 +215,7 @@ Then merge with an explicit base tree:
 
 ```sh
 BT=$(git -C "$REPO" rev-parse "$(git -C "$REPO" merge-base "$H1" "$H2")^{tree}")
-git -C "$REPO" merge-tree --write-tree --quiet --merge-base="$BT" "$T1" "$T2"
+git -C "$REPO" merge-tree --write-tree -z --name-only --merge-base="$BT" "$T1" "$T2"
 ```
 
 Caveats to encode:
@@ -178,9 +233,15 @@ Caveats to encode:
 | case | detection | action |
 |---|---|---|
 | detached HEAD | `worktree list` → `detached`; `symbolic-ref -q HEAD` exits 1 | usable, use the raw OID |
-| unborn branch | `HEAD 0000…`; status `# branch.oid (initial)`; `rev-parse --verify -q 'HEAD^{commit}'` exits 1 | exclude from pairing; change set is every `A.` entry |
-| branch deleted underneath | byte-identical to unborn, except `symbolic-ref -q HEAD` exits **0** and names a ref that no longer resolves | exclude from pairing, report as broken |
+| unborn branch | `HEAD 0000…`; `rev-parse --verify -q 'HEAD^{commit}'` exits 1; **no** `logs/HEAD` | exclude from pairing; change set is every `A.` entry |
+| branch deleted underneath | as unborn, but the worktree **has** a non-empty `logs/HEAD` | exclude from pairing, report as broken |
 | foreign repo | differing common-dir | never compare |
+
+Correction to an earlier note here: `symbolic-ref -q HEAD` does **not**
+distinguish unborn from deleted-branch. On git 2.53.0 it exits 0 and prints the
+same ref name in both cases. The discriminator that works is the worktree's own
+HEAD reflog: a worktree that ever had a commit checked out has `logs/HEAD`, a
+freshly initialised one does not.
 
 ## Cost, and the resulting pipeline
 
@@ -190,24 +251,48 @@ Caveats to encode:
 | `merge-base` / `rev-parse` | 2 |
 | `diff --name-only -z <base>...HEAD` | 2 |
 | `status --porcelain=v2 -z -uall` | 6 |
-| `merge-tree --write-tree --quiet` | 2 |
-| `merge-tree --write-tree --name-only` | 31 |
 | temp-index snapshot, seeded | 29 |
 
-`--quiet` is ~15× cheaper than `--name-only` because it skips writing the merged
-tree and blobs. `--stdin` batching saves nothing (31 ms vs 34 ms for three
-pairs) and forfeits `--quiet`, so it is not worth the parsing complexity.
+### `merge-tree` cost, re-measured
+
+The earlier claim that `--quiet` is ~15× cheaper than `--name-only` was measured
+on one pathological pair and generalised. Re-measured across pair shapes, median
+of 30 runs, warm cache:
+
+| pair | `--quiet` | `-z --name-only` |
+|---|---|---|
+| clean, 200 changed files per side, 5000-file repo | 1.72 ms | 1.77 ms |
+| conflicting, 12 conflicted files | 1.76 ms | 1.97 ms |
+| conflicting, 500 conflicted files | 2.37 ms | 35.37 ms |
+| the real failing pair from this repo | 1.48 ms | 1.87 ms |
+
+`--name-only` costs what it costs because it writes the merged tree and one blob
+per conflicted file, so its price scales with the **number of conflicted files**,
+not with repo size. The 15× gap therefore only appears on pairs with hundreds of
+conflicts — pairs the old pipeline had to run `--name-only` on anyway.
+
+The gate only ever saved work on **clean** pairs, and a clean pair is exactly
+where `--name-only` has nothing to write: 1.77 ms against 1.72 ms. The two-phase
+design bought 0.05 ms per clean pair and paid for it in lost conflicts.
+
+`--stdin` batching saves nothing (31 ms vs 34 ms for three pairs) and is not
+worth the parsing complexity.
 
 Pipeline for N worktrees (N(N−1)/2 pairs):
 
 1. **Prefilter, free.** Intersect change sets. Skip pairs with an empty
    intersection — they cannot conflict. Exception: do not skip when either side
    has a rename record.
-2. **Phase 1, 2 ms/pair, zero ODB writes.** `--quiet` on survivors, in parallel.
-3. **Phase 2, 31 ms/pair.** Rerun with `-z --name-only` only on pairs phase 1
-   flagged, to recover paths and conflict types.
+2. **Predict, ~2 ms/pair.** `merge-tree --write-tree -z --name-only` on the
+   survivors, in parallel, with objects redirected. One phase. Do not add a
+   `--quiet` pre-check: see "The --quiet trap".
 
 Snapshot each worktree once and reuse its tree OID across all of its pairs.
+
+Budget check at the default 5 s interval: 8 worktrees give 28 pairs, so ~55 ms
+of prediction plus ~230 ms of snapshotting — about 6 % of one interval, before
+the parallel fan-out. Prediction is not the term that matters; the per-worktree
+snapshot is.
 
 ## Unverified
 

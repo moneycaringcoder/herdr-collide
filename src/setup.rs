@@ -22,10 +22,16 @@ use crate::Result;
 const SECTION: &str = "[ui.sidebar.spaces]";
 const BACKUP_SUFFIX: &str = ".collide-backup";
 
-/// Colours chosen to read on both light and dark themes: green for clean, amber
-/// for overlap, orange for a runaway change set, red for a predicted conflict.
-const TOKEN_COLOURS: [(&str, &str); 4] = [
-    ("collide_clean", "#99FFE4"),
+/// Rows written into the user's config: amber for overlap, orange for a runaway
+/// change set, red for a predicted conflict. Colours chosen to read on both
+/// light and dark themes.
+///
+/// `collide_clean` is deliberately absent. A clean workspace renders an empty
+/// badge, which the daemon treats as "clear the token" rather than "write an
+/// empty one", so that token is never set and a row naming it would be three
+/// lines of config that can never display anything. The sweep in `daemon` still
+/// clears all four names defensively, which costs nothing and cannot go stale.
+const TOKEN_COLOURS: [(&str, &str); 3] = [
     ("collide_overlap", "#FFC799"),
     ("collide_runaway", "#FFB27F"),
     ("collide_conflict", "#FF8080"),

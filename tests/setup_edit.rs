@@ -29,14 +29,16 @@ key = "prefix+f"
 fn splices_into_an_existing_spaces_section() {
     let out = plan_edit(REAL_WORLD).expect("an edit was planned");
 
-    for token in [
-        "collide_clean",
-        "collide_overlap",
-        "collide_runaway",
-        "collide_conflict",
-    ] {
+    for token in ["collide_overlap", "collide_runaway", "collide_conflict"] {
         assert!(out.contains(&format!("\"${token}\"")), "missing {token}");
     }
+
+    // A clean workspace clears its badge rather than setting a token, so a row
+    // naming `collide_clean` could never display anything and is not written.
+    assert!(
+        !out.contains("$collide_clean"),
+        "wrote a row for a token that is never set"
+    );
 
     // The user's own rows survive untouched.
     assert!(out.contains("{ token = \"$git_dirty\", fg = \"#FFC799\" }"));

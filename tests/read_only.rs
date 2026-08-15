@@ -83,13 +83,18 @@ struct Fingerprint {
     locks: BTreeSet<PathBuf>,
 }
 
-fn walk(root: &Path, exclude: &[PathBuf], files: &mut BTreeMap<PathBuf, FileStamp>, locks: &mut BTreeSet<PathBuf>) {
+fn walk(
+    root: &Path,
+    exclude: &[PathBuf],
+    files: &mut BTreeMap<PathBuf, FileStamp>,
+    locks: &mut BTreeSet<PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if exclude.iter().any(|e| path == *e) {
+        if exclude.contains(&path) {
             continue;
         }
         match entry.file_type() {
@@ -148,9 +153,8 @@ fn fingerprint(fixture: &Fixture, worktrees: &[PathBuf]) -> Fingerprint {
     let mut index_bytes = BTreeMap::new();
     let mut index_mtimes = BTreeMap::new();
     for wt in std::iter::once(&fixture.repo).chain(worktrees.iter()) {
-        let git_dir = PathBuf::from(
-            fixture.git(wt, &["rev-parse", "--path-format=absolute", "--git-dir"]),
-        );
+        let git_dir =
+            PathBuf::from(fixture.git(wt, &["rev-parse", "--path-format=absolute", "--git-dir"]));
         let index = git_dir.join("index");
         if let Ok(bytes) = std::fs::read(&index) {
             index_bytes.insert(index.clone(), bytes);
@@ -172,11 +176,15 @@ fn fingerprint(fixture: &Fixture, worktrees: &[PathBuf]) -> Fingerprint {
 
     let mut reflogs = BTreeMap::new();
     let mut reflog_locks = BTreeSet::new();
-    walk(&common_dir.join("logs"), &[], &mut reflogs, &mut reflog_locks);
+    walk(
+        &common_dir.join("logs"),
+        &[],
+        &mut reflogs,
+        &mut reflog_locks,
+    );
     for wt in worktrees {
-        let git_dir = PathBuf::from(
-            fixture.git(wt, &["rev-parse", "--path-format=absolute", "--git-dir"]),
-        );
+        let git_dir =
+            PathBuf::from(fixture.git(wt, &["rev-parse", "--path-format=absolute", "--git-dir"]));
         walk(&git_dir.join("logs"), &[], &mut reflogs, &mut reflog_locks);
     }
 
@@ -227,9 +235,7 @@ fn assert_unchanged(before: &Fingerprint, after: &Fingerprint) {
     for (path, was) in &before.files {
         match after.files.get(path) {
             None => problems.push(format!("file removed: {}", path.display())),
-            Some(now) if now != was => {
-                problems.push(format!("file modified: {}", path.display()))
-            }
+            Some(now) if now != was => problems.push(format!("file modified: {}", path.display())),
             Some(_) => {}
         }
     }
@@ -287,18 +293,39 @@ fn assert_unchanged(before: &Fingerprint, after: &Fingerprint) {
     );
 }
 
-/// The plugin's own scratch area must be empty of temp indexes and their locks.
+/// The plugin state dir is shared by every collide process on the machine, so
+/// the leftover check has to be scoped twice over: to this process's own
+/// scratch directories (`collide-<pid>-<seq>`), and — via [`scratch_guard`] —
+/// to a window in which no sibling test in this binary holds a live predictor.
+/// Without both, a passing run only means the other tests happened to finish
+/// first.
 fn assert_no_scratch_leftovers() {
     let root = collide::config::state_dir().join("scratch");
-    let mut files = BTreeMap::new();
-    let mut locks = BTreeSet::new();
-    walk(&root, &[], &mut files, &mut locks);
+    let ours = format!("collide-{}-", std::process::id());
+    let mut leftovers = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&ours) {
+                let mut files = BTreeMap::new();
+                let mut locks = BTreeSet::new();
+                walk(&entry.path(), &[], &mut files, &mut locks);
+                leftovers.push((entry.path(), files.len(), locks.len()));
+            }
+        }
+    }
     assert!(
-        files.is_empty() && locks.is_empty(),
-        "temp index files left under the plugin state dir: {:?} {:?}",
-        files.keys().collect::<Vec<_>>(),
-        locks
+        leftovers.is_empty(),
+        "scratch directories left under the plugin state dir: {leftovers:?}"
     );
+}
+
+/// Serialises the tests that assert about the shared plugin state dir. They
+/// each create predictors under it, so they cannot judge each other's leftovers.
+fn scratch_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +359,19 @@ fn kitchen_sink(tag: &str) -> (Fixture, Vec<PathBuf>) {
         fixture.write(wt, "untracked-blob.bin", "\0\0\0binary\0\0\0");
     }
 
-    let worktrees = vec![fixture.repo.clone(), ca, cb, oa, ob, da, db, ra, rb, mid, detached];
+    let worktrees = vec![
+        fixture.repo.clone(),
+        ca,
+        cb,
+        oa,
+        ob,
+        da,
+        db,
+        ra,
+        rb,
+        mid,
+        detached,
+    ];
     (fixture, worktrees)
 }
 
@@ -389,6 +428,8 @@ fn run_full_pipeline(fixture: &Fixture, worktrees: &[PathBuf]) -> Vec<String> {
 
 #[test]
 fn the_full_pipeline_changes_nothing_in_the_repository() {
+    let _serialised = scratch_guard();
+
     let (fixture, worktrees) = kitchen_sink("read-only");
 
     let before = fingerprint(&fixture, &worktrees);
@@ -408,6 +449,8 @@ fn the_full_pipeline_changes_nothing_in_the_repository() {
 
 #[test]
 fn a_worktree_mid_merge_is_snapshotted_without_touching_it() {
+    let _serialised = scratch_guard();
+
     let fixture = Fixture::new("mid-merge-readonly");
     let mid = fixture.merge_in_progress_worktree("mid-merge");
     let (da, _db) = fixture.uncommitted_conflict_pair();
@@ -448,6 +491,8 @@ fn a_worktree_mid_merge_is_snapshotted_without_touching_it() {
 
 #[test]
 fn concurrent_pipelines_are_safe_while_another_process_holds_index_lock() {
+    let _serialised = scratch_guard();
+
     let (fixture, worktrees) = kitchen_sink("concurrent");
 
     // A separate process holding `index.lock` is exactly what an agent running
@@ -456,9 +501,8 @@ fn concurrent_pipelines_are_safe_while_another_process_holds_index_lock() {
     let mut holders = LockHolders::default();
     let mut lock_paths = Vec::new();
     for wt in [&fixture.repo, &worktrees[5]] {
-        let git_dir = PathBuf::from(
-            fixture.git(wt, &["rev-parse", "--path-format=absolute", "--git-dir"]),
-        );
+        let git_dir =
+            PathBuf::from(fixture.git(wt, &["rev-parse", "--path-format=absolute", "--git-dir"]));
         let lock = git_dir.join("index.lock");
         let child = std::process::Command::new("sh")
             .arg("-c")
@@ -537,6 +581,8 @@ impl Drop for LockHolders {
 
 #[test]
 fn sweep_scratch_reclaims_dead_runs_and_spares_live_ones() {
+    let _serialised = scratch_guard();
+
     let root = collide::config::state_dir().join("scratch");
     std::fs::create_dir_all(&root).expect("create scratch root");
 

@@ -721,6 +721,10 @@ pub struct PairPrediction {
     /// True when one side has a merge in progress: its snapshot contains
     /// conflict markers, so the prediction is advisory only.
     pub advisory: bool,
+    /// merge-tree's exit status for the pair as a whole. Authoritative:
+    /// git documents that a merge can conflict without any individual file
+    /// appearing in the conflicted-file list.
+    pub pair_conflict: bool,
     /// Machine-stable conflict-type tokens git reported, e.g.
     /// `CONFLICT (contents)`. Never parse the human prose instead.
     pub conflict_types: Vec<String>,
@@ -987,33 +991,16 @@ impl Predictor {
         let base_args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
         let env = self.odb_env(&l.common_dir);
 
-        // Phase 1: ~2 ms and provably zero ODB writes. Because both sides are
-        // pre-resolved OIDs, exit 1 here can only mean "conflicts".
-        let mut phase1 = vec!["merge-tree", "--write-tree", "--quiet"];
-        phase1.extend(base_args.iter().copied());
-        let quiet = run_git(left, &phase1, &env, self.timeout)?;
-        match quiet.code {
-            Some(0) => {
-                prediction.verdicts = paths.iter().map(|p| (p.clone(), false)).collect();
-                return Ok(prediction);
-            }
-            Some(1) => {}
-            _ => {
-                return Err(format!(
-                    "merge-tree failed for {} vs {}: {}",
-                    left.display(),
-                    right.display(),
-                    quiet.stderr_text()
-                )
-                .into())
-            }
-        }
-
-        // Phase 2: ~31 ms, and it writes the merged tree and blobs, so it only
-        // runs on pairs phase 1 already flagged.
-        let mut phase2 = vec!["merge-tree", "--write-tree", "-z", "--name-only"];
-        phase2.extend(base_args.iter().copied());
-        let named = run_git(left, &phase2, &env, self.timeout)?;
+        // One phase, not two. `--quiet` used to gate this call because it is
+        // ~15x cheaper, but it is not a sound oracle: on git 2.53.0 it reports
+        // a clean merge for merges that genuinely conflict. See
+        // docs/git-plumbing.md, "The --quiet trap". Losing a conflict is the
+        // one failure this plugin cannot have, so the cheap gate is gone and
+        // the authoritative form runs on every pair that survives the
+        // path-intersection prefilter.
+        let mut args = vec!["merge-tree", "--write-tree", "-z", "--name-only"];
+        args.extend(base_args.iter().copied());
+        let named = run_git(left, &args, &env, self.timeout)?;
         if named.code != Some(1) && named.code != Some(0) {
             return Err(format!(
                 "merge-tree --name-only failed for {} vs {}: {}",
@@ -1023,8 +1010,10 @@ impl Predictor {
             )
             .into());
         }
-        // On exit 1 this is only a conflict if stdout carries the file section;
-        // an argument error exits 1 with empty stdout.
+        // The exit-code trap: a bad argument also exits 1, with empty stdout
+        // and a message on stderr. A real merge always prints at least the
+        // merged tree OID, so empty stdout means the arguments were rejected,
+        // not that the merge conflicted.
         if named.stdout.is_empty() {
             return Err(format!(
                 "merge-tree reported failure with no output for {} vs {}: {}",
@@ -1037,6 +1026,7 @@ impl Predictor {
 
         let parsed = parse_merge_tree_z(&named.stdout);
         prediction.conflict_types = parsed.conflict_types;
+        prediction.pair_conflict = named.code == Some(1);
         let conflicted: BTreeSet<&String> = parsed.conflicted.iter().collect();
 
         let requested: BTreeSet<&String> = paths.iter().collect();
@@ -1047,6 +1037,15 @@ impl Predictor {
         for extra in &parsed.conflicted {
             if !requested.contains(extra) {
                 prediction.verdicts.push((extra.clone(), true));
+            }
+        }
+        // git's own documentation warns that an empty conflicted-file list is
+        // not a clean merge: some directory-rename conflicts have no individual
+        // conflicted file. The exit status is the authority, so surface the
+        // pair-level verdict rather than silently reporting every path clean.
+        if prediction.pair_conflict && parsed.conflicted.is_empty() {
+            for verdict in &mut prediction.verdicts {
+                verdict.1 = true;
             }
         }
         Ok(prediction)

@@ -91,6 +91,65 @@ fn uncommitted_edits_to_the_same_line_are_a_conflict() {
     assert_eq!(result, vec![("conflict.txt".to_string(), true)]);
 }
 
+/// Regression: `merge-tree --write-tree --quiet` used to gate the expensive
+/// `--name-only` run. It reports a *clean* merge for this pair, so every real
+/// conflict of this shape silently degraded to a plain overlap. Built from the
+/// temp-index snapshot of two real worktrees, because trees assembled by hand
+/// do not reproduce it.
+#[test]
+fn a_conflict_survives_even_when_quiet_would_call_the_merge_clean() {
+    let fixture = Fixture::new("quiet-trap");
+    let (a, b) = fixture.quiet_trap_pair();
+
+    let result = verdicts(&a, &b, &["conflict.txt"]);
+    assert_eq!(
+        result,
+        vec![("conflict.txt".to_string(), true)],
+        "the conflict was lost; see docs/git-plumbing.md, \"The --quiet trap\""
+    );
+}
+
+/// Guards the fixture above against going vacuous. If this fails, git has
+/// changed its behaviour — collide is fine either way, but the regression test
+/// above would no longer be testing anything and the plumbing notes are stale.
+#[test]
+fn the_quiet_oracle_still_disagrees_with_name_only_on_real_snapshot_trees() {
+    let fixture = Fixture::new("quiet-trap-guard");
+    let (a, b) = fixture.quiet_trap_pair();
+
+    let tree_a = fixture.snapshot_tree(&a);
+    let tree_b = fixture.snapshot_tree(&b);
+    let base = fixture.git(&a, &["rev-parse", "main^{tree}"]);
+    let merge_base = format!("--merge-base={base}");
+
+    let (quiet, _) = fixture.merge_tree(
+        &a,
+        &["--write-tree", "--quiet", &merge_base, &tree_a, &tree_b],
+    );
+    let (named, stdout) = fixture.merge_tree(
+        &a,
+        &[
+            "--write-tree",
+            "-z",
+            "--name-only",
+            &merge_base,
+            &tree_a,
+            &tree_b,
+        ],
+    );
+
+    assert_eq!(named, 1, "--name-only must see the conflict");
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("conflict.txt"),
+        "--name-only did not name the conflicting file"
+    );
+    assert_eq!(
+        quiet, 0,
+        "--quiet now agrees with --name-only. git's behaviour changed; \
+         re-check docs/git-plumbing.md, \"The --quiet trap\", before trusting it again"
+    );
+}
+
 #[test]
 fn uncommitted_edits_at_opposite_ends_are_not_a_conflict() {
     let fixture = Fixture::new("dirty-clean");
@@ -650,4 +709,139 @@ fn end_to_end_tolerates_degenerate_worktrees() {
     // And the whole run still says nothing about the user's repo being touched.
     let status = fixture.git(&ca, &["status", "--porcelain"]);
     assert!(status.is_empty(), "worktree was modified: {status}");
+}
+
+// ---------------------------------------------------------------------------
+// Checkout enrichment: branch and base ref
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gather_fills_in_the_branch_and_reports_none_only_when_detached() {
+    let fixture = Fixture::new("branch-fill");
+    let attached = fixture.worktree("feature", "fix/tier-promotion-scope");
+    let detached = fixture.detached_worktree("detached");
+
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    // Deliberately hand in the wrong branch, as herdr does when it has none:
+    // the git lookup is authoritative for the path we were given.
+    let mut checkouts = vec![
+        checkout("main", &fixture.repo, &key.0),
+        checkout("feature", &attached, &key.0),
+        checkout("detached", &detached, &key.0),
+    ];
+    for c in &mut checkouts {
+        c.branch = None;
+    }
+
+    let cycle = collide::collide::gather_for(checkouts, &config()).expect("gather");
+    let branch_of = |id: &str| {
+        cycle
+            .report
+            .checkouts
+            .iter()
+            .find(|c| c.workspace_id == id)
+            .and_then(|c| c.branch.clone())
+    };
+
+    assert_eq!(branch_of("main").as_deref(), Some("main"));
+    assert_eq!(
+        branch_of("feature").as_deref(),
+        Some("fix/tier-promotion-scope"),
+        "an attached HEAD must report its branch, not `(detached)`"
+    );
+    assert_eq!(
+        branch_of("detached"),
+        None,
+        "a genuinely detached HEAD must stay None"
+    );
+}
+
+#[test]
+fn a_configured_base_ref_wins_over_the_probing_chain() {
+    let fixture = Fixture::new("base-ref");
+    let wt = fixture.worktree("wt", "wt");
+    fixture.write(&wt, "conflict.txt", "committed\nbeta\ngamma\n");
+    fixture.commit_all(&wt, "committed since main");
+
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let checkouts = || vec![checkout("wt", &wt, &key.0)];
+
+    // Default: the probing chain finds `refs/heads/main`, so the commit above
+    // shows up as a committed-since-base change.
+    let default_run = collide::collide::gather_for(checkouts(), &config()).expect("gather");
+    let paths: Vec<&str> = default_run
+        .report
+        .change_set("wt")
+        .expect("change set")
+        .paths
+        .iter()
+        .map(|p| p.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["conflict.txt"],
+        "probing chain did not use main"
+    );
+
+    // Configured: measured against the checkout's own branch, so nothing is
+    // committed-since-base. Only an honoured base_ref can produce this.
+    let configured = Config {
+        base_ref: "refs/heads/wt".to_string(),
+        ..config()
+    };
+    let pinned = collide::collide::gather_for(checkouts(), &configured).expect("gather");
+    let set = pinned.report.change_set("wt").expect("change set");
+    assert!(
+        set.paths.is_empty(),
+        "base_ref was ignored; still measuring against the probed ref: {:?}",
+        set.paths
+    );
+    assert!(!set.degraded, "{:?}", set.degraded_reason);
+}
+
+#[test]
+fn a_configured_base_ref_that_does_not_resolve_degrades_rather_than_falling_back() {
+    let fixture = Fixture::new("base-ref-missing");
+    let wt = fixture.worktree("wt", "wt");
+    fixture.write(&wt, "conflict.txt", "committed\nbeta\ngamma\n");
+    fixture.commit_all(&wt, "committed since main");
+
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let configured = Config {
+        base_ref: "refs/heads/no-such-ref".to_string(),
+        ..config()
+    };
+    let cycle = collide::collide::gather_for(vec![checkout("wt", &wt, &key.0)], &configured)
+        .expect("gather");
+
+    let set = cycle.report.change_set("wt").expect("change set");
+    assert!(
+        set.degraded,
+        "a bad base_ref must be reported, not silently swapped for a probed one"
+    );
+    assert!(set
+        .degraded_reason
+        .as_deref()
+        .unwrap()
+        .contains(git::DEGRADED_MISSING_BASE_REF));
+}
+
+#[test]
+fn base_ref_for_only_probes_at_the_default() {
+    let fixture = Fixture::new("base-ref-unit");
+    let wt = fixture.worktree("wt", "wt");
+
+    // At the default the chain probes and lands on a ref that exists here.
+    let probed = collide::collide::base_ref_for(&wt, &config());
+    assert_eq!(probed, "refs/heads/main");
+
+    // Anything else is passed through untouched.
+    let pinned = Config {
+        base_ref: "refs/heads/anything".to_string(),
+        ..config()
+    };
+    assert_eq!(
+        collide::collide::base_ref_for(&wt, &pinned),
+        "refs/heads/anything"
+    );
 }

@@ -124,8 +124,13 @@ herdr renders a token's value as flat text and cannot colour by content. So
 severity is encoded in the **token name**: light exactly one, clear the others.
 
 ```
-collide_clean  collide_overlap  collide_conflict  collide_runaway
+collide_overlap  collide_conflict  collide_runaway
 ```
+
+A clean workspace sets no token at all: `render::badge` returns an empty string
+and the daemon treats that as "clear" rather than as an empty badge, so there is
+no `collide_clean` row for the user to configure. The disable sweep still clears
+that name defensively, which costs nothing.
 
 Each gets its own `fg` in the user's config. Track which name is currently
 active per workspace so a severity flip clears the previous name first —
@@ -157,7 +162,6 @@ no restart needed).
 rows = [
   ["state_icon", "workspace"],
   ["branch",
-    { token = "$collide_clean",    fg = "#a6e3a1" },
     { token = "$collide_overlap",  fg = "#f9e2af" },
     { token = "$collide_conflict", fg = "#f38ba8" },
     { token = "$collide_runaway",  fg = "#fab387" }],

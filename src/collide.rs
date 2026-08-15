@@ -311,6 +311,20 @@ pub fn gather(config: &Config) -> Result<Cycle> {
     gather_for(checkouts, config)
 }
 
+/// The ref one checkout's change set is measured against.
+///
+/// A `base_ref` the user actually set wins outright, whether it resolves or
+/// not: silently probing for something else would make `--base-ref` a lie, and
+/// `git::change_set` already degrades gracefully when the ref is missing. Only
+/// the untouched default hands over to the probing chain, which is there
+/// precisely because `origin/HEAD` does not exist in every repo.
+pub fn base_ref_for(checkout: &std::path::Path, config: &Config) -> String {
+    if config.base_ref != crate::config::DEFAULT_BASE_REF {
+        return config.base_ref.clone();
+    }
+    git::integration_ref(checkout, config.git_timeout).unwrap_or_else(|_| "HEAD".to_string())
+}
+
 /// The gathering pass, given a checkout list. Split out from [`gather`] so it
 /// can be driven from a fixture without a herdr socket.
 pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
@@ -325,6 +339,15 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
         match git::repo_key(&checkout.checkout_path, config.git_timeout) {
             Ok(key) => {
                 checkout.repo_key = key;
+                // Ask git for the branch rather than herdr. We already have the
+                // checkout path, and `worktree.list` is per-repo and errors on
+                // workspaces that are not repos at all. A genuinely detached
+                // HEAD comes back as `None` so the view stays truthful; on a
+                // lookup failure whatever herdr supplied is left alone.
+                if let Ok(branch) = git::current_branch(&checkout.checkout_path, config.git_timeout)
+                {
+                    checkout.branch = branch;
+                }
                 verified.push(checkout);
             }
             Err(err) => notes.push(format!(
@@ -336,8 +359,7 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
 
     let mut changes: Vec<(String, ChangeSet)> = Vec::new();
     for checkout in &verified {
-        let base = git::integration_ref(&checkout.checkout_path, config.git_timeout)
-            .unwrap_or_else(|_| "HEAD".to_string());
+        let base = base_ref_for(&checkout.checkout_path, config);
         match git::change_set(&checkout.checkout_path, &base, config.git_timeout) {
             Ok(set) => changes.push((checkout.workspace_id.clone(), set)),
             Err(err) => {

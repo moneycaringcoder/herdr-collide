@@ -56,6 +56,11 @@ impl Fixture {
             &(1..=12).map(|n| format!("line {n}\n")).collect::<String>(),
         );
         fixture.write(&fixture.repo, "conflict.txt", "alpha\nbeta\ngamma\n");
+        // A subdirectory sorting *after* `conflict.txt` is not decoration: it
+        // is what makes `quiet_trap_pair` reproduce the merge-tree `--quiet`
+        // unsoundness. See docs/git-plumbing.md, "The --quiet trap".
+        fixture.write(&fixture.repo, "docs/notes-a.md", "notes a\n");
+        fixture.write(&fixture.repo, "docs/notes-b.md", "notes b\n");
         fixture.write(&fixture.repo, "renamed.txt", "movable\n");
         fixture.write(&fixture.repo, "Cargo.lock", "# lockfile\nversion = 1\n");
         fixture.git(&fixture.repo, &["add", "-A"]);
@@ -307,10 +312,8 @@ impl Fixture {
         let path = self.worktree(name, name);
         self.write(&path, "conflict.txt", "FROM-TARGET\nbeta\ngamma\n");
         self.commit_all(&path, "target edits line 1");
-        let (code, _out, _err) = self.try_git(
-            &path,
-            &["merge", "--no-edit", &format!("{name}-source")],
-        );
+        let (code, _out, _err) =
+            self.try_git(&path, &["merge", "--no-edit", &format!("{name}-source")]);
         assert_ne!(code, 0, "the fixture merge was supposed to conflict");
         assert!(
             path.join(".git").exists(),
@@ -364,6 +367,113 @@ impl Fixture {
         let b = self.worktree("dirty-b", "dirty-b");
         self.write(&b, "conflict.txt", "DIRTY-B\nbeta\ngamma\n");
         (a, b)
+    }
+
+    /// Two worktrees whose *uncommitted* state reproduces the merge-tree
+    /// `--quiet` unsoundness.
+    ///
+    /// The shape that matters: a file both sides edit incompatibly
+    /// (`conflict.txt`), plus a one-sided edit on each side inside a
+    /// subdirectory that sorts *after* it (`docs/`). `--quiet` stops once it
+    /// has processed a directory both sides touched and reports the whole
+    /// merge clean, losing the conflict on every path that sorts before it.
+    /// Flat fixtures cannot reproduce this, which is exactly why the bug
+    /// survived until it was run against real worktrees.
+    pub fn quiet_trap_pair(&self) -> (PathBuf, PathBuf) {
+        let a = self.worktree("trap-a", "trap-a");
+        self.write(&a, "conflict.txt", "TRAP-A\nbeta\ngamma\n");
+        self.write(&a, "docs/notes-a.md", "edited by a\n");
+
+        let b = self.worktree("trap-b", "trap-b");
+        self.write(&b, "conflict.txt", "TRAP-B\nbeta\ngamma\n");
+        self.write(&b, "docs/notes-b.md", "edited by b\n");
+        (a, b)
+    }
+
+    /// The documented `cp`-seeded temp-index snapshot, done independently of
+    /// `git::Predictor`, so tests can compare merge-tree forms against the same
+    /// real worktree trees the plugin builds. Objects are redirected into a
+    /// scratch store, so this leaves the fixture repo's ODB alone.
+    pub fn snapshot_tree(&self, checkout: &Path) -> String {
+        let git_dir = PathBuf::from(self.git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        ));
+        let common_dir = PathBuf::from(self.git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let index = self.root.join(format!("snap-index-{seq}"));
+        let _ = std::fs::remove_file(&index);
+        let _ = std::fs::copy(git_dir.join("index"), &index);
+
+        let odb = self.scratch_odb();
+        let run = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(checkout)
+                .args(args)
+                .env("HOME", self.root.join("home"))
+                .env("GIT_CONFIG_GLOBAL", self.root.join("home/.gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_INDEX_FILE", &index)
+                .env("GIT_OBJECT_DIRECTORY", &odb)
+                .env(
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                    common_dir.join("objects"),
+                )
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["add", "-A", "--"]);
+        let tree = run(&["write-tree"]);
+        let _ = std::fs::remove_file(&index);
+        let mut lock = index.into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock));
+        tree
+    }
+
+    /// Scratch object store shared by this fixture's snapshot and merge-tree
+    /// calls, so neither ever writes into the fixture repo.
+    pub fn scratch_odb(&self) -> PathBuf {
+        let odb = self.root.join("scratch-odb");
+        std::fs::create_dir_all(odb.join("pack")).expect("create scratch odb");
+        std::fs::create_dir_all(odb.join("info")).expect("create scratch odb");
+        odb
+    }
+
+    /// Runs `merge-tree` against the scratch object store and returns its exit
+    /// code and raw stdout.
+    pub fn merge_tree(&self, checkout: &Path, args: &[&str]) -> (i32, Vec<u8>) {
+        let common_dir = PathBuf::from(self.git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .arg("merge-tree")
+            .args(args)
+            .env("HOME", self.root.join("home"))
+            .env("GIT_CONFIG_GLOBAL", self.root.join("home/.gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_OBJECT_DIRECTORY", self.scratch_odb())
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                common_dir.join("objects"),
+            )
+            .output()
+            .expect("spawn merge-tree");
+        (out.status.code().unwrap_or(-1), out.stdout)
     }
 
     /// Two worktrees with uncommitted edits to opposite ends of `shared.txt`.

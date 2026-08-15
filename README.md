@@ -110,14 +110,13 @@ the rows below into your `config.toml`, takes a `config.toml.collide-backup` alo
 reloads herdr; if the reload fails it puts the backup back byte for byte. **Collide: undo sidebar
 setup** restores that backup.
 
-To do it by hand, add the four tokens to `[ui.sidebar.spaces]` in `~/.config/herdr/config.toml`:
+To do it by hand, add the three tokens to `[ui.sidebar.spaces]` in `~/.config/herdr/config.toml`:
 
 ```toml
 [ui.sidebar.spaces]
 rows = [
   ["state_icon", "workspace"],
   ["branch",
-    { token = "$collide_clean",    fg = "#99FFE4" },
     { token = "$collide_overlap",  fg = "#FFC799" },
     { token = "$collide_runaway",  fg = "#FFB27F" },
     { token = "$collide_conflict", fg = "#FF8080" }],
@@ -132,16 +131,20 @@ herdr server reload-config
 
 Sidebar rows reload live — no restart, and no losing your panes.
 
-### Why there are four tokens instead of one
+### Why there are three tokens instead of one
 
 herdr renders a token's *value* as flat text and cannot colour it by content. A single
 `$collide_status` token could say `✘ 2`, but it could never say it in red. So severity is encoded in
-the token *name*: the plugin lights exactly one of `collide_clean`, `collide_overlap`,
-`collide_runaway`, or `collide_conflict` at a time and clears the other three, and each name carries
-its own `fg` in your config. The `$` prefix belongs to herdr's config row syntax only; the names sent
-over the wire have no `$`.
+the token *name*: the plugin lights exactly one of `collide_overlap`, `collide_runaway`, or
+`collide_conflict` at a time and clears the other two, and each name carries its own `fg` in your
+config. The `$` prefix belongs to herdr's config row syntax only; the names sent over the wire have
+no `$`.
 
-Change the colours to taste. The names must stay exactly as written, and all four should be present —
+There is deliberately no token for a clean workspace. A workspace with nothing to report clears its
+badge instead of writing one, so its sidebar cell is empty by design — an empty cell means "no
+collisions", not "the plugin is broken".
+
+Change the colours to taste. The names must stay exactly as written, and all three should be present —
 if you leave one out, workspaces at that severity simply show nothing.
 
 ## Actions and panes
