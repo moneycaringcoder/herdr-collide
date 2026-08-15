@@ -19,7 +19,9 @@ use collide::config::Config;
 use collide::git::{self, predict_conflict, Predictor};
 use collide::model::{FileVerdict, Report, Severity};
 
-use fixtures::{change_set, checkout, Fixture};
+use fixtures::{
+    change_set, change_set_degraded, change_set_renamed, change_set_with_lines, checkout, Fixture,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -437,9 +439,12 @@ fn unpairable_checkouts_are_excluded() {
 #[test]
 fn runaway_thresholds_raise_severity_without_an_overlap() {
     let checkouts = vec![checkout("one", Path::new("/tmp/one"), "/repo/.git")];
-    let mut set = change_set(&["a.txt"]);
-    set.lines_added = 10_000;
-    let changes = vec![("one".to_string(), set)];
+    // Volume lives on the paths, so that filtering a path also removes the
+    // lines it contributed.
+    let changes = vec![(
+        "one".to_string(),
+        change_set_with_lines(&[("a.txt", 10_000)]),
+    )];
 
     let report = analyse(&checkouts, &changes, &config());
     assert_eq!(report.statuses[0].severity, Severity::Runaway);
@@ -452,8 +457,7 @@ fn conflict_outranks_runaway_and_overlap() {
         checkout("one", Path::new("/tmp/one"), "/repo/.git"),
         checkout("two", Path::new("/tmp/two"), "/repo/.git"),
     ];
-    let mut noisy = change_set(&["shared.txt", "other.txt"]);
-    noisy.lines_added = 10_000;
+    let noisy = change_set_with_lines(&[("shared.txt", 10_000), ("other.txt", 0)]);
     let changes = vec![
         ("one".to_string(), noisy),
         ("two".to_string(), change_set(&["shared.txt"])),
@@ -467,6 +471,7 @@ fn conflict_outranks_runaway_and_overlap() {
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), true)],
             failed: false,
+            approximate: false,
         }],
         &changes,
         &config(),
@@ -500,6 +505,7 @@ fn a_clean_prediction_downgrades_unknown_to_overlap() {
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), false)],
             failed: false,
+            approximate: false,
         }],
         &changes,
         &config(),
@@ -529,6 +535,7 @@ fn a_failed_prediction_leaves_the_verdict_unknown() {
             right_workspace_id: "two".to_string(),
             verdicts: Vec::new(),
             failed: true,
+            approximate: false,
         }],
         &changes,
         &config(),
@@ -555,6 +562,7 @@ fn json_report_is_stable_and_documented() {
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), true)],
             failed: false,
+            approximate: false,
         }],
         &changes,
         &config(),
@@ -566,7 +574,7 @@ fn json_report_is_stable_and_documented() {
         notes: vec!["a note".to_string()],
     });
 
-    assert_eq!(json["schema"], 1);
+    assert_eq!(json["schema"], 2);
     assert_eq!(json["checkouts"].as_array().unwrap().len(), 2);
     assert_eq!(json["checkouts"][0]["workspace_id"], "one");
     assert_eq!(json["checkouts"][0]["changed_files"], 1);
@@ -844,4 +852,428 @@ fn base_ref_for_only_probes_at_the_default() {
         collide::collide::base_ref_for(&wt, &pinned),
         "refs/heads/anything"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Wrong answers that used to look like right ones
+//
+// Each test below pins a case where the analysis produced a confident, ordinary
+// looking result that was not true. They are grouped because they share a
+// shape: a failure, an exclusion, or a double count that reached the badge
+// wearing the costume of a normal reading.
+// ---------------------------------------------------------------------------
+
+/// A prediction that could not run must not be reported as "merges cleanly".
+/// The overlap badge is a claim about the merge; a failed prediction has not
+/// earned it, and the two used to be indistinguishable in the sidebar.
+#[test]
+fn a_pair_whose_prediction_failed_is_unknown_and_never_an_overlap() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("one".to_string(), change_set(&["shared.txt"])),
+        ("two".to_string(), change_set(&["shared.txt"])),
+    ];
+
+    let mut report = analyse(&checkouts, &changes, &config());
+    // `failed` is exactly what `predict_all` builds when the git call errors.
+    let failed = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: Vec::new(),
+        failed: true,
+        approximate: false,
+    }];
+    apply_predictions(&mut report, &failed, &changes, &config());
+
+    assert_eq!(report.pairings[0].shared[0].verdict, FileVerdict::Unknown);
+    for id in ["one", "two"] {
+        let status = status_of(&report, id);
+        assert_eq!(status.severity, Severity::Unknown);
+        assert_eq!(status.severity.token_name(), "collide_unknown");
+        assert_eq!(status.unknown_count, 1);
+        assert_eq!(
+            status.overlap_count, 0,
+            "an unknown verdict must not be counted as an overlap"
+        );
+    }
+}
+
+/// A successful prediction that finds the file clean is a genuine overlap, so
+/// the test above cannot pass by accident.
+#[test]
+fn a_pair_whose_prediction_succeeded_and_found_nothing_is_a_real_overlap() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("one".to_string(), change_set(&["shared.txt"])),
+        ("two".to_string(), change_set(&["shared.txt"])),
+    ];
+
+    let mut report = analyse(&checkouts, &changes, &config());
+    let clean = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![("shared.txt".to_string(), false)],
+        failed: false,
+        approximate: false,
+    }];
+    apply_predictions(&mut report, &clean, &changes, &config());
+
+    assert_eq!(report.pairings[0].shared[0].verdict, FileVerdict::Overlap);
+    assert_eq!(status_of(&report, "one").severity, Severity::Overlap);
+    assert_eq!(status_of(&report, "one").unknown_count, 0);
+}
+
+/// A checkout whose git pass failed carries no paths, which used to make it
+/// indistinguishable from a checkout with nothing to report.
+#[test]
+fn a_checkout_that_could_not_be_read_is_not_reported_as_clean() {
+    let checkouts = vec![
+        checkout("healthy", Path::new("/tmp/healthy"), "/repo/.git"),
+        checkout("unreadable", Path::new("/tmp/unreadable"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("healthy".to_string(), change_set(&[])),
+        (
+            "unreadable".to_string(),
+            change_set_degraded(&format!("{}: permission denied", git::DEGRADED_UNREADABLE)),
+        ),
+    ];
+
+    let report = analyse(&checkouts, &changes, &config());
+    assert_eq!(status_of(&report, "healthy").severity, Severity::Clean);
+    assert_eq!(status_of(&report, "unreadable").severity, Severity::Unknown);
+}
+
+/// A workspace with no entry in `changes` at all is the same failure by another
+/// route, and must not default to clean either.
+#[test]
+fn a_checkout_with_no_change_set_at_all_is_unknown() {
+    let checkouts = vec![checkout("orphan", Path::new("/tmp/orphan"), "/repo/.git")];
+    let report = analyse(&checkouts, &[], &config());
+    assert_eq!(status_of(&report, "orphan").severity, Severity::Unknown);
+}
+
+/// Ignored paths must take their line volume with them. A `package-lock.json`
+/// the plugin has decided not to look at cannot be allowed to paint a runaway
+/// badge on its own.
+#[test]
+fn an_ignored_path_takes_its_line_count_with_it() {
+    let checkouts = vec![checkout("one", Path::new("/tmp/one"), "/repo/.git")];
+    let changes = vec![(
+        "one".to_string(),
+        change_set_with_lines(&[("package-lock.json", 90_000)]),
+    )];
+
+    let report = analyse(&checkouts, &changes, &config());
+    let status = status_of(&report, "one");
+    assert!(
+        !status.runaway,
+        "a change set consisting only of ignored paths cannot be a runaway"
+    );
+    assert_eq!(status.severity, Severity::Clean);
+    assert_eq!(status.lines_changed, 0);
+}
+
+/// The same volume on a path that is *not* ignored still trips the threshold,
+/// so the test above is measuring the filter rather than a broken threshold.
+#[test]
+fn the_same_volume_on_a_counted_path_is_still_a_runaway() {
+    let checkouts = vec![checkout("one", Path::new("/tmp/one"), "/repo/.git")];
+    let changes = vec![(
+        "one".to_string(),
+        change_set_with_lines(&[("src/generated.rs", 90_000)]),
+    )];
+
+    let report = analyse(&checkouts, &changes, &config());
+    assert!(status_of(&report, "one").runaway);
+    assert_eq!(status_of(&report, "one").severity, Severity::Runaway);
+}
+
+/// Both halves of a rename belong in the change set for pairing, and one rename
+/// is still one changed file. Counting both halved the runaway threshold.
+#[test]
+fn a_rename_counts_as_one_changed_file_not_two() {
+    let checkouts = vec![checkout("one", Path::new("/tmp/one"), "/repo/.git")];
+    // 21 renames: 42 paths, but only 21 files. The default threshold is 40.
+    let changes = vec![("one".to_string(), change_set_renamed(21))];
+
+    let report = analyse(&checkouts, &changes, &config());
+    let status = status_of(&report, "one");
+    assert_eq!(status.changed_files, 21);
+    assert!(
+        !status.runaway,
+        "21 renamed files must not trip a 40-file threshold"
+    );
+
+    // And the threshold still works: 41 renamed files is 41 changed files.
+    let many = vec![("one".to_string(), change_set_renamed(41))];
+    let report = analyse(&checkouts, &many, &config());
+    assert!(status_of(&report, "one").runaway);
+}
+
+/// Two herdr workspaces can be opened on one directory, and one checkout can
+/// sit inside another. Either way git reports one change set twice, so every
+/// changed file looks shared and the pair badges a collision that is not real.
+#[test]
+fn two_workspaces_on_the_same_tree_are_never_paired() {
+    let fixture = Fixture::new("same-tree");
+    let wt = fixture.worktree("wt", "wt");
+    let nested = wt.join("src");
+    std::fs::create_dir_all(&nested).expect("nested dir");
+
+    let same = vec![
+        checkout("outer", &wt, "/repo/.git"),
+        checkout("again", &wt, "/repo/.git"),
+    ];
+    let changes = vec![
+        ("outer".to_string(), change_set(&["src/a.rs", "src/b.rs"])),
+        ("again".to_string(), change_set(&["src/a.rs", "src/b.rs"])),
+    ];
+    let report = analyse(&same, &changes, &config());
+    assert!(
+        report.pairings.is_empty(),
+        "one working tree cannot collide with itself"
+    );
+
+    let inside = vec![
+        checkout("outer", &wt, "/repo/.git"),
+        checkout("inner", &nested, "/repo/.git"),
+    ];
+    let changes = vec![
+        ("outer".to_string(), change_set(&["src/a.rs"])),
+        ("inner".to_string(), change_set(&["src/a.rs"])),
+    ];
+    let report = analyse(&inside, &changes, &config());
+    assert!(
+        report.pairings.is_empty(),
+        "a checkout nested inside another reports the same change set"
+    );
+}
+
+/// A rename can conflict on a path that appears under a different name in each
+/// change set, so an empty path intersection is not proof that a pair is safe.
+/// The prefilter used to drop those pairs before prediction ever saw them,
+/// which made the escape hatch in `git::Predictor::predict_pair` unreachable.
+#[test]
+fn a_pair_with_no_shared_path_is_still_predicted_when_either_side_renamed() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let mut renamed = change_set(&["only-here.rs"]);
+    renamed.has_rename = true;
+    let changes = vec![
+        ("one".to_string(), renamed),
+        ("two".to_string(), change_set(&["only-there.rs"])),
+    ];
+
+    let report = analyse(&checkouts, &changes, &config());
+    assert_eq!(
+        report.pairings.len(),
+        1,
+        "a renaming side must still be handed to prediction"
+    );
+    assert!(report.pairings[0].shared.is_empty());
+
+    // With neither side renaming, the pair is dropped for free as before.
+    let plain = vec![
+        ("one".to_string(), change_set(&["only-here.rs"])),
+        ("two".to_string(), change_set(&["only-there.rs"])),
+    ];
+    assert!(analyse(&checkouts, &plain, &config()).pairings.is_empty());
+}
+
+/// The rename probe must stay invisible when it finds nothing: a pairing with
+/// no shared files is noise in the pane.
+#[test]
+fn a_rename_probe_that_finds_nothing_leaves_no_pairing_behind() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let mut renamed = change_set(&["only-here.rs"]);
+    renamed.has_rename = true;
+    let changes = vec![
+        ("one".to_string(), renamed),
+        ("two".to_string(), change_set(&["only-there.rs"])),
+    ];
+
+    let mut report = analyse(&checkouts, &changes, &config());
+    let nothing = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: Vec::new(),
+        failed: false,
+        approximate: false,
+    }];
+    apply_predictions(&mut report, &nothing, &changes, &config());
+    assert!(report.pairings.is_empty());
+}
+
+/// A forced merge base makes the verdict an approximation, and the user is
+/// entitled to know that rather than being handed it as final.
+#[test]
+fn an_approximate_prediction_is_carried_through_to_the_pairing() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("one".to_string(), change_set(&["shared.txt"])),
+        ("two".to_string(), change_set(&["shared.txt"])),
+    ];
+
+    let mut report = analyse(&checkouts, &changes, &config());
+    assert!(!report.pairings[0].approximate);
+    let forced = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![("shared.txt".to_string(), true)],
+        failed: false,
+        approximate: true,
+    }];
+    apply_predictions(&mut report, &forced, &changes, &config());
+    assert!(report.pairings[0].approximate);
+}
+
+/// `ignore_suffixes` is a suffix list, not a substring list. Swallowing
+/// `tools/cargo.sum` because the list contains `go.sum` drops a real change
+/// with nothing to show for it.
+#[test]
+fn an_ignore_suffix_only_matches_at_a_path_boundary() {
+    let config = Config {
+        ignore_suffixes: vec![
+            "Cargo.lock".to_string(),
+            "go.sum".to_string(),
+            ".tmp".to_string(),
+        ],
+        ..config()
+    };
+
+    for ignored in [
+        "Cargo.lock",
+        "crates/core/Cargo.lock",
+        "go.sum",
+        "vendor/go.sum",
+        // A suffix beginning with `.` is an extension and may match mid-name.
+        "build/output.tmp",
+    ] {
+        assert!(
+            collide::collide::is_ignored(ignored, &config),
+            "{ignored} should be ignored"
+        );
+    }
+
+    for kept in [
+        "vendor/NotReallyCargo.lock",
+        "tools/cargo.sum",
+        "docs/mango.sum",
+        "src/yarn.lock.rs",
+    ] {
+        assert!(
+            !collide::collide::is_ignored(kept, &config),
+            "{kept} is a real path and must not be ignored"
+        );
+    }
+}
+
+/// The detail view prints one header per repository. It used to take the
+/// `repo_root` of whichever member sorted first by label, so the header named a
+/// worktree rather than the repository — and changed when a workspace was
+/// renamed.
+#[test]
+fn every_checkout_of_one_repo_reports_the_same_root() {
+    let fixture = Fixture::new("repo-root-agreement");
+    let main = fixture.worktree("wt", "wt");
+    let sibling = fixture.worktree("other", "other");
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("one", &main, "ignored-herdr-key"),
+            checkout("two", &sibling, "ignored-herdr-key"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+
+    let roots: BTreeSet<&std::path::Path> = cycle
+        .report
+        .checkouts
+        .iter()
+        .map(|c| c.repo_root.as_path())
+        .collect();
+    assert_eq!(
+        roots.len(),
+        1,
+        "two worktrees of one repository must agree on its root, got {roots:?}"
+    );
+    // And the root they agree on is the repository, not either worktree.
+    let root = roots.into_iter().next().unwrap();
+    assert_ne!(root, main.as_path());
+    assert_ne!(root, sibling.as_path());
+}
+
+/// git can name a conflicting path that appears in neither change set. A rename
+/// explains that honestly. A content filter the snapshot deliberately does not
+/// run explains it dishonestly: a filtered path that is stat-dirty but
+/// content-identical re-hashes to its raw bytes and differs from a base holding
+/// the filtered blob, even though `status` correctly calls the worktree clean.
+/// Believing that would raise a conflict on a file neither agent touched.
+#[test]
+fn a_conflicting_path_in_neither_change_set_is_only_believed_when_a_rename_explains_it() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("one".to_string(), change_set(&["shared.txt"])),
+        ("two".to_string(), change_set(&["shared.txt"])),
+    ];
+    // Neither side renamed anything, and neither change set mentions media.bin.
+    let phantom = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![
+            ("shared.txt".to_string(), false),
+            ("media.bin".to_string(), true),
+        ],
+        failed: false,
+        approximate: false,
+    }];
+
+    let mut report = analyse(&checkouts, &changes, &config());
+    apply_predictions(&mut report, &phantom, &changes, &config());
+    let paths: Vec<&str> = report.pairings[0]
+        .shared
+        .iter()
+        .map(|s| s.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["shared.txt"],
+        "a conflict on a file neither change set lists, with no rename to explain it, is a false alarm"
+    );
+
+    // The same prediction, with a rename on one side, is believed: that is the
+    // case the pair was predicted for.
+    let mut renamed = change_set(&["shared.txt"]);
+    renamed.has_rename = true;
+    let changes = vec![
+        ("one".to_string(), renamed),
+        ("two".to_string(), change_set(&["shared.txt"])),
+    ];
+    let mut report = analyse(&checkouts, &changes, &config());
+    apply_predictions(&mut report, &phantom, &changes, &config());
+    let paths: Vec<&str> = report.pairings[0]
+        .shared
+        .iter()
+        .map(|s| s.path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["media.bin", "shared.txt"]);
 }

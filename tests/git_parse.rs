@@ -1,5 +1,6 @@
-//! Parsing of real git plumbing output, and the change-set assembly built on
-//! it. Every byte string these tests parse comes out of an actual git process
+//! Parsing of real git plumbing output, the change-set assembly built on it,
+//! and the decisions the git layer makes before it will ask git anything at all.
+//! Every byte string these tests parse comes out of an actual git process
 //! running against a throwaway fixture, not from a hand-written literal, so a
 //! change in git's framing fails the test instead of passing silently.
 
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use collide::git::{
     self, change_set, current_branch, parse_merge_tree_z, parse_numstat_z, parse_status_v2,
+    Predictor,
 };
 use collide::model::ChangeKind;
 
@@ -154,10 +156,10 @@ fn untracked_files_are_reported_and_ignored_files_are_not() {
 }
 
 #[test]
-fn paths_with_a_space_and_a_newline_survive_z_framing() {
+fn a_path_with_a_space_survives_z_framing_intact() {
     let fixture = Fixture::new("weird-paths");
     let wt = fixture.worktree("wt", "wt");
-    let (spaced, newline) = fixture.tricky_untracked(&wt);
+    let (spaced, _newline) = fixture.tricky_untracked(&wt);
 
     let entries = parse_status_v2(&status_bytes(&fixture, &wt, false));
     let paths = paths_of(&entries);
@@ -165,16 +167,93 @@ fn paths_with_a_space_and_a_newline_survive_z_framing() {
         paths.contains(&spaced),
         "path with a space was truncated: {paths:?}"
     );
-    assert!(
-        paths.contains(&newline),
-        "path with a newline was split: {paths:?}"
-    );
 
-    // And they reach the change set intact.
+    // And it reaches the change set intact.
     let set = change_set(&wt, "main", TIMEOUT).expect("change set");
     let set_paths: Vec<&str> = set.paths.iter().map(|p| p.path.as_str()).collect();
     assert!(set_paths.contains(&spaced.as_str()), "{set_paths:?}");
-    assert!(set_paths.contains(&newline.as_str()), "{set_paths:?}");
+}
+
+/// A path containing a control character is deliberately *not* passed through:
+/// it is drawn into a pane that redraws in place, and a newline in a filename
+/// would corrupt every row below it. What must survive is the framing — the
+/// record is one record, not two — and the identity of the file.
+#[test]
+fn a_path_with_a_newline_is_neutralised_but_not_split() {
+    let fixture = Fixture::new("newline-path");
+    let wt = fixture.worktree("wt", "wt");
+    let (_spaced, newline) = fixture.tricky_untracked(&wt);
+    assert!(newline.contains('\n'), "fixture stopped using a newline");
+
+    let entries = parse_status_v2(&status_bytes(&fixture, &wt, false));
+    let paths = paths_of(&entries);
+    let rendered = paths
+        .iter()
+        .find(|p| p.starts_with("weird"))
+        .unwrap_or_else(|| panic!("the record was split or lost: {paths:?}"));
+    assert!(
+        !rendered.contains('\n'),
+        "a control character reached the model: {rendered:?}"
+    );
+    assert!(
+        rendered.starts_with("weird\u{FFFD}name.txt~"),
+        "unexpected rendering: {rendered:?}"
+    );
+
+    // One file on disk, one entry: the newline did not become a record boundary.
+    assert_eq!(
+        paths.iter().filter(|p| p.starts_with("weird")).count(),
+        1,
+        "{paths:?}"
+    );
+    let set = change_set(&wt, "main", TIMEOUT).expect("change set");
+    assert!(
+        set.paths.iter().any(|p| &p.path == rendered),
+        "the change set disagrees with the parser: {:?}",
+        set.paths
+    );
+}
+
+/// Replacement on its own is not injective, and change sets are intersected by
+/// string: `\xff-one.txt` and `\xfe-two.txt` both render as `<?>-one.txt`-shaped
+/// text, so two worktrees holding two *different* files were reported as sharing
+/// one. The rendering has to stay stable for identical bytes — `status` and
+/// `merge-tree` output must still match — and differ for different bytes.
+#[cfg(unix)]
+#[test]
+fn two_different_non_utf8_paths_do_not_collapse_into_one() {
+    let fixture = Fixture::new("non-utf8");
+    let wt = fixture.worktree("wt", "wt");
+    let (first, second) = fixture.distinct_invalid_utf8_untracked(&wt);
+    assert_ne!(first, second);
+
+    let bytes = status_bytes(&fixture, &wt, false);
+    let entries = parse_status_v2(&bytes);
+    let rendered: Vec<String> = paths_of(&entries)
+        .into_iter()
+        .filter(|p| p.contains('\u{FFFD}'))
+        .collect();
+
+    assert_eq!(
+        rendered.len(),
+        2,
+        "two distinct files must render as two distinct paths: {rendered:?}"
+    );
+    assert_ne!(rendered[0], rendered[1], "{rendered:?}");
+
+    // Stability: parsing the same bytes twice must give the same strings, or
+    // status output and merge-tree output would stop matching each other.
+    assert_eq!(paths_of(&parse_status_v2(&bytes)), paths_of(&entries));
+
+    // And the change set carries both, still distinct.
+    let set = change_set(&wt, "main", TIMEOUT).expect("change set");
+    let in_set: Vec<&str> = set
+        .paths
+        .iter()
+        .map(|p| p.path.as_str())
+        .filter(|p| p.contains('\u{FFFD}'))
+        .collect();
+    assert_eq!(in_set.len(), 2, "{in_set:?}");
 }
 
 #[test]
@@ -263,12 +342,52 @@ fn merge_tree_z_conflict_yields_paths_and_a_machine_stable_type() {
 
     let parsed = parse_merge_tree_z(&out.stdout);
     assert_eq!(parsed.conflicted, vec!["conflict.txt".to_string()]);
+    assert_eq!(
+        parsed.conflict_types,
+        vec!["CONFLICT (contents)".to_string()],
+        "conflict_types must be exactly the machine-stable tokens"
+    );
+}
+
+/// git emits an `Auto-merging` message record for every file it merged
+/// *successfully*, in the same framing as a real conflict record. Taking every
+/// type field verbatim filled this list with noise, and `Vec::dedup` could not
+/// collapse the repeats because they are not adjacent — for this pair the raw
+/// sequence is `Auto-merging, CONFLICT (contents), Auto-merging,
+/// CONFLICT (contents)`. Asserting `any(starts_with("CONFLICT ("))` passed
+/// happily on that, which is why this asserts the whole list.
+#[test]
+fn merge_tree_conflict_types_exclude_auto_merging_and_never_repeat() {
+    let fixture = Fixture::new("mt-types");
+    let (a, _b) = fixture.two_file_conflict_pair();
+
+    let (code, stdout) = fixture.merge_tree(
+        &a,
+        &[
+            "--write-tree",
+            "-z",
+            "--name-only",
+            "twofile-a",
+            "twofile-b",
+        ],
+    );
+    assert_eq!(code, 1, "the fixture pair was supposed to conflict");
+    // Guard against the fixture going vacuous: git really does emit the noise.
+    let raw = String::from_utf8_lossy(&stdout);
     assert!(
-        parsed
-            .conflict_types
-            .iter()
-            .any(|t| t.starts_with("CONFLICT (")),
-        "no machine-stable conflict token in {parsed:?}"
+        raw.contains("Auto-merging"),
+        "git no longer emits Auto-merging records; this test proves nothing now"
+    );
+
+    let parsed = parse_merge_tree_z(&stdout);
+    assert_eq!(
+        parsed.conflicted,
+        vec!["conflict.txt".to_string(), "renamed.txt".to_string()]
+    );
+    assert_eq!(
+        parsed.conflict_types,
+        vec!["CONFLICT (contents)".to_string()],
+        "two conflicting files must not yield four tokens, two of them noise"
     );
 }
 
@@ -343,28 +462,127 @@ fn unborn_branch_degrades_and_is_unpairable() {
     assert_eq!(set.lines_added, 2);
 }
 
+/// A branch deleted underneath its worktree leaves exactly what an unborn one
+/// leaves: HEAD pointing at a ref that is not in the ref store. It is reported
+/// as having no commit, which is the part that is true and the part that
+/// matters — it is degraded, unpairable, and still names its branch.
 #[test]
-fn deleted_branch_degrades_distinctly_from_unborn() {
+fn a_deleted_branch_is_reported_as_having_no_commit() {
     let fixture = Fixture::new("deleted");
     let wt = fixture.deleted_branch_worktree("doomed", "doomed");
 
     assert!(
         matches!(
             git::head_state(&wt, TIMEOUT).unwrap(),
-            git::HeadState::BrokenHead { .. }
+            git::HeadState::Unborn { .. }
         ),
-        "a deleted branch must not be reported as unborn"
+        "HEAD names a ref that is not in the ref store"
     );
 
     let set = change_set(&wt, "main", TIMEOUT).expect("change set");
     assert!(set.degraded);
     let reason = set.degraded_reason.as_deref().unwrap();
-    assert!(reason.contains(git::DEGRADED_BROKEN_HEAD), "{reason}");
+    assert!(reason.contains(git::DEGRADED_UNBORN), "{reason}");
     assert!(!collide::collide::pairable(&set));
     // The branch name is still worth reporting even though it no longer exists.
     assert_eq!(
         current_branch(&wt, TIMEOUT).unwrap().as_deref(),
         Some("doomed")
+    );
+}
+
+/// `docs/git-plumbing.md` used to assert that the worktree's `logs/HEAD` tells
+/// an unborn branch from a deleted one. It does not, in either direction, and
+/// both counter-examples are pinned here so the claim cannot come back.
+///
+/// Direction one: `git checkout --orphan` in a worktree that already had
+/// commits is *genuinely unborn* and has a reflog, so the old rule called it a
+/// deleted branch.
+#[test]
+fn an_orphan_branch_with_a_reflog_is_not_a_broken_head() {
+    let fixture = Fixture::new("orphan-reflog");
+    let wt = fixture.orphaned_in_place_worktree("orphan", "fresh");
+
+    let git_dir = fixture.git(&wt, &["rev-parse", "--path-format=absolute", "--git-dir"]);
+    let reflog = std::path::Path::new(&git_dir).join("logs/HEAD");
+    assert!(
+        reflog.metadata().map(|m| m.len() > 0).unwrap_or(false),
+        "fixture no longer has the reflog that made the old rule wrong"
+    );
+
+    assert!(
+        matches!(
+            git::head_state(&wt, TIMEOUT).unwrap(),
+            git::HeadState::Unborn { .. }
+        ),
+        "an orphan branch is unborn however much reflog the worktree carries"
+    );
+}
+
+/// Direction two: with `core.logAllRefUpdates=false` a branch really was deleted
+/// and there is no reflog to prove it, so the old rule called it unborn. Both
+/// deleted-branch fixtures must now agree with each other.
+#[test]
+fn a_deleted_branch_without_a_reflog_is_classified_the_same_way() {
+    let fixture = Fixture::new("deleted-no-reflog");
+    let wt = fixture.deleted_branch_worktree_without_reflog("quiet", "quiet");
+
+    let git_dir = fixture.git(&wt, &["rev-parse", "--path-format=absolute", "--git-dir"]);
+    let reflog = std::path::Path::new(&git_dir).join("logs/HEAD");
+    assert!(
+        !reflog.metadata().map(|m| m.len() > 0).unwrap_or(false),
+        "fixture no longer has the missing reflog that made the old rule wrong"
+    );
+
+    assert!(
+        matches!(
+            git::head_state(&wt, TIMEOUT).unwrap(),
+            git::HeadState::Unborn { .. }
+        ),
+        "reflogging is a configuration choice, not evidence about commits"
+    );
+}
+
+/// What the ref store *can* prove: the ref is there and still yields no commit.
+/// That is the only state `BrokenHead` now claims.
+#[test]
+fn a_ref_pointing_at_a_missing_object_is_a_broken_head() {
+    let fixture = Fixture::new("dangling");
+    let wt = fixture.dangling_head_worktree("dangling", "dangling");
+
+    assert!(
+        matches!(
+            git::head_state(&wt, TIMEOUT).unwrap(),
+            git::HeadState::BrokenHead { .. }
+        ),
+        "a ref whose object is missing is broken, not empty"
+    );
+
+    // `change_set` cannot be asserted on here: `status` itself refuses a HEAD
+    // whose object is gone (`fatal: bad object HEAD`), so the checkout fails
+    // loudly one step earlier. That is the right outcome — the point of the
+    // classification is that `BrokenHead` now names a state git can prove.
+    assert!(matches!(
+        git::current_branch(&wt, TIMEOUT).unwrap().as_deref(),
+        Some("dangling")
+    ));
+}
+
+/// A git that cannot answer must not be read as an answer. Every HEAD probe
+/// exits 128 here, and the old code folded that into the same arm as "no
+/// commit" — which silently removes a healthy checkout from every pairing while
+/// telling the user its branch is unborn.
+#[test]
+fn a_head_git_cannot_read_is_an_error_not_an_unborn_branch() {
+    let fixture = Fixture::new("garbage-head");
+    let wt = fixture.garbage_head_worktree("garbage");
+
+    let err = git::head_state(&wt, TIMEOUT)
+        .expect_err("an unreadable HEAD must not be reported as a state");
+    let text = err.to_string();
+    assert!(
+        text.contains("could not answer") || text.contains("timed out"),
+        "unhelpful error: {text}"
     );
 }
 
@@ -383,6 +601,197 @@ fn a_missing_integration_ref_degrades_without_erroring() {
         .contains(git::DEGRADED_MISSING_BASE_REF));
     // The dirty half is still reported.
     assert!(set.paths.iter().any(|p| p.path == "conflict.txt"));
+}
+
+// ---------------------------------------------------------------------------
+// Choosing a base to measure against
+// ---------------------------------------------------------------------------
+
+/// The probe chain used to end in `Ok("HEAD")`, which is not a guess but a
+/// fabrication: `HEAD...HEAD` is empty by construction, and because both the
+/// base ref and the merge base then resolve, nothing was marked degraded either.
+/// A repository whose trunk is `develop` reported every workspace as clean while
+/// two agents committed conflicting edits to the same line of the same file.
+#[test]
+fn a_repo_with_no_conventional_trunk_reports_no_integration_ref() {
+    let fixture = Fixture::new("trunkless");
+    let repo = fixture.trunkless_repo("dev-trunk", "develop");
+
+    assert_eq!(
+        git::integration_ref(&repo, TIMEOUT).expect("probe"),
+        None,
+        "there is no honest ref to measure against here"
+    );
+}
+
+/// And the sentinel it is replaced by has to *degrade*, not silently produce an
+/// empty change set. Committed work is what disappears, so the fixture commits
+/// something the old code lost entirely.
+#[test]
+fn the_no_integration_ref_sentinel_degrades_instead_of_reporting_clean() {
+    let fixture = Fixture::new("trunkless-degrade");
+    let repo = fixture.trunkless_repo("dev-trunk", "develop");
+    fixture.write(&repo, "conflict.txt", "COMMITTED\nbeta\ngamma\n");
+    fixture.commit_all(&repo, "work nobody can measure");
+
+    let set = change_set(&repo, git::NO_INTEGRATION_REF, TIMEOUT).expect("change set");
+    assert!(
+        set.degraded,
+        "an unmeasurable checkout must not read as a clean one"
+    );
+    let reason = set.degraded_reason.as_deref().unwrap();
+    assert!(reason.contains(git::DEGRADED_MISSING_BASE_REF), "{reason}");
+    // The sentinel is never handed to git, so nothing complains about a bad ref.
+    assert!(!reason.contains("does not resolve"), "{reason}");
+}
+
+/// The chain is also wider than the six conventional names, so fewer
+/// repositories reach the sentinel at all: the recorded HEAD of a remote that is
+/// not `origin`, and whatever this user names their trunks.
+#[test]
+fn the_probe_chain_finds_a_non_origin_remote_head() {
+    let fixture = Fixture::new("upstream-remote");
+    let repo = fixture.trunkless_repo("forked", "develop");
+    fixture.git(
+        &repo,
+        &["remote", "add", "upstream", fixture.repo.to_str().unwrap()],
+    );
+    fixture.git(&repo, &["fetch", "-q", "upstream"]);
+    fixture.git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/upstream/HEAD",
+            "refs/remotes/upstream/main",
+        ],
+    );
+
+    assert_eq!(
+        git::integration_ref(&repo, TIMEOUT).expect("probe"),
+        Some("refs/remotes/upstream/HEAD".to_string())
+    );
+}
+
+#[test]
+fn the_probe_chain_falls_back_to_the_configured_default_branch() {
+    let fixture = Fixture::new("default-branch");
+    let repo = fixture.trunkless_repo("named", "develop");
+    fixture.git(&repo, &["config", "init.defaultBranch", "develop"]);
+
+    assert_eq!(
+        git::integration_ref(&repo, TIMEOUT).expect("probe"),
+        Some("refs/heads/develop".to_string())
+    );
+}
+
+/// `status --porcelain` reports paths relative to the repository root whatever
+/// directory git was run in, so joining them onto a checkout path that is a
+/// subdirectory addressed nothing and every untracked file counted zero lines.
+#[test]
+fn line_counts_are_the_same_from_a_subdirectory_as_from_the_root() {
+    let fixture = Fixture::new("subdir");
+    let wt = fixture.worktree("wt", "wt");
+    fixture.write(&wt, "pkg/untracked.txt", "one\ntwo\nthree\n");
+
+    let from_root = change_set(&wt, "main", TIMEOUT).expect("change set");
+    let from_subdir = change_set(&wt.join("pkg"), "main", TIMEOUT).expect("change set");
+
+    assert_eq!(from_root.lines_added, 3, "{:?}", from_root.paths);
+    assert_eq!(
+        from_subdir.lines_added, from_root.lines_added,
+        "the same worktree measured from a subdirectory: {:?}",
+        from_subdir.paths
+    );
+    assert_eq!(from_subdir.paths, from_root.paths);
+}
+
+// ---------------------------------------------------------------------------
+// What the predictor refuses to answer without asking git
+// ---------------------------------------------------------------------------
+
+/// The one that got away. `predict_pair` used to short-circuit a pair with no
+/// shared path unless a side had a rename — and it decided that from `status`,
+/// which only ever shows *uncommitted* renames. A worktree that had committed a
+/// directory rename and was otherwise clean therefore short-circuited to a
+/// conflict-free verdict, while `merge-tree` on the very same pair exits 1 with
+/// `CONFLICT (directory rename suggested)`.
+///
+/// The pair is asked with an empty path list on purpose: that is exactly the
+/// shape the intersection produces here, because one side changed `docs/*` and
+/// `guide/*` and the other changed `docs/notes-c.md`.
+#[test]
+fn a_committed_directory_rename_is_predicted_even_with_no_shared_path() {
+    let fixture = Fixture::new("dir-rename");
+    let (a, b) = fixture.committed_directory_rename_pair();
+
+    // Guard against the fixture going vacuous: the change sets really do share
+    // nothing, so nothing but the predictor can catch this.
+    let left = change_set(&a, "main", TIMEOUT).expect("change set");
+    let right = change_set(&b, "main", TIMEOUT).expect("change set");
+    let shared: Vec<&str> = left
+        .path_set()
+        .intersection(&right.path_set())
+        .copied()
+        .collect();
+    assert!(shared.is_empty(), "fixture now shares paths: {shared:?}");
+
+    let mut predictor = Predictor::new(TIMEOUT).expect("predictor");
+    predictor.prime(&a).unwrap();
+    predictor.prime(&b).unwrap();
+    let prediction = predictor.predict_pair(&a, &b, &[]).expect("prediction");
+
+    assert!(
+        prediction.pair_conflict,
+        "merge-tree's exit status is the authority and it says conflict: {prediction:?}"
+    );
+    assert!(
+        prediction
+            .verdicts
+            .iter()
+            .any(|(path, hit)| *hit && path == "guide/notes-c.md"),
+        "the conflicting path was not reported: {prediction:?}"
+    );
+    assert!(
+        prediction
+            .conflict_types
+            .iter()
+            .any(|t| t.contains("directory rename")),
+        "{prediction:?}"
+    );
+}
+
+/// Two checkouts with no common ancestor get one answer regardless of how dirty
+/// they are. The dirty path used to substitute the empty tree for the base,
+/// which turns every shared path into an add/add and reports a confident
+/// conflict on all of them, while the clean path let merge-tree refuse. The same
+/// two branches therefore flipped between "unknown" and "everything conflicts"
+/// on the strength of one stray untracked file.
+#[test]
+fn a_pair_with_no_common_ancestor_is_refused_however_dirty_it_is() {
+    let fixture = Fixture::new("unrelated");
+    let (a, b) = fixture.unrelated_history_pair();
+
+    let refuse = |left: &std::path::Path, right: &std::path::Path| -> String {
+        let mut predictor = Predictor::new(TIMEOUT).expect("predictor");
+        predictor.prime(left).unwrap();
+        predictor.prime(right).unwrap();
+        predictor
+            .predict_pair(left, right, &["conflict.txt".to_string()])
+            .expect_err("a pair with no common ancestor cannot be predicted")
+            .to_string()
+    };
+
+    let clean = refuse(&a, &b);
+    // One untracked file is all it took to change the verdict before.
+    fixture.write(&a, "stray.txt", "stray\n");
+    let dirty = refuse(&a, &b);
+
+    for err in [&clean, &dirty] {
+        assert!(
+            err.contains("no common ancestor") || err.contains("unrelated histories"),
+            "unhelpful error: {err}"
+        );
+    }
 }
 
 #[test]

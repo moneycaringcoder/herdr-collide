@@ -41,6 +41,35 @@ pub enum ChangeKind {
 pub struct ChangedPath {
     pub path: String,
     pub kind: ChangeKind,
+    /// Lines this path contributes to the change set. Carried per path so that
+    /// `ignore_suffixes` can drop a path's volume along with the path itself —
+    /// a `package-lock.json` that the plugin has decided to ignore must not
+    /// still trip the runaway threshold.
+    pub lines_added: u64,
+    pub lines_removed: u64,
+    /// True for the *original* path of a rename. Both halves belong to the
+    /// change set, because a sibling worktree editing the old name really does
+    /// collide — but one rename is one changed file, so the origin half must not
+    /// count twice toward `runaway_files`.
+    pub is_rename_origin: bool,
+}
+
+impl ChangedPath {
+    /// A plain changed path with no volume attached, for callers that only care
+    /// about the set of paths.
+    pub fn new(path: impl Into<String>, kind: ChangeKind) -> Self {
+        Self {
+            path: path.into(),
+            kind,
+            lines_added: 0,
+            lines_removed: 0,
+            is_rename_origin: false,
+        }
+    }
+
+    pub fn lines_changed(&self) -> u64 {
+        self.lines_added.saturating_add(self.lines_removed)
+    }
 }
 
 /// Everything one checkout has changed relative to its merge base, plus enough
@@ -54,6 +83,11 @@ pub struct ChangeSet {
     /// (unborn branch, deleted branch, detached HEAD with no merge base).
     pub degraded: bool,
     pub degraded_reason: Option<String>,
+    /// True when git reported a rename in this checkout. A rename can conflict
+    /// on a path that appears under a different name in each change set, so a
+    /// pair with no literal path in common still has to be predicted when
+    /// either side renamed something.
+    pub has_rename: bool,
 }
 
 impl ChangeSet {
@@ -67,6 +101,10 @@ impl ChangeSet {
 }
 
 /// Per-file verdict for one pair of checkouts.
+///
+/// `Unknown` is not a weaker `Overlap`. It means prediction could not run, so
+/// the honest answer is "I do not know", and the severity ladder ranks it above
+/// a known-clean overlap for exactly that reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FileVerdict {
     /// Both sides touched the file; the changes merge cleanly.
@@ -89,6 +127,15 @@ pub struct Pairing {
     pub left_workspace_id: String,
     pub right_workspace_id: String,
     pub shared: Vec<SharedFile>,
+    /// True when the prediction for this pair had to force a single merge base
+    /// although the histories offer more than one. The verdicts are then an
+    /// approximation of what a real merge would do, and the detail view says so
+    /// rather than presenting them as final.
+    ///
+    /// A pair with *no* common ancestor is not approximate — it is refused
+    /// outright and its files stay [`FileVerdict::Unknown`], because there is no
+    /// merge to approximate.
+    pub approximate: bool,
 }
 
 impl Pairing {
@@ -98,15 +145,28 @@ impl Pairing {
             .filter(|f| f.verdict == FileVerdict::Conflict)
             .count()
     }
+
+    pub fn unknowns(&self) -> usize {
+        self.shared
+            .iter()
+            .filter(|f| f.verdict == FileVerdict::Unknown)
+            .count()
+    }
 }
 
 /// Worst-case state for a single workspace, which is what the badge shows.
+///
+/// The order is the precedence order, and `Unknown` deliberately sits above
+/// `Overlap` and `Runaway`: an overlap badge means "both of you touched this
+/// file and it merges clean", which is a claim, and a failed prediction is not
+/// entitled to make it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Severity {
     #[default]
     Clean,
     Overlap,
     Runaway,
+    Unknown,
     Conflict,
 }
 
@@ -119,14 +179,16 @@ impl Severity {
             Severity::Clean => "collide_clean",
             Severity::Overlap => "collide_overlap",
             Severity::Runaway => "collide_runaway",
+            Severity::Unknown => "collide_unknown",
             Severity::Conflict => "collide_conflict",
         }
     }
 
-    pub const ALL_TOKENS: [&'static str; 4] = [
+    pub const ALL_TOKENS: [&'static str; 5] = [
         "collide_clean",
         "collide_overlap",
         "collide_runaway",
+        "collide_unknown",
         "collide_conflict",
     ];
 }
@@ -143,11 +205,18 @@ pub struct WorkspaceStatus {
     pub severity: Severity,
     pub overlap_count: usize,
     pub conflict_count: usize,
+    /// Shared files whose verdict could not be established.
+    pub unknown_count: usize,
     pub runaway: bool,
     /// Size of this checkout's change set, which is what a runaway badge
     /// reports. Counts alone cannot express it: a runaway is usually a
     /// workspace sharing nothing at all with its siblings.
     pub lines_changed: u64,
+    /// Distinct changed files after `ignore_suffixes`, with the origin half of
+    /// a rename counted once. A runaway tripped on the file threshold alone
+    /// carries no lines, so the badge falls back to this rather than rendering
+    /// a bare mark with no magnitude.
+    pub changed_files: usize,
 }
 
 /// Full analysis for one refresh cycle, shared by the badge daemon, the detail

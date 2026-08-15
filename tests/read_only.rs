@@ -597,6 +597,16 @@ fn sweep_scratch_reclaims_dead_runs_and_spares_live_ones() {
     std::fs::write(dead.join("index-0"), b"stale").expect("write stale index");
     std::fs::write(dead.join("index-0.lock"), b"").expect("write stale lock");
 
+    // `Predictor::new` falls back to the system temp dir when the state dir
+    // cannot be created, and sweeping only the state dir leaked those forever.
+    let dead_fallback = std::env::temp_dir().join("collide-4294967290-999998");
+    std::fs::create_dir_all(dead_fallback.join("odb")).expect("create dead fallback scratch");
+
+    // A neighbour that merely shares the prefix. Its first segment is not a pid,
+    // so it is none of our business — the fixtures themselves are named this way.
+    let neighbour = std::env::temp_dir().join("collide-fixture-not-a-pid-1");
+    std::fs::create_dir_all(&neighbour).expect("create neighbour dir");
+
     // A live predictor's directory, which must survive the sweep.
     let live = Predictor::new(TIMEOUT).expect("predictor");
     let live_dir = live.scratch_dir().to_path_buf();
@@ -606,9 +616,123 @@ fn sweep_scratch_reclaims_dead_runs_and_spares_live_ones() {
 
     assert!(!dead.exists(), "a dead run's scratch directory survived");
     assert!(
+        !dead_fallback.exists(),
+        "a dead run's temp-dir fallback survived the sweep"
+    );
+    assert!(
+        neighbour.exists(),
+        "the sweep deleted a directory that only shares the prefix"
+    );
+    assert!(
         live_dir.exists(),
         "sweep deleted a live run's scratch directory"
     );
+    let _ = std::fs::remove_dir_all(&neighbour);
     drop(live);
     assert!(!live_dir.exists());
+}
+
+// ---------------------------------------------------------------------------
+// The deadline, and what git leaves behind
+// ---------------------------------------------------------------------------
+
+/// The timeout used to kill the child and then block forever anyway.
+///
+/// A pipe reaches EOF only when every holder of its write end has closed it, so
+/// a process git leaves behind — here a `core.fsmonitor` hook's background
+/// child, in the wild a clean filter that daemonises or a credential helper —
+/// kept the drain threads reading long after git itself was gone. Measured
+/// before the fix: a `git status` that git completes in milliseconds took the
+/// full lifetime of the holder to return through `run_git`.
+///
+/// In the daemon that is not a wrong answer but a silent stop: the refresh loop
+/// parks, every badge freezes at its last value, and nothing is written to
+/// `notes`. A frozen collide is indistinguishable from a quiet repository.
+#[test]
+fn a_git_that_leaks_a_child_holding_the_pipe_cannot_park_the_refresh_loop() {
+    let fixture = Fixture::new("pipe-leak");
+    let wt = fixture.worktree("leaky", "leaky");
+    let holder_seconds = fixture.leaking_fsmonitor(&wt, 90);
+    fixture.write(&wt, "conflict.txt", "dirty\nbeta\ngamma\n");
+
+    // Sanity: git itself is fast. Both streams go to /dev/null rather than to a
+    // pipe, so the leaked holder has nothing of ours to keep open and this
+    // measures git alone — `Fixture::git` would inherit the very bug under test.
+    let bare = std::time::Instant::now();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["--no-optional-locks", "status", "--porcelain=v2"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn git status");
+    assert!(status.success(), "fixture status failed: {status:?}");
+    assert!(
+        bare.elapsed() < Duration::from_secs(5),
+        "git itself is slow here; the fixture is not measuring what it claims"
+    );
+
+    let started = std::time::Instant::now();
+    let set = git::change_set(&wt, "main", Duration::from_secs(2));
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the call took {elapsed:?} with a 2 s git timeout and a {holder_seconds} s holder; \
+         the deadline is not a deadline"
+    );
+    // And the answer is not merely fast, it is complete: killing the process
+    // group releases the pipe, so the output is drained rather than truncated.
+    let set = set.expect("change set");
+    assert!(
+        set.paths.iter().any(|p| p.path == "conflict.txt"),
+        "output was lost rather than drained: {:?}",
+        set.paths
+    );
+}
+
+/// The snapshot's `git add` runs every configured content filter, which is
+/// arbitrary user code — and for git-lfs, code that writes into the user's own
+/// `.git/lfs`. A tool whose whole claim is that it changes nothing cannot
+/// execute them on every refresh cycle.
+///
+/// `tests/read_only.rs` could not catch this before because no fixture defined a
+/// filter, which is exactly the shape of guarantee that passes CI and fails in
+/// the wild. `required = true` is git-lfs's default and matters: emptying
+/// `clean`/`process` while it is set makes `add` fail outright.
+#[test]
+fn the_snapshot_never_runs_the_repositorys_content_filters() {
+    let _serialised = scratch_guard();
+
+    let fixture = Fixture::new("filters");
+    let a = fixture.worktree("filter-a", "filter-a");
+    let b = fixture.worktree("filter-b", "filter-b");
+    let log = fixture.recording_clean_filter();
+    fixture.filtered_payload(&a, "media bytes\n");
+    fixture.filtered_payload(&b, "media bytes\n");
+    assert!(!log.exists(), "the filter ran before the test started");
+
+    let worktrees = vec![fixture.repo.clone(), a.clone(), b.clone()];
+    let before = fingerprint(&fixture, &worktrees);
+
+    let notes = run_full_pipeline(&fixture, &worktrees);
+    assert!(notes.is_empty(), "pipeline reported problems: {notes:?}");
+
+    assert!(
+        !log.exists(),
+        "the clean filter ran during a read-only pass:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let after = fingerprint(&fixture, &worktrees);
+    assert_unchanged(&before, &after);
+    assert_no_scratch_leftovers();
+
+    // The prediction still works with filters off: both sides added the same new
+    // path with the same content, so the pair merges rather than conflicting,
+    // and neither the payload nor the attributes file went missing.
+    let set = git::change_set(&a, "main", TIMEOUT).expect("change set");
+    let paths: Vec<&str> = set.paths.iter().map(|p| p.path.as_str()).collect();
+    assert!(paths.contains(&"payload.bin"), "{paths:?}");
+    assert!(paths.contains(&".gitattributes"), "{paths:?}");
 }

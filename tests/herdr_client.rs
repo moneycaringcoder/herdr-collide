@@ -5,6 +5,11 @@
 //! protocol that bite (mandatory `{}` params, one request per connection, the
 //! merge-patch clear with no TTL) are invisible from the Rust API alone.
 //!
+//! The fixtures below are shaped from `herdr api snapshot` captured against a
+//! live 0.8.0 server and from the bundled schema (`herdr api schema --json`),
+//! including the fields the client never reads: a reply that carries only what
+//! the client reads cannot catch the client reading the wrong thing.
+//!
 //! No running herdr is required, and nothing here touches the user's state.
 
 use std::io::{BufRead, BufReader, Write};
@@ -29,6 +34,17 @@ fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn scratch_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "collide-wire-{tag}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
+
 /// What the server does with one connection.
 #[derive(Clone)]
 enum Reply {
@@ -49,13 +65,7 @@ struct TestServer {
 
 impl TestServer {
     fn start(replies: Vec<Reply>) -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "collide-wire-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = scratch_dir("srv");
         // Kept short: a Unix socket path is capped at ~108 bytes.
         let path = dir.join("s.sock");
 
@@ -110,8 +120,7 @@ impl TestServer {
     }
 
     fn client(&self) -> Herdr {
-        std::env::set_var("HERDR_SOCKET_PATH", &self.path);
-        std::env::set_var("HERDR_PLUGIN_ID", SOURCE);
+        point_at(&self.path);
         Herdr::connect().expect("connect")
     }
 
@@ -137,6 +146,85 @@ impl Drop for TestServer {
     }
 }
 
+fn point_at(path: &std::path::Path) {
+    std::env::set_var("HERDR_SOCKET_PATH", path);
+    std::env::set_var("HERDR_PLUGIN_ID", SOURCE);
+}
+
+/// A server that goes away and comes back, the way `herdr update --handoff`
+/// does: the old server unlinks the socket, and a moment later a new one binds
+/// the same path. Nothing is listening in between, so a dial made during the
+/// window fails outright.
+///
+/// `TestServer`'s `Reply::Eof` is a *different* failure — there the socket
+/// exists and the connection is accepted, then closed. Only this one exercises
+/// the case the protocol notes actually describe.
+struct HandoffServer {
+    path: PathBuf,
+    dir: PathBuf,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How long the rebound listener stays up, waiting for connections that may
+/// never come. It has to be bounded: `Drop` joins this thread while the test
+/// holds `env_lock`, so a blocking `accept()` here would wedge every other test
+/// in the file the moment this one failed. (It did, the first time.)
+const HANDOFF_LIFETIME: Duration = Duration::from_millis(1_500);
+
+impl HandoffServer {
+    /// Unlinks `path`, waits `gap`, rebinds, then answers `replies` in order.
+    fn start(dir: PathBuf, path: PathBuf, gap: Duration, replies: Vec<String>) -> Self {
+        let _ = std::fs::remove_file(&path);
+        let thread = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(gap);
+                let listener = UnixListener::bind(&path).expect("rebind");
+                listener.set_nonblocking(true).expect("nonblocking");
+                let deadline = std::time::Instant::now() + HANDOFF_LIFETIME;
+                let mut replies = replies.into_iter();
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).expect("blocking");
+                            let mut line = String::new();
+                            let mut reader = BufReader::new(&stream);
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                continue;
+                            }
+                            if let Some(reply) = replies.next() {
+                                let mut stream = &stream;
+                                let _ = stream.write_all(reply.as_bytes());
+                                let _ = stream.write_all(b"\n");
+                                let _ = stream.flush();
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Self {
+            path,
+            dir,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for HandoffServer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// One line, newline-terminated, with no trailing framing of its own.
 fn parse_framed(raw: &str) -> Value {
     assert!(raw.ends_with('\n'), "request must be newline-terminated");
@@ -154,37 +242,25 @@ fn ok_reply() -> Reply {
     Reply::Line(json!({"id": "collide:1", "result": {"type": "ok"}}).to_string())
 }
 
-/// `notification.show` does **not** answer `ok`: it reports whether the toast
-/// was actually shown, and why not when it was not.
-fn notification_reply() -> Reply {
-    Reply::Line(
-        json!({
-            "id": "collide:1",
-            "result": {"type": "notification_show", "shown": true, "reason": "shown"}
-        })
-        .to_string(),
-    )
-}
-
 /// A `session.snapshot` reply in the real envelope: the arrays live under
 /// `snapshot`, one level below `result`, alongside a `type` discriminator.
 /// Reading them off `result` yields zero workspaces and looks exactly like an
 /// idle session, which is why every reply here mirrors the wire shape rather
 /// than the shape the client would find convenient.
 fn snapshot_reply(snapshot: Value) -> Reply {
-    Reply::Line(
-        json!({
-            "id": "collide:1",
-            "result": {"type": "session_snapshot", "snapshot": snapshot}
-        })
-        .to_string(),
-    )
+    Reply::Line(snapshot_line(snapshot))
+}
+
+fn snapshot_line(snapshot: Value) -> String {
+    json!({
+        "id": "collide:1",
+        "result": {"type": "session_snapshot", "snapshot": snapshot}
+    })
+    .to_string()
 }
 
 /// Structure copied from `herdr api snapshot` on a live 0.8.0 server, paths
-/// redacted. Fields the client ignores are kept deliberately: a reply that
-/// carries only what the client reads cannot catch the client reading the wrong
-/// thing.
+/// redacted. Fields the client ignores are kept deliberately.
 fn snapshot_with_one_repo() -> Value {
     json!({
         "focused_pane_id": "w6:p1",
@@ -203,6 +279,11 @@ fn snapshot_with_one_repo() -> Value {
             "tab_count": 1,
             "active_tab_id": "w6:t1",
             "agent_status": "done",
+            // A readback of what plugins have set on this workspace. Real
+            // workspaces carry it, and the protocol notes call it out as the
+            // way to verify our own writes, so a fixture without it is not a
+            // snapshot herdr could send.
+            "tokens": {"git_dirty": "~55 ?45"},
             "worktree": {
                 "repo_key": "/repo/.git",
                 "repo_name": "repo",
@@ -264,7 +345,7 @@ fn request_framing_is_a_single_json_line_with_object_params() {
 fn one_request_per_connection_is_survived_by_reconnecting() {
     let _guard = env_lock();
     // The first connection is read and closed without an answer, exactly as a
-    // server that has just handed off behaves. The retry must land the call.
+    // server that has just answered behaves. The retry must land the call.
     let server = TestServer::start(vec![Reply::Eof, snapshot_reply(snapshot_with_one_repo())]);
     let mut client = server.client();
 
@@ -276,6 +357,58 @@ fn one_request_per_connection_is_survived_by_reconnecting() {
         2,
         "the dropped connection must be retried on a fresh one"
     );
+}
+
+/// The case the protocol notes describe and the EOF test above does *not*
+/// cover: the socket file is gone entirely for a moment, so the first dial
+/// fails before any connection exists.
+///
+/// This is what fails without a pause before the retry. Measured back to back,
+/// the two attempts were 0.05 ms apart — one attempt, as far as a rebind is
+/// concerned.
+#[test]
+fn a_call_survives_the_socket_being_unlinked_and_rebound() {
+    let _guard = env_lock();
+    let dir = scratch_dir("handoff");
+    let path = dir.join("s.sock");
+
+    // Bind first so `connect` succeeds, the way a daemon that has been running
+    // since before the handoff has an open client.
+    let listener = UnixListener::bind(&path).expect("bind");
+    point_at(&path);
+    let mut client = Herdr::connect().expect("connect before the handoff");
+    drop(listener);
+
+    // The old server goes away; a new one binds the same path 60 ms later,
+    // comfortably inside the client's retry pause and far outside a retry with
+    // no pause at all.
+    let server = HandoffServer::start(
+        dir,
+        path,
+        Duration::from_millis(60),
+        vec![snapshot_line(snapshot_with_one_repo())],
+    );
+
+    let checkouts = client
+        .checkouts()
+        .expect("the retry must land on the new server");
+    assert_eq!(checkouts.len(), 1);
+    drop(server);
+}
+
+/// `connect` is a call like any other — `--disable`'s sweep, `--once` and the
+/// daemon's shutdown clear all go through it — so it retries too.
+#[test]
+fn connect_survives_the_socket_being_unlinked_and_rebound() {
+    let _guard = env_lock();
+    let dir = scratch_dir("handoff-connect");
+    let path = dir.join("s.sock");
+    point_at(&path);
+
+    let server = HandoffServer::start(dir, path, Duration::from_millis(60), vec![]);
+
+    Herdr::connect().expect("connect must retry across a rebind");
+    drop(server);
 }
 
 #[test]
@@ -389,12 +522,32 @@ fn non_git_workspaces_are_skipped_rather_than_failing() {
     let server = TestServer::start(vec![snapshot_reply(json!({
         "protocol": 19,
         "version": "0.8.0",
+        "focused_pane_id": "w2:p1",
+        "focused_tab_id": "w2:t1",
+        "focused_workspace_id": "w2",
+        "layouts": [],
+        "tabs": [{"tab_id": "w2:t1", "workspace_id": "w2", "focused": true}],
         "workspaces": [
-            {"workspace_id": "w1", "label": "notes", "number": 1, "agent_status": "idle"},
+            // A live server omits `worktree` entirely for a workspace that is
+            // not a repo — verified against `herdr api snapshot`, where seven
+            // of ten workspaces had no such key at all.
+            {"workspace_id": "w1", "label": "notes", "number": 1, "agent_status": "idle",
+             "focused": false, "pane_count": 1, "tab_count": 1, "active_tab_id": "w1:t1"},
+            // The schema types it `anyOf [WorkspaceWorktreeInfo, null]`, so an
+            // explicit null is legal even though the server does not send one.
+            // It means the same thing: not a repo.
+            {"workspace_id": "wn", "label": "null", "number": 4, "agent_status": "idle",
+             "focused": false, "pane_count": 1, "tab_count": 1, "active_tab_id": "wn:t1",
+             "worktree": null},
             {
                 "workspace_id": "w2",
                 "label": "main",
                 "number": 2,
+                "focused": true,
+                "pane_count": 1,
+                "tab_count": 1,
+                "active_tab_id": "w2:t1",
+                "agent_status": "idle",
                 "worktree": {
                     "repo_key": "/repo/.git",
                     "repo_name": "repo",
@@ -407,6 +560,11 @@ fn non_git_workspaces_are_skipped_rather_than_failing() {
                 "workspace_id": "w3",
                 "label": "fix",
                 "number": 3,
+                "focused": false,
+                "pane_count": 1,
+                "tab_count": 1,
+                "active_tab_id": "w3:t1",
+                "agent_status": "idle",
                 "worktree": {
                     "repo_key": "/repo/.git",
                     "repo_name": "repo",
@@ -416,11 +574,17 @@ fn non_git_workspaces_are_skipped_rather_than_failing() {
                 }
             }
         ],
-        "panes": [{"pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent": "codex"}],
+        "panes": [{"pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1",
+                   "terminal_id": "term_1", "focused": false, "revision": 1,
+                   "agent_status": "idle", "agent": "codex"}],
         "agents": [{
             "pane_id": "w2:p1",
             "tab_id": "w2:t1",
+            "terminal_id": "term_0",
             "workspace_id": "w2",
+            "focused": true,
+            "revision": 1,
+            "agent_status": "idle",
             "agent": "claude",
             "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": "s1"},
             "name": "gitsmith"
@@ -436,7 +600,12 @@ fn non_git_workspaces_are_skipped_rather_than_failing() {
             .map(|c| c.workspace_id.as_str())
             .collect::<Vec<_>>(),
         ["w2", "w3"],
-        "a workspace with no worktree key is not a repo, not an error"
+        "a workspace with no worktree key, or a null one, is not a repo"
+    );
+    assert_eq!(
+        client.skipped_worktrees(),
+        0,
+        "neither shape is a worktree we failed to read"
     );
 
     let main = &checkouts[0];
@@ -450,7 +619,8 @@ fn non_git_workspaces_are_skipped_rather_than_failing() {
         Some("gitsmith"),
         "the user's own name for the agent wins over the program name"
     );
-    // Branches come from `worktree.list` in a later pass.
+    // Branches come from git, not from the snapshot and not from
+    // `worktree.list` — this client never calls that method.
     assert_eq!(main.branch, None);
 
     let linked = &checkouts[1];
@@ -462,19 +632,45 @@ fn non_git_workspaces_are_skipped_rather_than_failing() {
     );
 }
 
+/// A workspace herdr says is a repo but whose worktree object we cannot address
+/// is dropped — silently, before this, which made the session look smaller than
+/// it is. The count is what turns that into a note the daemon can print.
 #[test]
-fn notify_sends_title_and_body() {
+fn an_unreadable_worktree_object_is_counted_rather_than_swallowed() {
     let _guard = env_lock();
-    // Not an `ok` envelope: this method reports whether the toast was shown.
-    let server = TestServer::start(vec![notification_reply()]);
+    let server = TestServer::start(vec![snapshot_reply(json!({
+        "protocol": 19,
+        "version": "0.8.0",
+        "layouts": [],
+        "tabs": [],
+        "panes": [],
+        "agents": [],
+        "workspaces": [
+            // No checkout_path: a repo we can see but cannot address.
+            {"workspace_id": "w1", "label": "half", "number": 1, "agent_status": "idle",
+             "focused": false, "pane_count": 1, "tab_count": 1, "active_tab_id": "w1:t1",
+             "worktree": {"repo_key": "/repo/.git", "repo_name": "repo", "repo_root": "/repo",
+                          "is_linked_worktree": false}},
+            // Present but not an object at all.
+            {"workspace_id": "w2", "label": "odd", "number": 2, "agent_status": "idle",
+             "focused": false, "pane_count": 1, "tab_count": 1, "active_tab_id": "w2:t1",
+             "worktree": "/repo"},
+            {"workspace_id": "w3", "label": "fine", "number": 3, "agent_status": "idle",
+             "focused": false, "pane_count": 1, "tab_count": 1, "active_tab_id": "w3:t1",
+             "worktree": {"repo_key": "/repo/.git", "repo_name": "repo", "repo_root": "/repo",
+                          "checkout_path": "/repo", "is_linked_worktree": false}}
+        ]
+    }))]);
     let mut client = server.client();
 
-    client.notify("collide", "2 conflicts").expect("notify");
+    let checkouts = client.checkouts().expect("snapshot");
 
-    let request = server.only_request();
-    assert_eq!(request["method"], "notification.show");
-    assert_eq!(request["params"]["title"], "collide");
-    assert_eq!(request["params"]["body"], "2 conflicts");
+    assert_eq!(checkouts.len(), 1);
+    assert_eq!(
+        client.skipped_worktrees(),
+        2,
+        "both unreadable worktree objects must be counted"
+    );
 }
 
 /// The regression test for the shape bug: the arrays live under `snapshot`, and
@@ -519,6 +715,108 @@ fn a_reply_without_the_snapshot_key_is_an_error_not_an_empty_session() {
         err.to_string().contains("snapshot"),
         "the message must name what is missing: {err}"
     );
+}
+
+/// The same argument one level down. `workspaces` is a required field of
+/// `SessionSnapshot`, so its absence is a protocol break — and an absent array
+/// read as an empty one is the identical invisible failure, just deeper.
+#[test]
+fn a_snapshot_without_a_workspaces_array_is_an_error_not_an_idle_session() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![snapshot_reply(json!({
+        "protocol": 19,
+        "version": "0.8.0",
+        "layouts": [],
+        "tabs": [],
+        "panes": [],
+        "agents": []
+    }))]);
+    let mut client = server.client();
+
+    let err = client
+        .checkouts()
+        .expect_err("no workspaces array must not read as an idle session");
+
+    assert!(
+        err.to_string().contains("workspaces"),
+        "the message must name what is missing: {err}"
+    );
+    // And the keys that did arrive, so the reader can see what changed.
+    assert!(err.to_string().contains("agents"), "{err}");
+}
+
+#[test]
+fn an_empty_workspaces_array_really_is_an_idle_session() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![snapshot_reply(json!({
+        "protocol": 19,
+        "version": "0.8.0",
+        "layouts": [],
+        "tabs": [],
+        "panes": [],
+        "agents": [],
+        "workspaces": []
+    }))]);
+    let mut client = server.client();
+
+    assert!(client
+        .checkouts()
+        .expect("an idle session is fine")
+        .is_empty());
+}
+
+/// `server.reload_config` does not answer `{"type":"ok"}`. These three payloads
+/// were captured from a live 0.8.0 server driven against a scratch config file.
+#[test]
+fn a_config_reload_is_only_a_success_when_it_was_applied() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![
+        Reply::Line(
+            json!({"id": "collide:1", "result":
+                {"type": "config_reload", "status": "applied", "diagnostics": []}})
+            .to_string(),
+        ),
+        Reply::Line(
+            json!({"id": "collide:2", "result": {
+                "type": "config_reload",
+                "status": "failed",
+                "diagnostics": ["config parse error: TOML parse error at line 1, column 19; keeping current config"]
+            }})
+            .to_string(),
+        ),
+        Reply::Line(
+            json!({"id": "collide:3", "result": {
+                "type": "config_reload",
+                "status": "partial",
+                "diagnostics": ["invalid theme config: invalid type: integer `42`, expected a string"]
+            }})
+            .to_string(),
+        ),
+    ]);
+    let mut client = server.client();
+
+    client.reload_config().expect("applied is a success");
+
+    let failed = client.reload_config().expect_err("failed is not a success");
+    assert!(failed.to_string().contains("failed"), "{failed}");
+    assert!(
+        failed.to_string().contains("TOML parse error"),
+        "the diagnostics must reach the user: {failed}"
+    );
+
+    let partial = client
+        .reload_config()
+        .expect_err("partial is not a success either");
+    assert!(partial.to_string().contains("partial"), "{partial}");
+    assert!(
+        partial.to_string().contains("invalid theme config"),
+        "{partial}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(parse_framed(&requests[0])["method"], "server.reload_config");
+    assert_eq!(parse_framed(&requests[0])["params"], json!({}));
 }
 
 #[test]

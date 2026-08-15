@@ -19,6 +19,14 @@ pub const MIN_INTERVAL_SECONDS: u64 = 1;
 /// compile-time assertion below keeps the two in step.
 pub const MAX_INTERVAL_SECONDS: u64 = 3_600;
 
+pub const DEFAULT_GIT_TIMEOUT_SECONDS: u64 = 10;
+/// A zero git timeout is not "no timeout", it is "every git call fails", which
+/// degrades every workspace while looking like a working plugin. Clamped for
+/// the same reason the interval is: a number nobody could have meant should not
+/// silently become the plugin's behaviour.
+pub const MIN_GIT_TIMEOUT_SECONDS: u64 = 1;
+pub const MAX_GIT_TIMEOUT_SECONDS: u64 = 600;
+
 const MAX_TTL_MS: u64 = 86_400_000;
 const _: () = assert!(MAX_INTERVAL_SECONDS.saturating_mul(3_000) <= MAX_TTL_MS);
 
@@ -60,7 +68,7 @@ impl Default for Config {
             ],
             predict_conflicts: true,
             base_ref: DEFAULT_BASE_REF.to_string(),
-            git_timeout: Duration::from_secs(10),
+            git_timeout: Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS),
         }
     }
 }
@@ -92,22 +100,36 @@ pub fn load_with_args(args: &[String]) -> Result<Config> {
         );
     }
     if let Some(base_ref) = value_arg(args, "--base-ref")? {
+        // The same emptiness rule the file path uses. `--base-ref ""` is not a
+        // ref, and handing git an empty string makes every change set degrade
+        // for a reason nobody can see.
+        if base_ref.trim().is_empty() {
+            return Err("--base-ref needs a ref name, not an empty string".into());
+        }
         config.base_ref = base_ref;
     }
     // Clamped last so neither source can push the derived TTL past herdr's
-    // ceiling or below its floor.
+    // ceiling or below its floor, and so a zero git timeout can never mean
+    // "fail every git call".
     config.interval = Duration::from_secs(
         config
             .interval
             .as_secs()
             .clamp(MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS),
     );
+    config.git_timeout = Duration::from_secs(
+        config
+            .git_timeout
+            .as_secs()
+            .clamp(MIN_GIT_TIMEOUT_SECONDS, MAX_GIT_TIMEOUT_SECONDS),
+    );
     Ok(config)
 }
 
 /// The on-disk form. Every field is optional so a partial file overrides only
-/// what it names, and unknown keys are ignored so a newer file does not break
-/// an older binary.
+/// what it names, and an unknown key is applied-around rather than fatal so a
+/// newer file does not break an older binary — but it is named in a warning, so
+/// a typo cannot look like a setting that took effect.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct FileConfig {
@@ -119,6 +141,18 @@ struct FileConfig {
     base_ref: Option<String>,
     git_timeout_seconds: Option<u64>,
 }
+
+/// Every key `FileConfig` understands. Kept beside the struct because the
+/// unknown-key warning is only useful while the two agree.
+const KNOWN_KEYS: [&str; 7] = [
+    "interval_seconds",
+    "runaway_files",
+    "runaway_lines",
+    "ignore_suffixes",
+    "predict_conflicts",
+    "base_ref",
+    "git_timeout_seconds",
+];
 
 fn config_file() -> PathBuf {
     config_dir().join("config.json")
@@ -138,7 +172,37 @@ fn load_file() -> Config {
             return Config::default();
         }
     };
-    let file: FileConfig = match serde_json::from_str(&raw) {
+    // Parsed as a `Value` first, and required to be an object. serde will
+    // happily build a struct out of a JSON *sequence* by position, so a file
+    // containing `[1, 2, 3]` used to deserialize cleanly into
+    // `interval_seconds = 1, runaway_files = 2, runaway_lines = 3` — a garbage
+    // file silently reconfiguring the plugin, which is worse than a garbage
+    // file being ignored.
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("collide: ignoring malformed {}: {err}", path.display());
+            return Config::default();
+        }
+    };
+    let Some(object) = value.as_object() else {
+        eprintln!(
+            "collide: ignoring {}: the config file must be a JSON object, found {}",
+            path.display(),
+            json_kind(&value)
+        );
+        return Config::default();
+    };
+    for key in object.keys() {
+        if !KNOWN_KEYS.contains(&key.as_str()) {
+            eprintln!(
+                "collide: ignoring unknown key `{key}` in {} (known keys: {})",
+                path.display(),
+                KNOWN_KEYS.join(", ")
+            );
+        }
+    }
+    let file: FileConfig = match serde_json::from_value(value.clone()) {
         Ok(file) => file,
         Err(err) => {
             eprintln!("collide: ignoring malformed {}: {err}", path.display());
@@ -169,6 +233,18 @@ fn load_file() -> Config {
         config.git_timeout = Duration::from_secs(seconds);
     }
     config
+}
+
+/// What a JSON value is, for a message that tells the user what they wrote.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Value of `--name <VALUE>` or `--name=<VALUE>`, last occurrence winning. A
@@ -238,7 +314,10 @@ pub fn config_dir() -> PathBuf {
 /// (an empty-environment service manager). It is the wrong place for state, but
 /// it is better than writing to the working directory, which for this plugin is
 /// somebody's repository.
-fn xdg_dir(variable: &str, relative: &str) -> PathBuf {
+///
+/// `setup` resolves herdr's own config directory through this too, so the two
+/// modules cannot disagree about what `XDG_CONFIG_HOME` means.
+pub(crate) fn xdg_dir(variable: &str, relative: &str) -> PathBuf {
     if let Some(base) = non_empty_env(variable)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -263,6 +342,19 @@ pub fn pid_file() -> PathBuf {
 /// what `--restore` consults.
 pub fn enabled_flag() -> PathBuf {
     state_dir().join("enabled")
+}
+
+/// Lock held across the check-and-spawn in `--enable`/`--restore`, so two of
+/// them cannot both conclude that no daemon is running.
+pub fn lock_file() -> PathBuf {
+    state_dir().join("updater.lock")
+}
+
+/// Where the detached daemon's stderr goes. Without this every diagnostic the
+/// daemon writes is lost: herdr only logs commands *it* spawned, and the daemon
+/// re-execs itself, so a badge that never appears leaves nothing to read.
+pub fn log_file() -> PathBuf {
+    state_dir().join("updater.log")
 }
 
 /// herdr injects empty strings for absent context, so empty means unset.

@@ -18,7 +18,10 @@ use crate::model::{
 use crate::Result;
 
 /// JSON schema version emitted by `--json`. Bump on any incompatible change.
-pub const JSON_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 when `severity` gained the `unknown` value: a consumer matching
+/// exhaustively on the old four would break on it, which is exactly what a
+/// schema version is for.
+pub const JSON_SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Pure analysis
@@ -55,12 +58,36 @@ pub fn analyse(checkouts: &[Checkout], changes: &[(String, ChangeSet)], config: 
         FileVerdict::Overlap
     };
 
+    // Canonicalized once per checkout rather than twice per pair: pairing is
+    // quadratic, and this is the only filesystem call inside the pure pass.
+    let canonical: BTreeMap<&str, std::path::PathBuf> = checkouts
+        .iter()
+        .map(|c| {
+            let path =
+                std::fs::canonicalize(&c.checkout_path).unwrap_or_else(|_| c.checkout_path.clone());
+            (c.workspace_id.as_str(), path)
+        })
+        .collect();
+
     let mut pairings = Vec::new();
     for members in groups.values() {
         for (i, left) in members.iter().enumerate() {
             for right in members.iter().skip(i + 1) {
                 if left.workspace_id == right.workspace_id {
                     continue;
+                }
+                // Two herdr workspaces can point at one directory, and a
+                // workspace can sit inside another's checkout. Either way git
+                // reports one change set twice, every changed file looks
+                // "shared", and the pair badges a collision that does not
+                // exist. Same tree, no comparison.
+                if let (Some(l), Some(r)) = (
+                    canonical.get(left.workspace_id.as_str()),
+                    canonical.get(right.workspace_id.as_str()),
+                ) {
+                    if same_tree(l, r) {
+                        continue;
+                    }
                 }
                 let (Some(lc), Some(rc)) = (
                     filtered.get(left.workspace_id.as_str()),
@@ -80,13 +107,21 @@ pub fn analyse(checkouts: &[Checkout], changes: &[(String, ChangeSet)], config: 
                         verdict: unresolved,
                     })
                     .collect();
-                if shared.is_empty() {
+                // An empty intersection normally means the pair cannot
+                // collide, and dropping it is free. A rename breaks that: the
+                // same content can appear under a different name on each side,
+                // so the merge can conflict on a path neither change set
+                // lists. `git::Predictor::predict_pair` knows how to handle
+                // that, but only if it is given the pair at all.
+                let rename_probe = config.predict_conflicts && (lc.has_rename || rc.has_rename);
+                if shared.is_empty() && !rename_probe {
                     continue;
                 }
                 pairings.push(Pairing {
                     left_workspace_id: left.workspace_id.clone(),
                     right_workspace_id: right.workspace_id.clone(),
                     shared,
+                    approximate: false,
                 });
             }
         }
@@ -112,6 +147,10 @@ pub struct PairVerdicts {
     pub verdicts: Vec<(String, bool)>,
     /// Prediction could not run for this pair; the shared files stay `Unknown`.
     pub failed: bool,
+    /// A single merge base had to be forced although the histories offer more
+    /// than one, or there was no common ancestor at all, so the verdicts
+    /// approximate what a real merge would do.
+    pub approximate: bool,
 }
 
 /// Folds conflict predictions into a report and recomputes severities. Pure.
@@ -131,6 +170,9 @@ pub fn apply_predictions(
         })
         .collect();
 
+    let pair_changes: BTreeMap<&str, &ChangeSet> =
+        changes.iter().map(|(id, set)| (id.as_str(), set)).collect();
+
     for pairing in &mut report.pairings {
         let key = (
             pairing.left_workspace_id.as_str(),
@@ -142,6 +184,7 @@ pub fn apply_predictions(
         if prediction.failed {
             continue;
         }
+        pairing.approximate = prediction.approximate;
         let verdicts: BTreeMap<&str, bool> = prediction
             .verdicts
             .iter()
@@ -157,10 +200,41 @@ pub fn apply_predictions(
             };
         }
         let known: BTreeSet<&str> = pairing.shared.iter().map(|s| s.path.as_str()).collect();
+        // git can name a conflicting path that is in neither change set. Two
+        // causes, and they need telling apart:
+        //
+        // * a rename — the file exists under a different name on each side, so
+        //   neither change set lists the merged path. This is real, and it is
+        //   why the pair was predicted at all.
+        // * a content filter the snapshot deliberately did not run. A filtered
+        //   path that is stat-dirty but content-identical re-hashes to its raw
+        //   bytes and so differs from a base holding the filtered blob, even
+        //   though `status` — which is what the change set is built from —
+        //   correctly reports the worktree clean.
+        //
+        // The second would report a conflict on a file neither agent touched,
+        // which is a false alarm of exactly the kind this plugin exists to
+        // avoid raising. So an unlisted path is only believed when a rename
+        // could explain it.
+        let renamed = pair_changes
+            .get(key.0)
+            .is_some_and(|c: &&ChangeSet| c.has_rename)
+            || pair_changes
+                .get(key.1)
+                .is_some_and(|c: &&ChangeSet| c.has_rename);
+        let listed = |path: &str| {
+            [key.0, key.1].iter().any(|id| {
+                pair_changes
+                    .get(id)
+                    .is_some_and(|c| c.paths.iter().any(|p| p.path == path))
+            })
+        };
         let extra: Vec<String> = prediction
             .verdicts
             .iter()
-            .filter(|(path, hit)| *hit && !known.contains(path.as_str()))
+            .filter(|(path, hit)| {
+                *hit && !known.contains(path.as_str()) && (renamed || listed(path))
+            })
             .map(|(path, _)| path.clone())
             .collect();
         for path in extra {
@@ -171,6 +245,11 @@ pub fn apply_predictions(
         }
         pairing.shared.sort_by(|a, b| a.path.cmp(&b.path));
     }
+
+    // A pair kept only because one side renamed something has nothing to show
+    // unless the prediction actually found a conflicting path. Dropping the
+    // empty ones here keeps the probe invisible when it comes back clean.
+    report.pairings.retain(|pairing| !pairing.shared.is_empty());
 
     let filtered: BTreeMap<&str, FilteredChange> = changes
         .iter()
@@ -187,32 +266,125 @@ pub fn apply_predictions(
 struct FilteredChange {
     paths: BTreeSet<String>,
     lines_changed: u64,
+    /// Distinct changed files, with the origin half of a rename counted once.
+    changed_files: usize,
+    has_rename: bool,
     pairable: bool,
+    /// The git pass failed for this checkout, so an empty change set means
+    /// "not read" rather than "nothing changed".
+    unreadable: bool,
 }
 
 impl FilteredChange {
     fn new(set: &ChangeSet, config: &Config) -> Self {
-        let paths: BTreeSet<String> = set
+        let kept: Vec<&crate::model::ChangedPath> = set
             .paths
             .iter()
-            .map(|p| p.path.as_str())
-            .filter(|path| !is_ignored(path, config))
-            .map(str::to_string)
+            .filter(|p| !is_ignored(&p.path, config))
             .collect();
+        let paths: BTreeSet<String> = kept.iter().map(|p| p.path.clone()).collect();
+        // Volume is filtered along with the paths. A `package-lock.json` the
+        // plugin has decided to ignore must not still trip the runaway
+        // threshold, and the origin half of a rename is one file, not two.
+        let lines_changed = kept
+            .iter()
+            .fold(0u64, |total, p| total.saturating_add(p.lines_changed()));
+        let changed_files = kept.iter().filter(|p| !p.is_rename_origin).count();
         Self {
             paths,
-            lines_changed: set.lines_changed(),
+            lines_changed,
+            changed_files,
+            has_rename: set.has_rename,
             pairable: pairable(set),
+            unreadable: set
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(git::DEGRADED_UNREADABLE)),
         }
     }
 }
 
-/// Suffix match against `Config::ignore_suffixes`.
+/// Makes every checkout of one repository report the same `repo_root`.
+///
+/// Repo *identity* is re-derived from git, but `repo_root` is taken from herdr,
+/// which falls back to the checkout path when it has nothing better. Two
+/// worktrees of one repository could therefore disagree, and the detail view —
+/// which prints one header per repository — showed whichever of them happened to
+/// sort first, so the header named a worktree rather than the repository, and
+/// changed when a workspace was renamed or closed.
+///
+/// The repo key is the canonicalized `--git-common-dir`. For an ordinary layout
+/// that is `<root>/.git`, so the parent is the answer. For a bare repository or
+/// a `--separate-git-dir` layout it is not, and there is nothing honest to
+/// derive, so the group falls back to the root reported by a checkout that is
+/// not a linked worktree, and failing that to the shortest one — any rule will
+/// do provided every member lands on the same answer.
+fn agree_on_repo_root(checkouts: &mut [Checkout]) {
+    let mut roots: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
+    for checkout in checkouts.iter() {
+        let key = checkout.repo_key.0.as_str();
+        if roots.contains_key(key) {
+            continue;
+        }
+        let from_key = std::path::Path::new(key)
+            .file_name()
+            .filter(|name| *name == ".git")
+            .and_then(|_| std::path::Path::new(key).parent())
+            .map(std::path::Path::to_path_buf);
+        let root = from_key.unwrap_or_else(|| {
+            let mut candidates: Vec<&Checkout> =
+                checkouts.iter().filter(|c| c.repo_key.0 == key).collect();
+            candidates.sort_by_key(|c| {
+                (
+                    c.is_linked_worktree,
+                    c.repo_root.as_os_str().len(),
+                    c.repo_root.clone(),
+                )
+            });
+            candidates
+                .first()
+                .map(|c| c.repo_root.clone())
+                .unwrap_or_default()
+        });
+        roots.insert(key.to_string(), root);
+    }
+    for checkout in checkouts.iter_mut() {
+        if let Some(root) = roots.get(checkout.repo_key.0.as_str()) {
+            checkout.repo_root = root.clone();
+        }
+    }
+}
+
+/// Whether two checkouts are really the same working tree — the same directory
+/// by a different path, or one nested inside the other. git reports paths
+/// relative to the repository root whichever directory it was invoked from, so
+/// a nested checkout produces the outer one's change set verbatim and every
+/// changed file would look shared.
+///
+/// Both paths are expected to be canonicalized already.
+fn same_tree(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+/// Suffix match against `Config::ignore_suffixes`, anchored to a path-component
+/// or extension boundary.
+///
+/// A bare `ends_with` is too eager: `go.sum` would swallow `tools/cargo.sum`
+/// and `Cargo.lock` would swallow `vendor/NotReallyCargo.lock`, dropping real
+/// changes from the change set with nothing to show for it. A suffix that
+/// starts with `.` is an extension and may match mid-name; anything else must
+/// begin at the start of the path or straight after a `/`.
 pub fn is_ignored(path: &str, config: &Config) -> bool {
-    config
-        .ignore_suffixes
-        .iter()
-        .any(|suffix| !suffix.is_empty() && path.ends_with(suffix.as_str()))
+    config.ignore_suffixes.iter().any(|suffix| {
+        if suffix.is_empty() || !path.ends_with(suffix.as_str()) {
+            return false;
+        }
+        if suffix.starts_with('.') {
+            return true;
+        }
+        let start = path.len() - suffix.len();
+        start == 0 || path.as_bytes()[start - 1] == b'/'
+    })
 }
 
 /// An unborn branch and a branch deleted underneath a worktree both leave the
@@ -239,6 +411,7 @@ fn statuses(
             let id = checkout.workspace_id.as_str();
             let mut overlaps: BTreeSet<&str> = BTreeSet::new();
             let mut conflicts: BTreeSet<&str> = BTreeSet::new();
+            let mut unknowns: BTreeSet<&str> = BTreeSet::new();
             for pairing in pairings {
                 if pairing.left_workspace_id != id && pairing.right_workspace_id != id {
                     continue;
@@ -248,28 +421,44 @@ fn statuses(
                         FileVerdict::Conflict => {
                             conflicts.insert(shared.path.as_str());
                         }
-                        FileVerdict::Overlap | FileVerdict::Unknown => {
+                        FileVerdict::Overlap => {
                             overlaps.insert(shared.path.as_str());
+                        }
+                        // Not a weaker overlap. An overlap badge claims the
+                        // file merges clean, and a prediction that could not
+                        // run has not earned that claim.
+                        FileVerdict::Unknown => {
+                            unknowns.insert(shared.path.as_str());
                         }
                     }
                 }
             }
             // A path that conflicts in one pairing is a conflict, full stop; it
-            // should not also inflate the overlap count.
+            // should not also inflate the overlap or unknown counts.
             for path in &conflicts {
+                overlaps.remove(path);
+                unknowns.remove(path);
+            }
+            for path in &unknowns {
                 overlaps.remove(path);
             }
 
-            let runaway = filtered
-                .get(id)
+            // A checkout the git pass could not read at all has no entry here.
+            // Reporting it clean would be a claim about a repository we failed
+            // to look at, so it is unknown instead.
+            let change = filtered.get(id);
+            let unreadable = change.map(|c| c.unreadable).unwrap_or(true);
+            let runaway = change
                 .map(|change| {
-                    change.paths.len() > config.runaway_files
+                    change.changed_files > config.runaway_files
                         || change.lines_changed > config.runaway_lines
                 })
                 .unwrap_or(false);
 
             let severity = if !conflicts.is_empty() {
                 Severity::Conflict
+            } else if !unknowns.is_empty() || unreadable {
+                Severity::Unknown
             } else if runaway {
                 Severity::Runaway
             } else if !overlaps.is_empty() {
@@ -283,8 +472,10 @@ fn statuses(
                 severity,
                 overlap_count: overlaps.len(),
                 conflict_count: conflicts.len(),
+                unknown_count: unknowns.len(),
                 runaway,
-                lines_changed: filtered.get(id).map(|c| c.lines_changed).unwrap_or(0),
+                lines_changed: change.map(|c| c.lines_changed).unwrap_or(0),
+                changed_files: change.map(|c| c.changed_files).unwrap_or(0),
             }
         })
         .collect()
@@ -322,7 +513,15 @@ pub fn base_ref_for(checkout: &std::path::Path, config: &Config) -> String {
     if config.base_ref != crate::config::DEFAULT_BASE_REF {
         return config.base_ref.clone();
     }
-    git::integration_ref(checkout, config.git_timeout).unwrap_or_else(|_| "HEAD".to_string())
+    // No honest answer is available when the probing chain finds nothing, and
+    // substituting `HEAD` is the one option indistinguishable from success: the
+    // committed half of every change set silently becomes empty, so two agents
+    // about to collide head-on read as two clean workspaces. Hand `change_set`
+    // the sentinel instead and let the checkout degrade visibly.
+    match git::integration_ref(checkout, config.git_timeout) {
+        Ok(Some(found)) => found,
+        Ok(None) | Err(_) => git::NO_INTEGRATION_REF.to_string(),
+    }
 }
 
 /// The gathering pass, given a checkout list. Split out from [`gather`] so it
@@ -357,6 +556,8 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
         }
     }
 
+    agree_on_repo_root(&mut verified);
+
     let mut changes: Vec<(String, ChangeSet)> = Vec::new();
     for checkout in &verified {
         let base = base_ref_for(&checkout.checkout_path, config);
@@ -364,7 +565,21 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
             Ok(set) => changes.push((checkout.workspace_id.clone(), set)),
             Err(err) => {
                 notes.push(format!("{}: {err}", checkout.checkout_path.display()));
-                changes.push((checkout.workspace_id.clone(), ChangeSet::default()));
+                // Not `ChangeSet::default()`. An empty, healthy-looking change
+                // set is indistinguishable from a clean worktree, so a
+                // checkout we failed to read would badge as clean — the
+                // quietest possible wrong answer. Say so instead.
+                changes.push((
+                    checkout.workspace_id.clone(),
+                    ChangeSet {
+                        degraded: true,
+                        degraded_reason: Some(format!(
+                            "{}: could not read this checkout: {err}",
+                            git::DEGRADED_UNREADABLE
+                        )),
+                        ..ChangeSet::default()
+                    },
+                ));
             }
         }
     }
@@ -445,6 +660,7 @@ fn predict_all(
         .min(jobs.len());
 
     let mut results: Vec<(PairVerdicts, Option<String>)> = Vec::with_capacity(jobs.len());
+    let mut panicked = 0usize;
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in jobs.chunks(jobs.len().div_ceil(workers)) {
@@ -465,6 +681,7 @@ fn predict_all(
                                     right_workspace_id: pairing.right_workspace_id.clone(),
                                     verdicts: prediction.verdicts,
                                     failed: false,
+                                    approximate: prediction.approximate,
                                 },
                                 None,
                             ),
@@ -474,6 +691,7 @@ fn predict_all(
                                     right_workspace_id: pairing.right_workspace_id.clone(),
                                     verdicts: Vec::new(),
                                     failed: true,
+                                    approximate: false,
                                 },
                                 Some(format!(
                                     "{} vs {}: {err}",
@@ -487,11 +705,20 @@ fn predict_all(
             }));
         }
         for handle in handles {
-            if let Ok(chunk) = handle.join() {
-                results.extend(chunk);
+            match handle.join() {
+                Ok(chunk) => results.extend(chunk),
+                // A panicked worker takes its whole chunk's verdicts with it.
+                // Those pairs stay `Unknown`, which is the honest outcome, but
+                // it must not happen silently.
+                Err(_) => panicked += 1,
             }
         }
     });
+    if panicked > 0 {
+        notes.push(format!(
+            "{panicked} conflict-prediction worker(s) panicked; the pairs they held are unknown"
+        ));
+    }
 
     let mut predictions = Vec::with_capacity(results.len());
     for (prediction, note) in results {
@@ -547,10 +774,11 @@ pub fn text_report(cycle: &Cycle) -> String {
             .and_then(|c| c.branch.as_deref())
             .unwrap_or("(detached)");
         out.push_str(&format!(
-            "{:<9} {label} [{branch}]  {} conflict, {} overlap{}\n",
+            "{:<9} {label} [{branch}]  {} conflict, {} overlap, {} unknown{}\n",
             severity_name(status.severity),
             status.conflict_count,
             status.overlap_count,
+            status.unknown_count,
             if status.runaway { ", runaway" } else { "" },
         ));
         if let Some(set) = changes.get(status.workspace_id.as_str()) {
@@ -562,8 +790,14 @@ pub fn text_report(cycle: &Cycle) -> String {
 
     for pairing in &cycle.report.pairings {
         out.push_str(&format!(
-            "\n{} <-> {}\n",
-            pairing.left_workspace_id, pairing.right_workspace_id
+            "\n{} <-> {}{}\n",
+            pairing.left_workspace_id,
+            pairing.right_workspace_id,
+            if pairing.approximate {
+                "  (approximate: merge base forced)"
+            } else {
+                ""
+            }
         ));
         for shared in &pairing.shared {
             out.push_str(&format!(
@@ -584,16 +818,21 @@ pub fn text_report(cycle: &Cycle) -> String {
 ///
 /// ```text
 /// {
-///   "schema":   1,                       // JSON_SCHEMA_VERSION
+///   "schema":   2,                       // JSON_SCHEMA_VERSION
 ///   "checkouts": [ {
 ///       "workspace_id", "label", "repo_key", "repo_root", "checkout_path",
 ///       "branch": string|null, "agent": string|null, "is_linked_worktree": bool,
 ///       "changed_files": int, "lines_added": int, "lines_removed": int,
+///       "has_rename": bool,
 ///       "degraded": bool, "degraded_reason": string|null } ],
-///   "pairings":  [ { "left", "right", "conflict_count",
+///   "pairings":  [ { "left", "right", "conflict_count", "unknown_count",
+///                    "approximate": bool,
 ///                    "shared": [ { "path", "verdict": "conflict|overlap|unknown" } ] } ],
-///   "statuses":  [ { "workspace_id", "severity": "clean|overlap|runaway|conflict",
-///                    "token", "badge", "overlap_count", "conflict_count", "runaway" } ],
+///   "statuses":  [ { "workspace_id",
+///                    "severity": "clean|overlap|runaway|unknown|conflict",
+///                    "token", "badge", "overlap_count", "conflict_count",
+///                    "unknown_count", "runaway", "lines_changed",
+///                    "changed_files" } ],
 ///   "notes": [ string ]
 /// }
 /// ```
@@ -623,9 +862,12 @@ pub fn json_report(cycle: &Cycle) -> serde_json::Value {
                 "branch": checkout.branch,
                 "agent": checkout.agent,
                 "is_linked_worktree": checkout.is_linked_worktree,
-                "changed_files": set.paths.len(),
+                // Distinct files, with the origin half of a rename counted
+                // once, so this agrees with what the runaway threshold sees.
+                "changed_files": set.paths.iter().filter(|p| !p.is_rename_origin).count(),
                 "lines_added": set.lines_added,
                 "lines_removed": set.lines_removed,
+                "has_rename": set.has_rename,
                 "degraded": set.degraded,
                 "degraded_reason": set.degraded_reason,
             })
@@ -641,6 +883,8 @@ pub fn json_report(cycle: &Cycle) -> serde_json::Value {
                 "left": pairing.left_workspace_id,
                 "right": pairing.right_workspace_id,
                 "conflict_count": pairing.conflicts(),
+                "unknown_count": pairing.unknowns(),
+                "approximate": pairing.approximate,
                 "shared": pairing.shared.iter().map(|shared| serde_json::json!({
                     "path": shared.path,
                     "verdict": verdict_name(shared.verdict),
@@ -661,8 +905,10 @@ pub fn json_report(cycle: &Cycle) -> serde_json::Value {
                 "badge": crate::render::badge(status),
                 "overlap_count": status.overlap_count,
                 "conflict_count": status.conflict_count,
+                "unknown_count": status.unknown_count,
                 "runaway": status.runaway,
                 "lines_changed": status.lines_changed,
+                "changed_files": status.changed_files,
             })
         })
         .collect();
@@ -681,6 +927,7 @@ pub fn severity_name(severity: Severity) -> &'static str {
         Severity::Clean => "clean",
         Severity::Overlap => "overlap",
         Severity::Runaway => "runaway",
+        Severity::Unknown => "unknown",
         Severity::Conflict => "conflict",
     }
 }

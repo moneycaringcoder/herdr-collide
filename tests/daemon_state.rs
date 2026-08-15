@@ -11,8 +11,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use collide::config::{self, Config, DEFAULT_BASE_REF, MAX_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS};
-use collide::daemon::{self, BadgeOp};
+use collide::config::{
+    self, Config, DEFAULT_BASE_REF, MAX_GIT_TIMEOUT_SECONDS, MAX_INTERVAL_SECONDS,
+    MIN_GIT_TIMEOUT_SECONDS, MIN_INTERVAL_SECONDS,
+};
+use collide::daemon::{self, BadgeOp, PushOutcome};
 use collide::model::{Severity, WorkspaceStatus};
 
 fn owned(args: &[&str]) -> Vec<String> {
@@ -30,8 +33,10 @@ fn status(
         severity,
         overlap_count: overlaps,
         conflict_count: conflicts,
+        unknown_count: usize::from(severity == Severity::Unknown),
         runaway: severity == Severity::Runaway,
         lines_changed: 0,
+        changed_files: 0,
     }
 }
 
@@ -73,6 +78,10 @@ impl TempDirs {
 
     fn config_file(&self) -> PathBuf {
         self.root.join("config").join("config.json")
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.root.join("state")
     }
 }
 
@@ -403,29 +412,45 @@ fn the_default_is_the_herdr_path_and_never_a_temp_dir() {
 /// itself must be the directory herdr injects. When they disagree, `--enable`
 /// through a plugin action and `--disable` from a shell address different
 /// daemons, and the one that is running cannot be stopped.
+///
+/// The paths below are **literals, taken from the machine this was written
+/// against**, not values computed from `config::state_dir()`. An earlier
+/// version of this test injected whatever the code had just produced and then
+/// asserted the two were equal, which is true of any implementation and so
+/// could never fail. These are the real directories herdr created there:
+///
+/// ```text
+/// $ ls ~/.local/state/herdr/plugins/
+/// ez-corp.git-status  herdr.agent-icons  moneycaringcoder.collide  nicosuave.memex …
+/// $ ls ~/.config/herdr/plugins/config/
+/// ez-corp.git-status  herdr.agent-icons  moneycaringcoder.collide  usagebar …
+/// ```
 #[test]
 fn hand_invocation_and_herdr_invocation_resolve_to_one_directory() {
     let _guard = env_lock();
     let env = dir_env();
     env.set("HOME", "/home/test");
 
-    let id = config::plugin_id();
-    // Run by hand: nothing injected.
-    let by_hand_state = config::state_dir();
-    let by_hand_config = config::config_dir();
+    // The layout herdr uses, spelled out rather than derived.
+    let herdr_state = "/home/test/.local/state/herdr/plugins/moneycaringcoder.collide";
+    let herdr_config = "/home/test/.config/herdr/plugins/config/moneycaringcoder.collide";
 
-    // Run by herdr: it injects the paths it actually uses on this machine.
-    env.set(
-        "HERDR_PLUGIN_STATE_DIR",
-        &format!("/home/test/.local/state/herdr/plugins/{id}"),
-    );
-    env.set(
-        "HERDR_PLUGIN_CONFIG_DIR",
-        &format!("/home/test/.config/herdr/plugins/config/{id}"),
-    );
+    // Run by hand: nothing injected. This must already land where herdr puts
+    // it, because there is no second chance to agree later.
+    assert_eq!(config::state_dir(), PathBuf::from(herdr_state));
+    assert_eq!(config::config_dir(), PathBuf::from(herdr_config));
 
-    assert_eq!(by_hand_state, config::state_dir());
-    assert_eq!(by_hand_config, config::config_dir());
+    // Run by herdr: it injects those same paths, and they must be honoured.
+    env.set("HERDR_PLUGIN_STATE_DIR", herdr_state);
+    env.set("HERDR_PLUGIN_CONFIG_DIR", herdr_config);
+    assert_eq!(config::state_dir(), PathBuf::from(herdr_state));
+    assert_eq!(config::config_dir(), PathBuf::from(herdr_config));
+
+    // `HERDR_PLUGIN_ID` is not something herdr sets — it appears nowhere in the
+    // 0.8.0 binary — so the constant is what has to match the directory name
+    // above. If the constant ever changes, the hand-run path silently stops
+    // being herdr's path, which is exactly the bug this test exists for.
+    assert_eq!(config::PLUGIN_ID, "moneycaringcoder.collide");
 }
 
 #[test]
@@ -709,4 +734,280 @@ fn a_missing_config_file_is_the_normal_case() {
         config::load_with_args(&[]).expect("load"),
         Config::default()
     );
+}
+
+/// serde will build a struct out of a JSON *sequence* by position, so
+/// `[1, 2, 3]` used to deserialize cleanly into
+/// `interval_seconds = 1, runaway_files = 2, runaway_lines = 3` — with no
+/// warning at all. A garbage file silently reconfiguring the plugin is worse
+/// than a garbage file being ignored.
+#[test]
+fn a_config_file_that_is_not_an_object_is_rejected() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("cfgarray");
+
+    for contents in ["[1, 2, 3]", "\"interval_seconds\"", "42", "true", "null"] {
+        std::fs::write(dirs.config_file(), contents).expect("write config");
+        assert_eq!(
+            config::load_with_args(&[]).expect("never fatal"),
+            Config::default(),
+            "config file {contents:?} must not reconfigure anything"
+        );
+    }
+}
+
+/// A zero git timeout is not "no timeout", it is "every git call fails", which
+/// leaves every workspace degraded while the plugin looks like it is working.
+#[test]
+fn the_git_timeout_is_clamped_like_the_interval() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("cfggit");
+
+    std::fs::write(dirs.config_file(), r#"{"git_timeout_seconds": 0}"#).expect("write");
+    assert_eq!(
+        config::load_with_args(&[]).expect("load").git_timeout,
+        Duration::from_secs(MIN_GIT_TIMEOUT_SECONDS)
+    );
+
+    std::fs::write(
+        dirs.config_file(),
+        r#"{"git_timeout_seconds": 18446744073709551615}"#,
+    )
+    .expect("write");
+    assert_eq!(
+        config::load_with_args(&[]).expect("load").git_timeout,
+        Duration::from_secs(MAX_GIT_TIMEOUT_SECONDS)
+    );
+
+    // A sane value survives untouched.
+    std::fs::write(dirs.config_file(), r#"{"git_timeout_seconds": 30}"#).expect("write");
+    assert_eq!(
+        config::load_with_args(&[]).expect("load").git_timeout,
+        Duration::from_secs(30)
+    );
+}
+
+/// An unknown key is still applied around rather than fatal — a newer config
+/// file must not break an older binary — but the keys beside it still take
+/// effect, so a typo cannot look like a setting that worked.
+#[test]
+fn an_unrecognised_key_does_not_stop_the_rest_of_the_file() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("cfgtypo");
+
+    std::fs::write(
+        dirs.config_file(),
+        r#"{"interval_secondz": 300, "runaway_files": 9}"#,
+    )
+    .expect("write config");
+
+    let config = config::load_with_args(&[]).expect("load");
+    assert_eq!(config.runaway_files, 9);
+    assert_eq!(
+        config.interval,
+        Config::default().interval,
+        "the misspelled key must not have taken effect"
+    );
+}
+
+/// The file path already refused an empty ref; the command line did not, and an
+/// empty `--base-ref` reaches git as an empty string.
+#[test]
+fn an_empty_base_ref_on_the_command_line_is_fatal() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("cfgbaseref");
+
+    assert!(config::load_with_args(&owned(&["--base-ref", ""])).is_err());
+    assert!(config::load_with_args(&owned(&["--base-ref=  "])).is_err());
+    assert_eq!(
+        config::load_with_args(&owned(&["--base-ref", "main"]))
+            .expect("load")
+            .base_ref,
+        "main"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What stays lit after a cycle
+// ---------------------------------------------------------------------------
+
+fn set(workspace_id: &str, token: &'static str) -> BadgeOp {
+    BadgeOp::Set {
+        workspace_id: workspace_id.to_string(),
+        token,
+        text: "x".to_string(),
+    }
+}
+
+fn clear(workspace_id: &str, token: &str) -> BadgeOp {
+    BadgeOp::Clear {
+        workspace_id: workspace_id.to_string(),
+        token: token.to_string(),
+    }
+}
+
+/// The bug this exists for, captured off the wire: a set that herdr rejects
+/// used to erase the daemon's record of the token herdr was still rendering, so
+/// the next severity flip emitted no clear for it and two collide tokens lit at
+/// once on one workspace.
+#[test]
+fn a_rejected_set_does_not_make_the_daemon_forget_what_is_lit() {
+    let before = lit(&[("w6", "collide_overlap")]);
+
+    let after = daemon::next_active(
+        &before,
+        &[(set("w6", "collide_overlap"), PushOutcome::Failed)],
+    );
+
+    assert_eq!(
+        after, before,
+        "herdr is still rendering collide_overlap under its TTL"
+    );
+
+    // …so the next cycle, with the severity flipped, still clears it first.
+    let plan = daemon::badge_plan(&after, &[status("w6", Severity::Runaway, 0, 0)]);
+    assert!(
+        plan.contains(&BadgeOp::Clear {
+            workspace_id: "w6".to_string(),
+            token: "collide_overlap".to_string(),
+        }),
+        "two badges would light at once: {plan:?}"
+    );
+}
+
+#[test]
+fn a_successful_set_replaces_what_was_lit() {
+    let after = daemon::next_active(
+        &lit(&[("w6", "collide_overlap")]),
+        &[
+            (clear("w6", "collide_overlap"), PushOutcome::Done),
+            (set("w6", "collide_conflict"), PushOutcome::Done),
+        ],
+    );
+    assert_eq!(after, lit(&[("w6", "collide_conflict")]));
+}
+
+#[test]
+fn a_failed_clear_is_remembered_so_it_can_be_reissued() {
+    let after = daemon::next_active(
+        &lit(&[("w6", "collide_conflict")]),
+        &[(clear("w6", "collide_conflict"), PushOutcome::Failed)],
+    );
+    assert_eq!(
+        after,
+        lit(&[("w6", "collide_conflict")]),
+        "the token is still lit, so forgetting it strands the badge"
+    );
+}
+
+/// A workspace that closed under us took its badge with it, so there is nothing
+/// left to clear and nothing to remember — otherwise the daemon would reissue a
+/// doomed clear on every cycle for the rest of its life.
+#[test]
+fn a_workspace_that_went_away_is_forgotten() {
+    assert!(daemon::next_active(
+        &lit(&[("w6", "collide_conflict")]),
+        &[(clear("w6", "collide_conflict"), PushOutcome::Gone)],
+    )
+    .is_empty());
+
+    assert!(daemon::next_active(
+        &lit(&[("w6", "collide_conflict")]),
+        &[(set("w6", "collide_overlap"), PushOutcome::Gone)],
+    )
+    .is_empty());
+}
+
+#[test]
+fn one_workspaces_failure_does_not_disturb_another() {
+    let after = daemon::next_active(
+        &lit(&[("w6", "collide_overlap"), ("w7", "collide_conflict")]),
+        &[
+            (set("w6", "collide_conflict"), PushOutcome::Failed),
+            (clear("w7", "collide_conflict"), PushOutcome::Done),
+            (set("w7", "collide_overlap"), PushOutcome::Done),
+        ],
+    );
+    assert_eq!(
+        after,
+        lit(&[("w6", "collide_overlap"), ("w7", "collide_overlap")])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Refusing to start a daemon nobody could stop
+// ---------------------------------------------------------------------------
+
+/// An unwritable state dir used to be a warning: `--enable` exited 0, spawned a
+/// daemon, failed to record its pid, and did the same again on every subsequent
+/// invocation. The daemons piled up and `--disable` could not stop any of them,
+/// because there was no pid file to read.
+#[cfg(unix)]
+#[test]
+fn enable_refuses_to_spawn_when_the_state_dir_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = env_lock();
+    let dirs = TempDirs::new("readonly");
+    let state = dirs.state_dir();
+
+    let original = std::fs::metadata(&state).expect("stat").permissions();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+
+    let result = daemon::enable(&owned(&["--enable"]));
+
+    // Restore before asserting, so a failure cannot leave an unwritable dir
+    // behind for the Drop impl.
+    std::fs::set_permissions(&state, original).expect("chmod back");
+
+    let err = result.expect_err("an unstoppable daemon is worse than no daemon");
+    let message = err.to_string();
+    assert!(
+        message.contains("lock") || message.contains("state directory"),
+        "the message must name the problem: {message}"
+    );
+    assert!(
+        !exists(&config::pid_file()),
+        "nothing may have been spawned"
+    );
+    assert!(
+        !exists(&config::enabled_flag()),
+        "and nothing may have been marked either"
+    );
+}
+
+/// Two `--enable` invocations cannot both conclude that no daemon is running.
+/// The lock is what makes that true; holding it here proves the second one
+/// waits rather than racing ahead to spawn.
+#[test]
+fn enable_serialises_behind_the_spawn_lock() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("lock");
+
+    // A live daemon standing in for the one the first `--enable` just spawned.
+    daemon::write_pid(std::process::id());
+
+    // With the marker in place, a second `--enable` must take the lock, see the
+    // live pid, and do nothing — not spawn a second daemon.
+    daemon::enable(&owned(&["--enable"])).expect("enable");
+
+    assert_eq!(daemon::read_pid(), Some(std::process::id() as i32));
+    assert!(exists(&config::enabled_flag()));
+    daemon::clear_pid_file();
+}
+
+/// The lock file lives in the state dir, so it must not be mistaken for the
+/// markers the verbs actually consult.
+#[test]
+fn the_lock_file_is_not_a_marker() {
+    let _guard = env_lock();
+    let _dirs = TempDirs::new("lockfile");
+
+    daemon::enable(&owned(&["--enable", "--interval", "soon"])).expect_err("bad interval");
+
+    assert!(!daemon::is_enabled());
+    assert_eq!(daemon::live_pid(), None);
+    assert_ne!(config::lock_file(), config::pid_file());
+    assert_ne!(config::lock_file(), config::enabled_flag());
+    assert_ne!(config::log_file(), config::pid_file());
 }
