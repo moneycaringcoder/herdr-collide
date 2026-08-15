@@ -1,0 +1,72 @@
+# herdr plugin: collide
+#
+# Warns when two agents working in different git worktrees of the SAME repo are
+# editing the same files — and whether those edits will actually conflict.
+#
+# Install:   herdr plugin install moneycaringcoder/herdr-collide
+# Local dev: herdr plugin link /path/to/herdr-collide   (does NOT run [[build]])
+# Remove:    herdr plugin unlink moneycaringcoder.collide
+# Logs:      herdr plugin log list --plugin moneycaringcoder.collide
+
+id = "moneycaringcoder.collide"
+name = "Collide"
+version = "0.1.0"
+# Oldest herdr with every API this plugin calls: the `tokens` metadata API on
+# workspace.report_metadata, which landed in 0.7.5. Developed and tested
+# against 0.8.0 / protocol 19.
+min_herdr_version = "0.7.5"
+description = "Cross-worktree collision and conflict warnings for concurrent agents."
+platforms = ["linux", "macos"]
+
+# Commands are argv arrays run with no shell and a minimal PATH, with the plugin
+# root as cwd. Compiled once at install time; the resulting binary is what every
+# command below invokes.
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+# Restart recovery. herdr runs startup hooks on a fresh server start AND on a
+# live handoff (`herdr update --handoff`), so this fires whenever herdr comes
+# back. --restore re-spawns the updater only if it was enabled when herdr went
+# away, and is a silent no-op otherwise.
+[[startup]]
+command = ["./target/release/collide", "--restore"]
+
+# Live detail view: every sibling worktree of the focused repo, the files they
+# share, and the per-file verdict.
+[[panes]]
+id = "detail"
+title = "Collide: shared files"
+placement = "overlay"
+command = ["./target/release/collide", "--watch"]
+
+[[actions]]
+id = "report"
+title = "Collide: report"
+description = "One-shot collision snapshot for the focused repo."
+contexts = ["global", "workspace"]
+command = ["./target/release/collide", "--once"]
+
+[[actions]]
+id = "json"
+title = "Collide: JSON snapshot"
+description = "Machine-readable snapshot for scripting."
+contexts = ["global", "workspace"]
+command = ["./target/release/collide", "--json"]
+
+[[actions]]
+id = "status-toggle"
+title = "Collide: toggle badge updater"
+contexts = ["global"]
+command = ["./target/release/collide", "--toggle"]
+
+[[actions]]
+id = "status-enable"
+title = "Collide: enable badge updater"
+contexts = ["global"]
+command = ["./target/release/collide", "--enable"]
+
+[[actions]]
+id = "status-disable"
+title = "Collide: disable badge updater"
+contexts = ["global"]
+command = ["./target/release/collide", "--disable"]
