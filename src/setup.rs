@@ -178,8 +178,10 @@ pub fn run_setup() -> Result<()> {
             // complete undo. Report the original failure, not the restore.
             std::fs::write(&config, &text)?;
             let _ = std::fs::remove_file(&backup);
-            Err(format!("herdr rejected the updated config, so it was restored unchanged: {err}")
-                .into())
+            Err(
+                format!("herdr rejected the updated config, so it was restored unchanged: {err}")
+                    .into(),
+            )
         }
     }
 }
@@ -207,5 +209,8 @@ fn reload_herdr_config() -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    Err(String::from_utf8_lossy(&output.stderr).trim().to_string().into())
+    Err(String::from_utf8_lossy(&output.stderr)
+        .trim()
+        .to_string()
+        .into())
 }

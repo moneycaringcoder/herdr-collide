@@ -27,6 +27,8 @@ Sidebar setup:
 
 Other:
   --interval <SECS>   Refresh interval for --watch and --daemon
+  --base-ref <REF>    Ref each change set is measured against
+                      (default: origin/HEAD)
   --version           Print version and exit
   --help              Show this help
 ";
@@ -45,9 +47,9 @@ fn run(args: &[String]) -> Result<()> {
         "--once" => analysis::run_once(&config::load()?),
         "--json" => analysis::run_json(&config::load()?),
         "--watch" => render::run_watch(&config::load_with_args(args)?),
-        "--enable" => daemon::enable(),
+        "--enable" => daemon::enable(args),
         "--disable" => daemon::disable(),
-        "--toggle" => daemon::toggle(),
+        "--toggle" => daemon::toggle(args),
         "--restore" => daemon::restore(),
         "--daemon" => daemon::run(&config::load_with_args(args)?),
         "--setup" => setup::run_setup(),

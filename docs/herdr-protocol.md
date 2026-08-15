@@ -214,6 +214,27 @@ Logs are in-server only (`herdr plugin log list`), with no log file on disk.
 has no workspace selector, so any per-workspace aiming happens inside the
 plugin.
 
+## Gaps this document does not answer
+
+Found while implementing against it. Each is a decision we made rather than a
+fact we verified, so revisit them if behaviour looks wrong:
+
+- **Token batching.** The 16-keys-per-report limit implies a multi-token patch,
+  but nothing states whether one report may clear several tokens at once, or mix
+  a set and a clear — and if it could, it is unclear what `ttl_ms` would apply
+  to. We send one token per call, so the disable sweep costs four round trips
+  per workspace instead of one.
+- **How a stop is requested.** The lifecycle contract says "request stop" without
+  naming a mechanism. We use `SIGTERM`, matching the signal-thread language.
+- **Empty versus missing.** herdr injects empty strings for absent environment
+  context. We assume the same for snapshot string fields and treat empty as
+  absent.
+- **Agent join priority.** When `agents[].name`, `agents[].agent_session` and
+  `panes[].agent` disagree, no precedence is documented. We prefer them in that
+  order.
+- **Response `id` echo.** Documented but not validated here — one request per
+  connection makes a mismatch impossible to act on.
+
 ## Open risk
 
 `repo_key` equality across linked worktrees is observed, not documented —

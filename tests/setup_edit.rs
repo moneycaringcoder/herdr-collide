@@ -29,7 +29,12 @@ key = "prefix+f"
 fn splices_into_an_existing_spaces_section() {
     let out = plan_edit(REAL_WORLD).expect("an edit was planned");
 
-    for token in ["collide_clean", "collide_overlap", "collide_runaway", "collide_conflict"] {
+    for token in [
+        "collide_clean",
+        "collide_overlap",
+        "collide_runaway",
+        "collide_conflict",
+    ] {
         assert!(out.contains(&format!("\"${token}\"")), "missing {token}");
     }
 
@@ -57,7 +62,10 @@ fn appends_a_section_when_none_exists() {
     let out = plan_edit(input).expect("an edit was planned");
     assert!(out.contains("[ui.sidebar.spaces]"));
     assert!(out.contains("$collide_conflict"));
-    assert!(out.starts_with("[theme]"), "existing content must be preserved");
+    assert!(
+        out.starts_with("[theme]"),
+        "existing content must be preserved"
+    );
 }
 
 #[test]

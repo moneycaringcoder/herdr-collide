@@ -93,7 +93,10 @@ pub struct Pairing {
 
 impl Pairing {
     pub fn conflicts(&self) -> usize {
-        self.shared.iter().filter(|f| f.verdict == FileVerdict::Conflict).count()
+        self.shared
+            .iter()
+            .filter(|f| f.verdict == FileVerdict::Conflict)
+            .count()
     }
 }
 
@@ -120,20 +123,31 @@ impl Severity {
         }
     }
 
-    pub const ALL_TOKENS: [&'static str; 4] =
-        ["collide_clean", "collide_overlap", "collide_runaway", "collide_conflict"];
+    pub const ALL_TOKENS: [&'static str; 4] = [
+        "collide_clean",
+        "collide_overlap",
+        "collide_runaway",
+        "collide_conflict",
+    ];
 }
 
 /// What the daemon pushes for one workspace on one cycle.
+///
+/// Deliberately carries no rendered text. `render::badge` is the single author
+/// of the badge string: two independent builders disagreed about what a clean
+/// workspace should emit, and the protocol needs an empty string there to clear
+/// the token rather than a tick to draw one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceStatus {
     pub workspace_id: String,
     pub severity: Severity,
-    /// Rendered badge text, e.g. `✘ 2` or `⧉ 3`.
-    pub badge: String,
     pub overlap_count: usize,
     pub conflict_count: usize,
     pub runaway: bool,
+    /// Size of this checkout's change set, which is what a runaway badge
+    /// reports. Counts alone cannot express it: a runaway is usually a
+    /// workspace sharing nothing at all with its siblings.
+    pub lines_changed: u64,
 }
 
 /// Full analysis for one refresh cycle, shared by the badge daemon, the detail
@@ -143,4 +157,16 @@ pub struct Report {
     pub checkouts: Vec<Checkout>,
     pub pairings: Vec<Pairing>,
     pub statuses: Vec<WorkspaceStatus>,
+    /// Change set per workspace id, kept so the detail view can explain *why* a
+    /// checkout is degraded instead of inferring it from a missing branch.
+    pub changes: Vec<(String, ChangeSet)>,
+}
+
+impl Report {
+    pub fn change_set(&self, workspace_id: &str) -> Option<&ChangeSet> {
+        self.changes
+            .iter()
+            .find(|(id, _)| id == workspace_id)
+            .map(|(_, set)| set)
+    }
 }
