@@ -86,3 +86,66 @@ fn leaves_a_spaces_section_with_no_rows_array_alone() {
     let input = "[ui.sidebar.spaces]\nrow_gap = 0\n\n[[keys.command]]\nkey = \"prefix+f\"\n";
     assert!(plan_edit(input).is_none());
 }
+
+/// Every element of the `rows` array must itself be an array. A bare table
+/// dropped between two rows is valid TOML, so herdr accepts the file and then
+/// renders nothing — an invisible failure that a "does the token appear in the
+/// text" assertion happily passes. This walks the array and reports any element
+/// that is not a row.
+fn stray_row_elements(text: &str) -> Vec<String> {
+    let mut depth = 0usize;
+    let mut in_rows = false;
+    let mut stray = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !in_rows {
+            if trimmed.starts_with("rows") && trimmed.contains('[') {
+                in_rows = true;
+                depth = line.matches('[').count() - line.matches(']').count();
+            }
+            continue;
+        }
+        // At depth 1 we are directly inside `rows`, so anything starting a value
+        // here must open a row.
+        if depth == 1 && !trimmed.is_empty() && !trimmed.starts_with('[') && !trimmed.starts_with(']')
+        {
+            stray.push(trimmed.to_string());
+        }
+        for ch in line.chars() {
+            match ch {
+                '[' => depth += 1,
+                ']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+    stray
+}
+
+#[test]
+fn tokens_land_inside_a_row_not_beside_one() {
+    let out = plan_edit(REAL_WORLD).expect("an edit was planned");
+    let stray = stray_row_elements(&out);
+    assert!(
+        stray.is_empty(),
+        "these ended up as siblings of the rows instead of inside one: {stray:#?}\n\n{out}"
+    );
+}
+
+#[test]
+fn a_single_line_row_is_spliced_in_place() {
+    let input = "[ui.sidebar.spaces]\nrows = [\n  [\"state_icon\", \"workspace\"],\n  [\"branch\"],\n]\n";
+    let out = plan_edit(input).expect("an edit was planned");
+    assert!(stray_row_elements(&out).is_empty(), "{out}");
+    assert!(out.contains("$collide_conflict"));
+    // The row it joined must still be one row.
+    let branch_line = out
+        .lines()
+        .find(|l| l.contains("\"branch\""))
+        .expect("branch row survives");
+    assert_eq!(branch_line.matches('[').count(), branch_line.matches(']').count());
+}

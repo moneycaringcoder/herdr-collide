@@ -94,33 +94,79 @@ pub fn plan_edit(text: &str) -> Option<String> {
         return Some(append_section(text));
     };
 
-    // Find this section's rows array, stopping at the next section header so we
-    // can never reach into a neighbouring table.
-    let mut insert_at = None;
+    // Find the LAST row inside this section's rows array, and its final line.
+    //
+    // The entries have to land inside a row, not beside one. `rows` is an array
+    // of arrays, and each inner array is one rendered line; a bare table dropped
+    // between two rows is still valid TOML, so herdr accepts the file and then
+    // renders nothing at all. That failure is invisible — which is exactly how
+    // it shipped past a passing test suite once already.
+    //
+    // Depth 1 is inside `rows`, depth 2 is inside a row.
     let mut depth = 0usize;
     let mut in_rows = false;
+    let mut row_span: Option<(usize, usize)> = None;
+    let mut row_start: Option<usize> = None;
+
     for (offset, line) in lines.iter().enumerate().skip(section_start + 1) {
         let trimmed = line.trim_start();
-        if !in_rows && trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            break; // next table; this section has no rows array
-        }
-        if !in_rows && trimmed.starts_with("rows") && trimmed.contains('[') {
-            in_rows = true;
-        }
-        if in_rows {
-            depth += line.matches('[').count();
-            depth = depth.saturating_sub(line.matches(']').count());
-            if depth == 0 {
-                insert_at = Some(offset); // the array's closing bracket
-                break;
+        if !in_rows {
+            if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+                break; // next table; this section has no rows array
             }
+            if trimmed.starts_with("rows") && trimmed.contains('[') {
+                in_rows = true;
+                depth = line.matches('[').count() - line.matches(']').count();
+                continue;
+            }
+            continue;
+        }
+
+        for ch in line.chars() {
+            match ch {
+                '[' => {
+                    depth += 1;
+                    if depth == 2 && row_start.is_none() {
+                        row_start = Some(offset);
+                    }
+                }
+                ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 1 {
+                        if let Some(start) = row_start.take() {
+                            row_span = Some((start, offset));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            break; // rows array closed
         }
     }
 
-    let insert_at = insert_at?;
+    let (row_start, row_end) = row_span?;
     let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-    for (n, line) in token_lines().into_iter().enumerate() {
-        out.insert(insert_at + n, line);
+
+    if row_start == row_end {
+        // A single-line row: splice the entries in before its closing bracket.
+        let line = out[row_end].clone();
+        let close = line.rfind(']')?;
+        let (head, tail) = line.split_at(close);
+        let head = head.trim_end();
+        let separator = if head.ends_with('[') { "" } else { "," };
+        let entries: Vec<String> = token_lines()
+            .into_iter()
+            .map(|l| l.trim().trim_end_matches(',').to_string())
+            .collect();
+        out[row_end] = format!("{head}{separator} {}{tail}", entries.join(", "));
+    } else {
+        // A multi-line row: insert before its final line, which carries the
+        // closing bracket. The preceding line already ends in a comma.
+        for (n, line) in token_lines().into_iter().enumerate() {
+            out.insert(row_end + n, line);
+        }
     }
     Some(finish(out, text))
 }
