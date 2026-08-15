@@ -177,13 +177,20 @@ collide --watch     # the live detail view
 collide --enable | --disable | --toggle
 collide --setup | --setup-rollback
 collide --interval 10 --watch
+collide --base-ref origin/main --once
 collide --help
 ```
 
+Options may come before or after the verb, so `collide --base-ref main --once` and
+`collide --once --base-ref main` are the same command.
+
 ## Configuration
 
-Configuration is a JSON file at `$HERDR_PLUGIN_CONFIG_DIR/config.json` — herdr injects that directory
-when it runs the plugin. Every key is optional and overrides just that default, and unknown keys are
+Configuration is a JSON file at `$HERDR_PLUGIN_CONFIG_DIR/config.json`. herdr injects that directory
+when it runs the plugin; when you run the binary yourself it resolves to the same place herdr would
+use, `~/.config/herdr/plugins/config/moneycaringcoder.collide/config.json`, so both routes read one
+file. The daemon's own state lives alongside it under `~/.local/state/herdr/plugins/`, which is why
+`collide --disable` typed at a shell stops the updater a plugin action started. Every key is optional and overrides just that default, and unknown keys are
 ignored, so a config written for a newer version will not break an older binary. A missing file is the
 normal case; a malformed one prints a warning and falls back to the defaults rather than taking the
 badge down.
