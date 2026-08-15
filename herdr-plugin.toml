@@ -54,6 +54,20 @@ contexts = ["global", "workspace"]
 command = ["./target/release/collide", "--json"]
 
 [[actions]]
+id = "setup"
+title = "Collide: set up sidebar (start here)"
+description = "Add collide's tokens to herdr's config.toml, back it up, and reload."
+contexts = ["global"]
+command = ["./target/release/collide", "--setup"]
+
+[[actions]]
+id = "setup-rollback"
+title = "Collide: undo sidebar setup"
+description = "Restore the config.toml backup taken by setup."
+contexts = ["global"]
+command = ["./target/release/collide", "--setup-rollback"]
+
+[[actions]]
 id = "status-toggle"
 title = "Collide: toggle badge updater"
 contexts = ["global"]

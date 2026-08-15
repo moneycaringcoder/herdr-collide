@@ -1,20 +1,8 @@
 //! collide — cross-worktree collision warnings for concurrent agents.
 //!
-//! Verb dispatch only. Each verb is implemented in its own module:
-//!
-//!   --once / --json / --watch   analysis + rendering  (collide.rs, render.rs)
-//!   --enable / --disable /      badge updater control (daemon.rs)
-//!   --toggle / --restore / --daemon
+//! Verb dispatch only; every verb is implemented in the library crate.
 
-mod collide;
-mod config;
-mod daemon;
-mod git;
-mod herdr;
-mod model;
-mod render;
-
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use collide::{collide as analysis, config, daemon, render, setup, Result};
 
 const USAGE: &str = "\
 collide — cross-worktree collision warnings for herdr
@@ -33,6 +21,10 @@ Badge updater:
   --restore           Restart it only if it was enabled (herdr startup hook)
   --daemon            Run the updater in the foreground (internal)
 
+Sidebar setup:
+  --setup             Add collide's tokens to herdr's config.toml and reload
+  --setup-rollback    Restore the config.toml backup taken by --setup
+
 Other:
   --interval <SECS>   Refresh interval for --watch and --daemon
   --version           Print version and exit
@@ -50,14 +42,16 @@ fn main() {
 fn run(args: &[String]) -> Result<()> {
     let verb = args.first().map(String::as_str).unwrap_or("--once");
     match verb {
-        "--once" => collide::run_once(&config::load()?),
-        "--json" => collide::run_json(&config::load()?),
+        "--once" => analysis::run_once(&config::load()?),
+        "--json" => analysis::run_json(&config::load()?),
         "--watch" => render::run_watch(&config::load_with_args(args)?),
         "--enable" => daemon::enable(),
         "--disable" => daemon::disable(),
         "--toggle" => daemon::toggle(),
         "--restore" => daemon::restore(),
         "--daemon" => daemon::run(&config::load_with_args(args)?),
+        "--setup" => setup::run_setup(),
+        "--setup-rollback" => setup::run_rollback(),
         "--version" => {
             println!("collide {}", env!("CARGO_PKG_VERSION"));
             Ok(())
