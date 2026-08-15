@@ -139,7 +139,12 @@ fn fingerprint(fixture: &Fixture, worktrees: &[PathBuf]) -> Fingerprint {
     let mut locks = BTreeSet::new();
     // The object store is compared as a name set instead of file-by-file, so it
     // is excluded from the byte walk.
-    walk(&common_dir, &[objects.clone()], &mut files, &mut locks);
+    walk(
+        &common_dir,
+        std::slice::from_ref(&objects),
+        &mut files,
+        &mut locks,
+    );
     for wt in worktrees {
         // `.git` inside a linked worktree is a gitlink file, and inside the main
         // worktree it is the git dir itself; either way it is repository state,
