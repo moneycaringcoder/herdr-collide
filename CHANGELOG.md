@@ -6,6 +6,96 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+An adversarial pass over the whole plugin, looking for one kind of bug: a wrong
+answer with no error, indistinguishable from a right one. Everything below was
+found by looking for that shape deliberately, and every fix carries a test that
+was checked to fail without it.
+
+### Added
+
+- **A fourth severity, `unknown`, with its own sidebar token.** When conflict
+  prediction cannot run, the affected files are reported as `? unknown` and the
+  workspace badges `?`. Previously they were folded into the overlap badge,
+  whose legend reads *"same file, merges clean"* — so a prediction that failed
+  looked exactly like a prediction that succeeded and found nothing wrong.
+  **Run the setup action again to add the new row**; it adds only what your
+  config is missing and tells you what it added.
+- `unknown_count` and `changed_files` on each status in `--json`, plus
+  `has_rename` and `approximate` on the objects that gained a meaning for them.
+  The JSON schema version is now `2`, because `severity` gained a value.
+
+### Fixed
+
+- A checkout whose git pass failed was given an empty change set and reported as
+  clean. It is now visibly degraded.
+- When no conventional trunk could be found, the base ref silently became `HEAD`,
+  which empties the committed half of every change set and reports no
+  degradation — two agents colliding head-on read as two clean workspaces. The
+  probe chain is wider, and when it still finds nothing it says so.
+- A failed HEAD probe was reported as "unborn branch" or "branch deleted",
+  excluding a healthy checkout from every comparison and telling the user its
+  branch was gone.
+- A git invocation that left a descendant holding its output pipe could park the
+  refresh loop indefinitely, despite the timeout: a command finishing in 80 ms
+  took over 40 seconds to return under a 2 second deadline. Children now run in
+  their own process group and the output drain is bounded.
+- A committed directory rename could conflict for real and be reported clean,
+  because the pair was dropped before prediction ran.
+- A pair of histories with no common ancestor answered "everything conflicts" or
+  "cannot tell" depending on whether one side happened to have an untracked file.
+  It is now refused consistently.
+- Line volume ignored `ignore_suffixes`, so a single `npm install` could paint a
+  runaway badge on a workspace whose whole diff the plugin had decided to ignore.
+- Both halves of a rename counted toward `runaway_files`, halving the threshold.
+- Two herdr workspaces open on one checkout — or one nested inside another — were
+  compared against each other and reported a permanent overlap.
+- `ignore_suffixes` matched anywhere in a path, so `go.sum` swallowed
+  `tools/cargo.sum`.
+- The badge updater sent every diagnostic to `/dev/null`; it now writes to a
+  size-capped `updater.log` in its state directory.
+- A rejected badge push made the updater forget which token was lit, leaving two
+  badges on one workspace after the next severity change.
+- `--enable` could spawn an unstoppable updater when the state directory was not
+  writable, and two concurrent invocations produced two updaters with one
+  recorded. Both are refused, and the check and spawn happen under a lock.
+- `--disable` reported success while the updater was still running.
+- Sidebar setup could splice its rows into a comment, or beside the rows rather
+  than inside one — both valid TOML, both rendering nothing — and reported
+  "nothing to do" when it had failed to place them at all.
+- Setup's idempotency check was all-or-nothing, so a config written before a new
+  token existed never gained it.
+- The config file was accepted as a JSON array and applied positionally;
+  `git_timeout_seconds` was not clamped; unknown keys vanished silently.
+- Emoji and several wide characters were measured as one column, so pane lines
+  could exceed their width budget and wrap.
+- The badge was the last thing on a worktree line and so the first thing
+  truncated — it disappeared from exactly the narrow panes where it matters most.
+- A mistyped option was ignored rather than reported, and verbs were recognised
+  by elimination, so the first boolean flag added to the binary would silently
+  have become the verb.
+
+### Changed
+
+- **The snapshot no longer runs your repository's content filters.** `git add`
+  was executing whatever `filter.*.clean` or `filter.*.process` programs a
+  repository configures, on every refresh — and for git-lfs that writes into your
+  own `.git/lfs`, which a read-only tool may not do. Filtered paths are now
+  compared as their raw bytes.
+- Paths that are not valid UTF-8, or that contain control characters, are still
+  replaced for display but now carry a short digest of the original bytes, so two
+  different files can no longer render as one shared path.
+- Pairings in the detail view sort worst first rather than alphabetically, and
+  the notes section moved to the top of the pane, where a short pane cannot cut
+  it off.
+
+### Documentation
+
+- Both notes files are corrected where they were found to be wrong, with the
+  wrong claims called out rather than quietly edited. Chief among them: the rule
+  for telling an unborn branch from a deleted one by its reflog fails in *both*
+  directions, and no discriminator exists, because the two are the same
+  observable state.
+
 ## [0.1.0]
 
 First release.
