@@ -1,0 +1,77 @@
+# Every worktree of a repository is compared with every other one, and each
+# workspace's badge rolls up whatever its own pairings found. Drawn from a real
+# four-worktree run rather than invented.
+#
+# No unicode marks in labels — d2's bundled font renders them as tofu.
+
+direction: right
+
+classes: {
+  wt: {
+    shape: rectangle
+    style: {
+      stroke: "#8b949e"
+      font-color: "#57606a"
+      fill: transparent
+      stroke-width: 2
+    }
+  }
+  hot: {
+    shape: rectangle
+    style: {
+      stroke: "#e05252"
+      font-color: "#b32222"
+      fill: transparent
+      stroke-width: 3
+      bold: true
+    }
+  }
+  warm: {
+    shape: rectangle
+    style: {
+      stroke: "#d9a441"
+      font-color: "#9a6700"
+      fill: transparent
+      stroke-width: 3
+      bold: true
+    }
+  }
+  cool: {
+    shape: rectangle
+    style: {
+      stroke: "#57a773"
+      font-color: "#1a7f37"
+      fill: transparent
+      stroke-width: 2
+    }
+  }
+}
+
+alpha: "alpha\nbadge: conflict" { class: hot }
+beta: "beta\nbadge: conflict" { class: hot }
+gamma: "gamma\nbadge: overlap" { class: warm }
+delta: "delta\nbadge: clean" { class: cool }
+
+alpha -- beta: "README.md\nconflict" {
+  style: {
+    stroke: "#e05252"
+    stroke-width: 3
+    font-color: "#b32222"
+  }
+}
+
+alpha -- gamma: "README.md\ndocs/git-plumbing.md\noverlap" {
+  style: {
+    stroke: "#d9a441"
+    stroke-width: 2
+    font-color: "#9a6700"
+  }
+}
+
+beta -- gamma: "README.md\noverlap" {
+  style: {
+    stroke: "#d9a441"
+    stroke-width: 2
+    font-color: "#9a6700"
+  }
+}

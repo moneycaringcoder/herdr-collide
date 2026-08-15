@@ -257,6 +257,25 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
 
 /// Reduces a `session.snapshot` result to the git-backed workspaces. The flat
 /// sibling arrays are joined on `workspace_id`.
+/// Drops `.` components from a path herdr reports.
+///
+/// herdr echoes back whatever path a worktree was created with, so a workspace
+/// made with `--cwd .` arrives as `/home/you/repos/app/.` and would be rendered
+/// that way in the detail pane. Purely cosmetic — the path still resolves — but
+/// the pane is something people look at.
+fn tidy_path(raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    let tidied: PathBuf = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    if tidied.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        tidied
+    }
+}
+
 fn reduce_snapshot(snapshot: &Value) -> Vec<Checkout> {
     let mut agents: Vec<(String, String)> = Vec::new();
     let mut record_agent = |workspace_id: Option<&str>, name: Option<&str>| {
@@ -296,8 +315,8 @@ fn reduce_snapshot(snapshot: &Value) -> Vec<Checkout> {
             workspace_id: workspace_id.to_string(),
             workspace_label: text(workspace, "label").unwrap_or(workspace_id).to_string(),
             repo_key: RepoKey(repo_key.to_string()),
-            repo_root: PathBuf::from(repo_root),
-            checkout_path: PathBuf::from(checkout_path),
+            repo_root: tidy_path(repo_root),
+            checkout_path: tidy_path(checkout_path),
             is_linked_worktree: worktree
                 .get("is_linked_worktree")
                 .and_then(Value::as_bool)

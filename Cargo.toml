@@ -2,7 +2,7 @@
 name = "collide"
 version = "0.1.0"
 edition = "2021"
-description = "Warns when two agents in different git worktrees of one repo are about to collide."
+description = "Warns when agents in different git worktrees of one repo are about to collide."
 license = "MIT"
 repository = "https://github.com/moneycaringcoder/herdr-collide"
 

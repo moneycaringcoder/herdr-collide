@@ -1,7 +1,8 @@
 # herdr plugin: collide
 #
-# Warns when two agents working in different git worktrees of the SAME repo are
+# Warns when agents working in different git worktrees of the SAME repo are
 # editing the same files — and whether those edits will actually conflict.
+# Every pair of worktrees in a repository is compared, not just two.
 #
 # Install:   herdr plugin install moneycaringcoder/herdr-collide
 # Local dev: herdr plugin link /path/to/herdr-collide   (does NOT run [[build]])

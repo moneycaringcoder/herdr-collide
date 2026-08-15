@@ -4,8 +4,8 @@
 
 # collide
 
-**Warns you when two agents in different git worktrees of one repository are about to step on each
-other — and whether their edits merely overlap or will actually conflict.**
+**Warns you when agents working in different git worktrees of one repository are about to step on
+each other — and whether their edits merely overlap or will actually conflict.**
 
 [![CI](https://github.com/moneycaringcoder/herdr-collide/actions/workflows/ci.yml/badge.svg)](https://github.com/moneycaringcoder/herdr-collide/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -16,7 +16,7 @@ other — and whether their edits merely overlap or will actually conflict.**
 
 Running several coding agents at once usually means several git worktrees of the same repository, one
 per herdr workspace. That works right up until two of them start editing the same file, and you find
-out at merge time. `collide` watches every workspace that is backed by a git checkout, groups them by
+out at merge time — and the more agents you run, the likelier that gets. `collide` watches every workspace that is backed by a git checkout, groups them by
 repository, and tells you — while the work is still in flight — which sibling worktrees are touching
 the same files, and whether those edits will merely overlap or will genuinely conflict on merge. It
 also flags a *runaway* worktree whose change set has grown past a threshold you set, which is usually
@@ -27,11 +27,20 @@ so it cannot contend with an agent's own git commands, and stages nothing throug
 
 ## Overlap is not conflict
 
-Most tools would stop at "you both touched `src/api.rs`". That is usually a false alarm — two agents
-editing opposite ends of one file merge without complaint. `collide` asks git what the merge would
-actually do, so a warning means something:
+Most tools would stop at "you both touched `src/api.rs`". That is usually a false alarm — two
+checkouts editing opposite ends of one file merge without complaint. `collide` asks git what the
+merge would actually do, so a warning means something:
 
 <img src="docs/img/verdicts.svg" alt="Two worktrees editing the same file at different lines merge cleanly and are reported as an overlap; two worktrees rewriting the same line are reported as a conflict." width="100%">
+
+That check runs for **every pair of worktrees in the repository**, not just two. Six pairs for four
+agents, forty-five for ten, and each workspace's badge rolls up whatever its own pairings found:
+
+<img src="docs/img/fanout.svg" alt="Four worktrees of one repository. Alpha and beta conflict over README.md; gamma overlaps both of them; delta shares no files with anyone and stays clean." width="100%">
+
+`delta` shares nothing with anybody, so it has no pairings and no badge. `gamma` overlaps two
+different siblings and its badge counts both. Pairs with no files in common are dropped before any
+expensive work happens, which is what keeps the comparison cheap as the number of agents grows.
 
 ## What it looks like
 
@@ -51,28 +60,34 @@ than of shared files — a runaway agent is usually one that shares nothing with
 workspace shows nothing at all. Numbers abbreviate once they get long — `1.2k`, `12k`, `1.2M` — so a
 badge never grows wide enough to push the branch name off the row.
 
-The full picture lives in the **Collide: shared files** overlay pane, which redraws on an interval:
+The full picture lives in the **Collide: shared files** overlay pane, which redraws on an interval.
+Worktrees are grouped by repository, and every pairing that shares anything is listed under its group:
 
 ```
 collide · shared files
 
 repo /home/you/repos/app
   api [feature/api] @claude  ✘ 2
-      degraded: a merge is in progress — this side is snapshotted with its
-      conflict markers still in place, so any prediction involving it is
-      advisory.
+  ui [feature/ui] @codex  ✘ 2
+  docs [docs/readme] @claude  ⧉ 1
+  spike [spike/parser] @pi  ⚠ 4.1k
   salvage [no branch] (no agent)
       degraded: `wip/salvage` has no commits yet — unborn branch, so this
       checkout has no commit and is not paired with its siblings.
-  ui [feature/ui] @codex  ✘ 2
 
   api <-> ui
-    advisory: a merge is in progress in api, so these verdicts were computed
-    from a tree that still contains conflict markers.
     ✘ conflict  src/collide.rs
     ✘ conflict  src/git.rs
-    ? unknown   …e-core/src/analysis/pairing/heuristics/very_long_module_name.rs
     ⧉ overlap   src/model.rs
+
+  api <-> docs
+    ⧉ overlap   README.md
+
+  ui <-> docs
+    ? unknown   …e-core/src/analysis/pairing/heuristics/very_long_module_name.rs
+
+repo /home/you/repos/infra
+  deploy [chore/bump] @codex
 
 legend
   ✘  conflict predicted on merge
