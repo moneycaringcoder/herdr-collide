@@ -1,0 +1,9 @@
+# Every change requests a review from the maintainer automatically.
+# This is about staying informed, not about gatekeeping: contributions are
+# welcome and reviewed personally.
+*       @moneycaringcoder
+
+# The read-only guarantee lives here. Changes to these get the closest reading,
+# because they run against repositories full of uncommitted agent work.
+/src/git.rs         @moneycaringcoder
+/tests/read_only.rs @moneycaringcoder

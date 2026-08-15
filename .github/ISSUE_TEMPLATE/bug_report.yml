@@ -1,0 +1,70 @@
+name: Bug report
+description: Something behaves differently than it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Redact paths and branch
+        names freely — a report with `/home/you/repos/app` in it is just as
+        useful as one with your real paths.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+      placeholder: |
+        Two worktrees are editing the same file, but the badge stays clean.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >
+        The state of the repositories and workspaces involved. Number of
+        worktrees, whether the changes were committed or uncommitted, and
+        anything unusual about the repo (submodules, sparse checkout, a merge
+        in progress, a detached HEAD).
+    validations:
+      required: true
+
+  - type: textarea
+    id: json
+    attributes:
+      label: Output of `collide --json`
+      description: >
+        This carries the analysis the plugin actually made, which is usually
+        enough to find the problem on its own.
+      render: json
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `collide --version`, `herdr --version`, and `git --version`.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: >
+        If this involves the sidebar, the `[ui.sidebar.spaces]` part of your
+        herdr `config.toml`. If you have a plugin `config.json`, that too.
+      render: toml

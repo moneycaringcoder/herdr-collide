@@ -278,6 +278,20 @@ Worth knowing before you trust it:
 - **Repository identity across linked worktrees is observed rather than specified.** It holds for
   ordinary `git worktree` layouts; submodules and `--separate-git-dir` setups are less well tested.
 
+## Contributing
+
+Bug reports, questions, documentation fixes and code are all welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to build it, what makes a change
+easy to merge, and what is deliberately out of scope. The project is maintained
+by one person, so review is careful rather than instant.
+
+The one rule worth knowing up front: collide is strictly read-only against your
+repositories, and `tests/read_only.rs` enforces that by fingerprinting every
+index, ref and object before and after a run.
+
+Security issues go through [private reporting](SECURITY.md) rather than public
+issues.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
