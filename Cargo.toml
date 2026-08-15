@@ -16,7 +16,7 @@ serde_json = "1"
 # Unix-only: setsid for daemon detachment, and SIGINT/SIGTERM shutdown plumbing.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [profile.release]
 opt-level = "z"
