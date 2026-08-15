@@ -108,7 +108,10 @@ fn stray_row_elements(text: &str) -> Vec<String> {
         }
         // At depth 1 we are directly inside `rows`, so anything starting a value
         // here must open a row.
-        if depth == 1 && !trimmed.is_empty() && !trimmed.starts_with('[') && !trimmed.starts_with(']')
+        if depth == 1
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('[')
+            && !trimmed.starts_with(']')
         {
             stray.push(trimmed.to_string());
         }
@@ -138,7 +141,8 @@ fn tokens_land_inside_a_row_not_beside_one() {
 
 #[test]
 fn a_single_line_row_is_spliced_in_place() {
-    let input = "[ui.sidebar.spaces]\nrows = [\n  [\"state_icon\", \"workspace\"],\n  [\"branch\"],\n]\n";
+    let input =
+        "[ui.sidebar.spaces]\nrows = [\n  [\"state_icon\", \"workspace\"],\n  [\"branch\"],\n]\n";
     let out = plan_edit(input).expect("an edit was planned");
     assert!(stray_row_elements(&out).is_empty(), "{out}");
     assert!(out.contains("$collide_conflict"));
@@ -147,5 +151,8 @@ fn a_single_line_row_is_spliced_in_place() {
         .lines()
         .find(|l| l.contains("\"branch\""))
         .expect("branch row survives");
-    assert_eq!(branch_line.matches('[').count(), branch_line.matches(']').count());
+    assert_eq!(
+        branch_line.matches('[').count(),
+        branch_line.matches(']').count()
+    );
 }

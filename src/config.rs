@@ -196,16 +196,62 @@ pub fn plugin_id() -> String {
     non_empty_env("HERDR_PLUGIN_ID").unwrap_or_else(|| PLUGIN_ID.to_string())
 }
 
+/// Where the daemon's markers live: `~/.local/state/herdr/plugins/<id>/`.
+///
+/// herdr injects `HERDR_PLUGIN_STATE_DIR` into the commands it spawns and is
+/// authoritative when it does, but the fallback has to resolve to the *same*
+/// directory. The README encourages running the binary by hand during
+/// development, and a fallback that pointed somewhere else — a temp dir — gave
+/// `--enable` from a plugin action and `--disable` from a shell two different
+/// state dirs: the hand-run disable found no pid file, silently did nothing,
+/// and left a daemon running that the user had no way to stop.
 pub fn state_dir() -> PathBuf {
     non_empty_env("HERDR_PLUGIN_STATE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(plugin_id()))
+        .unwrap_or_else(|| {
+            xdg_dir("XDG_STATE_HOME", ".local/state")
+                .join("herdr")
+                .join("plugins")
+                .join(plugin_id())
+        })
 }
 
+/// Where the config file lives:
+/// `~/.config/herdr/plugins/config/<id>/`. Same split-brain rule as
+/// [`state_dir`] — a config read by hand must be the config herdr reads.
 pub fn config_dir() -> PathBuf {
     non_empty_env("HERDR_PLUGIN_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("{}-config", plugin_id())))
+        .unwrap_or_else(|| {
+            xdg_dir("XDG_CONFIG_HOME", ".config")
+                .join("herdr")
+                .join("plugins")
+                .join("config")
+                .join(plugin_id())
+        })
+}
+
+/// An XDG base directory. The variable wins when it is set to an absolute path
+/// — the spec says a relative one must be ignored — otherwise `$HOME/<relative>`.
+///
+/// The temp path is a last resort for a process with no home directory at all
+/// (an empty-environment service manager). It is the wrong place for state, but
+/// it is better than writing to the working directory, which for this plugin is
+/// somebody's repository.
+fn xdg_dir(variable: &str, relative: &str) -> PathBuf {
+    if let Some(base) = non_empty_env(variable)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return base;
+    }
+    match non_empty_env("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        Some(home) => home.join(relative),
+        None => std::env::temp_dir().join("herdr-no-home"),
+    }
 }
 
 /// Marker: a daemon is live right now.

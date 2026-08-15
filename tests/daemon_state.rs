@@ -84,6 +84,52 @@ impl Drop for TempDirs {
     }
 }
 
+/// Saves and restores process-global variables, so a test that rewrites `HOME`
+/// cannot leak that into the next one.
+struct EnvGuard {
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl EnvGuard {
+    fn new(variables: &[&str]) -> Self {
+        let saved = variables
+            .iter()
+            .map(|name| (name.to_string(), std::env::var(name).ok()))
+            .collect();
+        for name in variables {
+            std::env::remove_var(name);
+        }
+        Self { saved }
+    }
+
+    fn set(&self, name: &str, value: &str) {
+        std::env::set_var(name, value);
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// The four variables that decide where state and config land.
+fn dir_env() -> EnvGuard {
+    EnvGuard::new(&[
+        "HERDR_PLUGIN_STATE_DIR",
+        "HERDR_PLUGIN_CONFIG_DIR",
+        "XDG_STATE_HOME",
+        "XDG_CONFIG_HOME",
+        "HOME",
+        "HERDR_PLUGIN_ID",
+    ])
+}
+
 fn write_pid_file(contents: &str) {
     std::fs::write(config::pid_file(), contents).expect("write pid file");
 }
@@ -272,6 +318,127 @@ fn interval_argument_overrides_the_default_and_is_clamped() {
     // A value the user typed themselves fails loudly, unlike a config file.
     assert!(config::load_with_args(&["--interval".to_string()]).is_err());
     assert!(config::load_with_args(&["--interval".to_string(), "soon".to_string()]).is_err());
+}
+
+#[test]
+fn the_injected_env_var_wins_over_every_fallback() {
+    let _guard = env_lock();
+    let env = dir_env();
+    // herdr is authoritative for the commands it spawns.
+    env.set("HOME", "/home/ignored");
+    env.set("XDG_STATE_HOME", "/xdg/ignored");
+    env.set("HERDR_PLUGIN_STATE_DIR", "/injected/state");
+    env.set("HERDR_PLUGIN_CONFIG_DIR", "/injected/config");
+
+    assert_eq!(config::state_dir(), PathBuf::from("/injected/state"));
+    assert_eq!(config::config_dir(), PathBuf::from("/injected/config"));
+    assert_eq!(
+        config::pid_file(),
+        PathBuf::from("/injected/state/updater.pid")
+    );
+}
+
+#[test]
+fn the_xdg_variables_are_honoured_when_herdr_injects_nothing() {
+    let _guard = env_lock();
+    let env = dir_env();
+    env.set("HOME", "/home/test");
+    env.set("XDG_STATE_HOME", "/state-root");
+    env.set("XDG_CONFIG_HOME", "/config-root");
+
+    let id = config::plugin_id();
+    assert_eq!(
+        config::state_dir(),
+        PathBuf::from(format!("/state-root/herdr/plugins/{id}"))
+    );
+    assert_eq!(
+        config::config_dir(),
+        PathBuf::from(format!("/config-root/herdr/plugins/config/{id}"))
+    );
+
+    // The spec says a relative XDG path must be ignored, and honouring one here
+    // would put the state dir inside somebody's repository.
+    env.set("XDG_STATE_HOME", "relative/state");
+    assert_eq!(
+        config::state_dir(),
+        PathBuf::from(format!("/home/test/.local/state/herdr/plugins/{id}"))
+    );
+}
+
+#[test]
+fn the_default_is_the_herdr_path_and_never_a_temp_dir() {
+    let _guard = env_lock();
+    let env = dir_env();
+    env.set("HOME", "/home/test");
+
+    let id = config::plugin_id();
+    assert_eq!(
+        config::state_dir(),
+        PathBuf::from(format!("/home/test/.local/state/herdr/plugins/{id}"))
+    );
+    assert_eq!(
+        config::config_dir(),
+        PathBuf::from(format!("/home/test/.config/herdr/plugins/config/{id}"))
+    );
+    // The temp-dir fallback is what split `--enable` from `--disable`.
+    let temp = std::env::temp_dir();
+    assert!(
+        !config::state_dir().starts_with(&temp),
+        "state dir in {temp:?}"
+    );
+    assert!(
+        !config::config_dir().starts_with(&temp),
+        "config dir in {temp:?}"
+    );
+
+    // The plugin id is part of the path, so two plugins never share a state dir.
+    env.set("HERDR_PLUGIN_ID", "someone.else");
+    assert_eq!(
+        config::state_dir(),
+        PathBuf::from("/home/test/.local/state/herdr/plugins/someone.else")
+    );
+}
+
+/// The invariant that actually broke: the directory the binary computes for
+/// itself must be the directory herdr injects. When they disagree, `--enable`
+/// through a plugin action and `--disable` from a shell address different
+/// daemons, and the one that is running cannot be stopped.
+#[test]
+fn hand_invocation_and_herdr_invocation_resolve_to_one_directory() {
+    let _guard = env_lock();
+    let env = dir_env();
+    env.set("HOME", "/home/test");
+
+    let id = config::plugin_id();
+    // Run by hand: nothing injected.
+    let by_hand_state = config::state_dir();
+    let by_hand_config = config::config_dir();
+
+    // Run by herdr: it injects the paths it actually uses on this machine.
+    env.set(
+        "HERDR_PLUGIN_STATE_DIR",
+        &format!("/home/test/.local/state/herdr/plugins/{id}"),
+    );
+    env.set(
+        "HERDR_PLUGIN_CONFIG_DIR",
+        &format!("/home/test/.config/herdr/plugins/config/{id}"),
+    );
+
+    assert_eq!(by_hand_state, config::state_dir());
+    assert_eq!(by_hand_config, config::config_dir());
+}
+
+#[test]
+fn a_process_with_no_home_still_gets_a_usable_state_dir() {
+    let _guard = env_lock();
+    let _env = dir_env();
+    // No HOME, no XDG: writing to the working directory would mean writing into
+    // the user's repository, so a temp path is the least bad answer left.
+    let state = config::state_dir();
+
+    assert!(state.is_absolute());
+    assert!(state.starts_with(std::env::temp_dir()));
+    assert!(state.ends_with(config::plugin_id()));
 }
 
 #[test]
