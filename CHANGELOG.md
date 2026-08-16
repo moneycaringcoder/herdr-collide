@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Tag-triggered release automation. Pushing `vX.Y.Z` runs the full suite on
+  Linux and macOS and publishes the GitHub release with notes taken from that
+  version's changelog section — but only after an identity gate has confirmed
+  that the tag, `Cargo.toml`, `Cargo.lock` and `herdr-plugin.toml` all name the
+  same version and that the changelog section for it exists and is not empty.
+  The manifest version is the one the marketplace displays and the one easiest
+  to forget, so it is checked explicitly.
 - An advisory upstream canary. Once a day it resolves one exact herdr `master`
   commit, fetches the API schema herdr generates from its own types at that
   revision, and checks that the three methods collide calls, the parameters it
