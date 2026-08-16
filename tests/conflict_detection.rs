@@ -11,13 +11,15 @@
 mod fixtures;
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use collide::collide::{analyse, apply_predictions, json_report, Cycle, PairVerdicts};
+use collide::collide::{
+    analyse, apply_predictions, json_report, work_tree_root, Cycle, PairVerdicts,
+};
 use collide::config::Config;
 use collide::git::{self, predict_conflict, Predictor};
-use collide::model::{FileVerdict, Report, Severity};
+use collide::model::{Checkout, FileVerdict, Report, Severity, WorkTrees};
 
 use fixtures::{
     change_set, change_set_degraded, change_set_renamed, change_set_with_lines, checkout, Fixture,
@@ -353,6 +355,55 @@ fn config() -> Config {
     }
 }
 
+/// One working tree per checkout, taken from the checkout path verbatim.
+///
+/// The synthetic fixtures use paths that do not exist (`/tmp/one`, `/tmp/two`),
+/// and what they mean by that is "two different working trees". Saying so
+/// directly keeps these tests independent of whatever happens to be on disk;
+/// [`resolved_trees`] is for the fixtures where the answer has to come from git.
+fn distinct_trees(checkouts: &[Checkout]) -> WorkTrees {
+    let mut trees = WorkTrees::new();
+    for checkout in checkouts {
+        trees.insert(
+            checkout.workspace_id.clone(),
+            checkout.checkout_path.clone(),
+        );
+    }
+    trees
+}
+
+/// Exactly what `gather_for` builds: every checkout's top level resolved from
+/// disk.
+fn resolved_trees(checkouts: &[Checkout]) -> WorkTrees {
+    let mut trees = WorkTrees::new();
+    for checkout in checkouts {
+        trees.insert(
+            checkout.workspace_id.clone(),
+            work_tree_root(&checkout.checkout_path),
+        );
+    }
+    trees
+}
+
+/// `git rev-parse --show-toplevel`, the answer this plugin's own resolution has
+/// to agree with.
+fn git_toplevel(path: &Path) -> PathBuf {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--path-format=absolute", "--show-toplevel"])
+        .output()
+        .expect("git rev-parse");
+    assert!(
+        out.status.success(),
+        "git rev-parse --show-toplevel failed in {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    std::fs::canonicalize(&raw).unwrap_or(raw)
+}
+
 #[test]
 fn analyse_never_pairs_checkouts_from_different_repos() {
     let checkouts = vec![
@@ -364,7 +415,7 @@ fn analyse_never_pairs_checkouts_from_different_repos() {
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert!(
         report.pairings.is_empty(),
         "two repos were paired: {:?}",
@@ -387,7 +438,7 @@ fn analyse_pairs_within_a_repo_and_intersects_change_sets() {
         ("two".to_string(), change_set(&["b.txt", "shared.txt"])),
     ];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert_eq!(report.pairings.len(), 1);
     let paths: Vec<&str> = report.pairings[0]
         .shared
@@ -410,7 +461,7 @@ fn ignore_suffixes_drop_lockfiles_before_anything_counts_them() {
         ("two".to_string(), change_set(&["Cargo.lock"])),
     ];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert!(
         report.pairings.is_empty(),
         "a lockfile overlap was reported: {:?}",
@@ -432,7 +483,7 @@ fn unpairable_checkouts_are_excluded() {
         ("two".to_string(), unborn),
     ];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert!(report.pairings.is_empty());
 }
 
@@ -446,7 +497,7 @@ fn runaway_thresholds_raise_severity_without_an_overlap() {
         change_set_with_lines(&[("a.txt", 10_000)]),
     )];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert_eq!(report.statuses[0].severity, Severity::Runaway);
     assert!(report.statuses[0].runaway);
 }
@@ -463,7 +514,7 @@ fn conflict_outranks_runaway_and_overlap() {
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
 
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     apply_predictions(
         &mut report,
         &[PairVerdicts {
@@ -497,7 +548,7 @@ fn a_clean_prediction_downgrades_unknown_to_overlap() {
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
 
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     apply_predictions(
         &mut report,
         &[PairVerdicts {
@@ -527,7 +578,7 @@ fn a_failed_prediction_leaves_the_verdict_unknown() {
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
 
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     apply_predictions(
         &mut report,
         &[PairVerdicts {
@@ -554,7 +605,7 @@ fn json_report_is_stable_and_documented() {
         ("one".to_string(), change_set(&["shared.txt"])),
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     apply_predictions(
         &mut report,
         &[PairVerdicts {
@@ -574,16 +625,94 @@ fn json_report_is_stable_and_documented() {
         notes: vec!["a note".to_string()],
     });
 
+    // Every field in the schema block on `collide::json_report`, asserted once.
+    // The block documents the contract a `--json` consumer reads; a field that
+    // is documented and not asserted can disappear without a test noticing, and
+    // that is precisely what happened to the fields the version was bumped for.
     assert_eq!(json["schema"], 2);
+
     assert_eq!(json["checkouts"].as_array().unwrap().len(), 2);
-    assert_eq!(json["checkouts"][0]["workspace_id"], "one");
-    assert_eq!(json["checkouts"][0]["changed_files"], 1);
-    assert_eq!(json["pairings"][0]["left"], "one");
-    assert_eq!(json["pairings"][0]["conflict_count"], 1);
-    assert_eq!(json["pairings"][0]["shared"][0]["verdict"], "conflict");
-    assert_eq!(json["statuses"][0]["severity"], "conflict");
-    assert_eq!(json["statuses"][0]["token"], "collide_conflict");
+    let one = &json["checkouts"][0];
+    assert_eq!(one["workspace_id"], "one");
+    assert_eq!(one["label"], "one");
+    assert_eq!(one["repo_key"], "/repo/.git");
+    assert_eq!(one["repo_root"], "/tmp/one");
+    assert_eq!(one["checkout_path"], "/tmp/one");
+    assert_eq!(one["branch"], "one");
+    assert!(one["agent"].is_null());
+    assert_eq!(one["is_linked_worktree"], true);
+    assert_eq!(one["changed_files"], 1);
+    assert_eq!(one["lines_added"], 0);
+    assert_eq!(one["lines_removed"], 0);
+    assert_eq!(one["has_rename"], false);
+    assert_eq!(one["degraded"], false);
+    assert!(one["degraded_reason"].is_null());
+
+    let pairing = &json["pairings"][0];
+    assert_eq!(pairing["left"], "one");
+    assert_eq!(pairing["right"], "two");
+    assert_eq!(pairing["conflict_count"], 1);
+    assert_eq!(pairing["unknown_count"], 0);
+    assert_eq!(pairing["approximate"], false);
+    assert_eq!(pairing["shared"][0]["path"], "shared.txt");
+    assert_eq!(pairing["shared"][0]["verdict"], "conflict");
+
+    let status = &json["statuses"][0];
+    assert_eq!(status["workspace_id"], "one");
+    assert_eq!(status["severity"], "conflict");
+    assert_eq!(status["token"], "collide_conflict");
+    assert_eq!(status["badge"], "\u{2718} 1");
+    assert_eq!(status["conflict_count"], 1);
+    assert_eq!(status["overlap_count"], 0);
+    assert_eq!(status["unknown_count"], 0);
+    assert_eq!(status["runaway"], false);
+    assert_eq!(status["lines_changed"], 0);
+    assert_eq!(status["changed_files"], 1);
+
     assert_eq!(json["notes"][0], "a note");
+}
+
+/// The value the schema bump was for. `unknown` is a severity a consumer that
+/// matched exhaustively on the old four has never seen, so it belongs in the
+/// documented output and in a test.
+#[test]
+fn json_reports_the_unknown_severity_the_schema_was_bumped_for() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("one".to_string(), change_set(&["shared.txt"])),
+        ("two".to_string(), change_set(&["shared.txt"])),
+    ];
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    apply_predictions(
+        &mut report,
+        &[PairVerdicts {
+            left_workspace_id: "one".to_string(),
+            right_workspace_id: "two".to_string(),
+            verdicts: Vec::new(),
+            failed: true,
+            approximate: true,
+        }],
+        &changes,
+        &config(),
+    );
+
+    let json = json_report(&Cycle {
+        report,
+        changes,
+        notes: Vec::new(),
+    });
+
+    assert_eq!(json["statuses"][0]["severity"], "unknown");
+    assert_eq!(json["statuses"][0]["token"], "collide_unknown");
+    assert_eq!(json["statuses"][0]["badge"], "? 1");
+    assert_eq!(json["statuses"][0]["unknown_count"], 1);
+    assert_eq!(json["pairings"][0]["unknown_count"], 1);
+    assert_eq!(json["pairings"][0]["shared"][0]["verdict"], "unknown");
+    // A failed prediction says nothing about the merge base either.
+    assert_eq!(json["pairings"][0]["approximate"], false);
 }
 
 fn status_of<'a>(report: &'a Report, id: &str) -> &'a collide::model::WorkspaceStatus {
@@ -877,7 +1006,7 @@ fn a_pair_whose_prediction_failed_is_unknown_and_never_an_overlap() {
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
 
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     // `failed` is exactly what `predict_all` builds when the git call errors.
     let failed = vec![PairVerdicts {
         left_workspace_id: "one".to_string(),
@@ -914,7 +1043,7 @@ fn a_pair_whose_prediction_succeeded_and_found_nothing_is_a_real_overlap() {
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
 
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     let clean = vec![PairVerdicts {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
@@ -945,7 +1074,7 @@ fn a_checkout_that_could_not_be_read_is_not_reported_as_clean() {
         ),
     ];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert_eq!(status_of(&report, "healthy").severity, Severity::Clean);
     assert_eq!(status_of(&report, "unreadable").severity, Severity::Unknown);
 }
@@ -955,7 +1084,7 @@ fn a_checkout_that_could_not_be_read_is_not_reported_as_clean() {
 #[test]
 fn a_checkout_with_no_change_set_at_all_is_unknown() {
     let checkouts = vec![checkout("orphan", Path::new("/tmp/orphan"), "/repo/.git")];
-    let report = analyse(&checkouts, &[], &config());
+    let report = analyse(&checkouts, &[], &distinct_trees(&checkouts), &config());
     assert_eq!(status_of(&report, "orphan").severity, Severity::Unknown);
 }
 
@@ -970,7 +1099,7 @@ fn an_ignored_path_takes_its_line_count_with_it() {
         change_set_with_lines(&[("package-lock.json", 90_000)]),
     )];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     let status = status_of(&report, "one");
     assert!(
         !status.runaway,
@@ -990,7 +1119,7 @@ fn the_same_volume_on_a_counted_path_is_still_a_runaway() {
         change_set_with_lines(&[("src/generated.rs", 90_000)]),
     )];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert!(status_of(&report, "one").runaway);
     assert_eq!(status_of(&report, "one").severity, Severity::Runaway);
 }
@@ -1003,7 +1132,7 @@ fn a_rename_counts_as_one_changed_file_not_two() {
     // 21 renames: 42 paths, but only 21 files. The default threshold is 40.
     let changes = vec![("one".to_string(), change_set_renamed(21))];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     let status = status_of(&report, "one");
     assert_eq!(status.changed_files, 21);
     assert!(
@@ -1013,7 +1142,7 @@ fn a_rename_counts_as_one_changed_file_not_two() {
 
     // And the threshold still works: 41 renamed files is 41 changed files.
     let many = vec![("one".to_string(), change_set_renamed(41))];
-    let report = analyse(&checkouts, &many, &config());
+    let report = analyse(&checkouts, &many, &distinct_trees(&checkouts), &config());
     assert!(status_of(&report, "one").runaway);
 }
 
@@ -1035,7 +1164,7 @@ fn two_workspaces_on_the_same_tree_are_never_paired() {
         ("outer".to_string(), change_set(&["src/a.rs", "src/b.rs"])),
         ("again".to_string(), change_set(&["src/a.rs", "src/b.rs"])),
     ];
-    let report = analyse(&same, &changes, &config());
+    let report = analyse(&same, &changes, &resolved_trees(&same), &config());
     assert!(
         report.pairings.is_empty(),
         "one working tree cannot collide with itself"
@@ -1049,10 +1178,116 @@ fn two_workspaces_on_the_same_tree_are_never_paired() {
         ("outer".to_string(), change_set(&["src/a.rs"])),
         ("inner".to_string(), change_set(&["src/a.rs"])),
     ];
-    let report = analyse(&inside, &changes, &config());
+    let report = analyse(&inside, &changes, &resolved_trees(&inside), &config());
     assert!(
         report.pairings.is_empty(),
         "a checkout nested inside another reports the same change set"
+    );
+}
+
+/// The other half, and the one a sibling-worktree fixture cannot reach: a linked
+/// worktree *inside* the main worktree's directory, which is the `.worktrees/`
+/// layout most agent-per-worktree setups use.
+///
+/// Its path sits under the main worktree's, so a same-tree test written as a
+/// path-prefix comparison called them one tree and stopped comparing them. They
+/// are not one tree — separate HEAD, separate index, separate change set — and
+/// the main worktree then badged clean while conflicting head-on with every
+/// agent living inside it. Nothing about that was visible: no error, no note,
+/// and an empty badge, which the daemon reads as "clear the token".
+#[test]
+fn a_worktree_nested_inside_another_is_still_compared_with_it() {
+    let fixture = Fixture::new("nested-worktree");
+    let api = fixture.nested_worktree("api", "feature/api");
+    let ui = fixture.nested_worktree("ui", "feature/ui");
+    let main = fixture.repo.clone();
+
+    // All three change the same line of the same file: three real conflicts.
+    for (tree, text) in [(&api, "api\n"), (&ui, "ui\n"), (&main, "main\n")] {
+        std::fs::write(tree.join("conflict.txt"), text).expect("write");
+    }
+    fixture.commit_all(&api, "api");
+    fixture.commit_all(&ui, "ui");
+
+    let checkouts = vec![
+        checkout("main", &main, "unused"),
+        checkout("api", &api, "unused"),
+        checkout("ui", &ui, "unused"),
+    ];
+    let cycle = collide::collide::gather_for(checkouts, &config()).expect("cycle");
+
+    // The nesting is real: `api` lives underneath `main`'s directory.
+    assert!(api.starts_with(&main), "the fixture is not nested");
+
+    // Normalised, because which side is "left" is an artefact of the input
+    // order and not what this test is about.
+    let mut pairs: Vec<String> = cycle
+        .report
+        .pairings
+        .iter()
+        .map(|p| {
+            let mut ends = [p.left_workspace_id.as_str(), p.right_workspace_id.as_str()];
+            ends.sort();
+            format!("{} <-> {}", ends[0], ends[1])
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec!["api <-> main", "api <-> ui", "main <-> ui"],
+        "every pair must be compared, notes: {:?}",
+        cycle.notes
+    );
+
+    // And the main worktree is not reported clean.
+    let main_status = status_of(&cycle.report, "main");
+    assert_ne!(
+        main_status.severity,
+        Severity::Clean,
+        "the main worktree conflicts with both of its nested worktrees"
+    );
+    assert_eq!(main_status.severity, Severity::Conflict);
+    assert!(!collide::render::badge(main_status).is_empty());
+}
+
+/// The resolution the guard above depends on, checked against git rather than
+/// against itself. `work_tree_root` is a filesystem walk, not a `git rev-parse`
+/// call, so this is what stops it drifting away from what git actually says.
+#[test]
+fn resolved_work_trees_match_git_rev_parse() {
+    let fixture = Fixture::new("toplevels");
+    let nested = fixture.nested_worktree("api", "feature/api");
+    let sibling = fixture.worktree("beside", "beside");
+    let subdir_of_main = fixture.repo.join("pkg");
+    let subdir_of_nested = nested.join("pkg");
+    std::fs::create_dir_all(&subdir_of_main).expect("dir");
+    std::fs::create_dir_all(&subdir_of_nested).expect("dir");
+
+    for path in [
+        fixture.repo.clone(),
+        nested.clone(),
+        sibling.clone(),
+        subdir_of_main.clone(),
+        subdir_of_nested.clone(),
+    ] {
+        assert_eq!(
+            work_tree_root(&path),
+            git_toplevel(&path),
+            "work_tree_root disagrees with git for {}",
+            path.display()
+        );
+    }
+
+    // The two facts the pairing pass actually needs out of that.
+    assert_eq!(
+        work_tree_root(&subdir_of_main),
+        work_tree_root(&fixture.repo),
+        "a subdirectory is the same working tree"
+    );
+    assert_ne!(
+        work_tree_root(&nested),
+        work_tree_root(&fixture.repo),
+        "a nested linked worktree is a different working tree"
     );
 }
 
@@ -1073,7 +1308,7 @@ fn a_pair_with_no_shared_path_is_still_predicted_when_either_side_renamed() {
         ("two".to_string(), change_set(&["only-there.rs"])),
     ];
 
-    let report = analyse(&checkouts, &changes, &config());
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert_eq!(
         report.pairings.len(),
         1,
@@ -1086,7 +1321,11 @@ fn a_pair_with_no_shared_path_is_still_predicted_when_either_side_renamed() {
         ("one".to_string(), change_set(&["only-here.rs"])),
         ("two".to_string(), change_set(&["only-there.rs"])),
     ];
-    assert!(analyse(&checkouts, &plain, &config()).pairings.is_empty());
+    assert!(
+        analyse(&checkouts, &plain, &distinct_trees(&checkouts), &config())
+            .pairings
+            .is_empty()
+    );
 }
 
 /// The rename probe must stay invisible when it finds nothing: a pairing with
@@ -1104,7 +1343,7 @@ fn a_rename_probe_that_finds_nothing_leaves_no_pairing_behind() {
         ("two".to_string(), change_set(&["only-there.rs"])),
     ];
 
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     let nothing = vec![PairVerdicts {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
@@ -1129,7 +1368,7 @@ fn an_approximate_prediction_is_carried_through_to_the_pairing() {
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
 
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     assert!(!report.pairings[0].approximate);
     let forced = vec![PairVerdicts {
         left_workspace_id: "one".to_string(),
@@ -1247,7 +1486,7 @@ fn a_conflicting_path_in_neither_change_set_is_only_believed_when_a_rename_expla
         approximate: false,
     }];
 
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     apply_predictions(&mut report, &phantom, &changes, &config());
     let paths: Vec<&str> = report.pairings[0]
         .shared
@@ -1268,7 +1507,7 @@ fn a_conflicting_path_in_neither_change_set_is_only_believed_when_a_rename_expla
         ("one".to_string(), renamed),
         ("two".to_string(), change_set(&["shared.txt"])),
     ];
-    let mut report = analyse(&checkouts, &changes, &config());
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
     apply_predictions(&mut report, &phantom, &changes, &config());
     let paths: Vec<&str> = report.pairings[0]
         .shared
@@ -1276,4 +1515,505 @@ fn a_conflicting_path_in_neither_change_set_is_only_believed_when_a_rename_expla
         .map(|s| s.path.as_str())
         .collect();
     assert_eq!(paths, vec!["media.bin", "shared.txt"]);
+}
+
+/// A path the plugin was told to ignore must not come back through the
+/// unlisted-conflict door.
+///
+/// `merge-tree` merges whole trees and names every conflicted path regardless of
+/// the paths it was asked about, so a `Cargo.lock` both agents regenerated is
+/// reported as conflicting even though it was filtered out of the pairing. It
+/// was then re-added as a `Conflict` and drove the badge — the single commonest
+/// false alarm there is, and precisely what `ignore_suffixes` exists to stop.
+#[test]
+fn an_ignored_path_cannot_return_as_an_unlisted_conflict() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    // Both sides changed a real file and the lockfile. Only the real file
+    // survives the filter into the pairing.
+    let changes = vec![
+        ("one".to_string(), change_set(&["src/a.rs", "Cargo.lock"])),
+        ("two".to_string(), change_set(&["src/a.rs", "Cargo.lock"])),
+    ];
+    assert!(collide::collide::is_ignored("Cargo.lock", &config()));
+
+    let prediction = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![
+            ("src/a.rs".to_string(), false),
+            ("Cargo.lock".to_string(), true),
+        ],
+        failed: false,
+        approximate: false,
+    }];
+
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    apply_predictions(&mut report, &prediction, &changes, &config());
+
+    let paths: Vec<&str> = report.pairings[0]
+        .shared
+        .iter()
+        .map(|s| s.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["src/a.rs"],
+        "an ignored path came back as a conflict"
+    );
+    for id in ["one", "two"] {
+        let status = status_of(&report, id);
+        assert_eq!(status.conflict_count, 0);
+        assert_eq!(status.severity, Severity::Overlap);
+    }
+}
+
+/// The other direction, so the test above is measuring the ignore filter and not
+/// a broken unlisted-path rule: a path that is *not* ignored and that a change
+/// set does list is believed.
+#[test]
+fn a_listed_unignored_path_still_returns_as_a_conflict() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    // `vendor/notes.md` is listed by one side only, so it is not in the
+    // intersection and not in the pairing — but it is a real path, not an
+    // ignored one.
+    let changes = vec![
+        (
+            "one".to_string(),
+            change_set(&["src/a.rs", "vendor/notes.md"]),
+        ),
+        ("two".to_string(), change_set(&["src/a.rs"])),
+    ];
+    let prediction = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![
+            ("src/a.rs".to_string(), false),
+            ("vendor/notes.md".to_string(), true),
+        ],
+        failed: false,
+        approximate: false,
+    }];
+
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    apply_predictions(&mut report, &prediction, &changes, &config());
+
+    let paths: Vec<&str> = report.pairings[0]
+        .shared
+        .iter()
+        .map(|s| s.path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["src/a.rs", "vendor/notes.md"]);
+    assert_eq!(status_of(&report, "one").severity, Severity::Conflict);
+    // Listed is a fact, not a guess, so nothing about this is approximate.
+    assert!(!report.pairings[0].approximate);
+}
+
+/// An unlisted path admitted only because *some* rename happened somewhere in
+/// the pair is a guess: nothing in the prediction says which conflict the rename
+/// explains. It is a guess worth making — the alternative is losing the rename
+/// conflicts the pair was predicted for — but the pairing says so.
+#[test]
+fn a_path_admitted_only_by_a_rename_marks_the_pairing_approximate() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let mut renamed = change_set(&["shared.txt"]);
+    renamed.has_rename = true;
+    let changes = vec![
+        ("one".to_string(), renamed),
+        ("two".to_string(), change_set(&["shared.txt"])),
+    ];
+    // `moved.rs` is in neither change set; only the rename can explain it.
+    let prediction = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![
+            ("shared.txt".to_string(), false),
+            ("moved.rs".to_string(), true),
+        ],
+        failed: false,
+        approximate: false,
+    }];
+
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    apply_predictions(&mut report, &prediction, &changes, &config());
+
+    let paths: Vec<&str> = report.pairings[0]
+        .shared
+        .iter()
+        .map(|s| s.path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["moved.rs", "shared.txt"], "the guess is kept");
+    assert!(
+        report.pairings[0].approximate,
+        "a path admitted on the strength of an unrelated rename is not a firm verdict"
+    );
+
+    // With every conflicting path listed, nothing was guessed and the pairing
+    // stays firm even though a rename happened.
+    let mut renamed = change_set(&["shared.txt"]);
+    renamed.has_rename = true;
+    let changes = vec![
+        ("one".to_string(), renamed),
+        ("two".to_string(), change_set(&["shared.txt"])),
+    ];
+    let firm = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![("shared.txt".to_string(), true)],
+        failed: false,
+        approximate: false,
+    }];
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    apply_predictions(&mut report, &firm, &changes, &config());
+    assert!(!report.pairings[0].approximate);
+}
+
+/// Reason codes are the stable half of a `degraded_reason`; the human half
+/// interpolates branch and ref names the user chose. Matching a code as a
+/// substring of the whole string therefore fired on a *branch* named
+/// `unborn-branch`, which silently excluded its checkout from every comparison.
+#[test]
+fn a_branch_named_after_a_reason_code_is_still_paired() {
+    for name in ["unborn-branch", "feature/broken-head-rework"] {
+        let mut set = change_set(&["shared.txt"]);
+        set.degraded = true;
+        set.degraded_reason = Some(format!(
+            "{}: `{name}` does not resolve",
+            git::DEGRADED_MISSING_BASE_REF
+        ));
+        assert!(
+            collide::collide::pairable(&set),
+            "a missing base ref named {name} is not an unborn branch"
+        );
+    }
+
+    // The real codes still work, alone and joined.
+    let mut unborn = change_set(&[]);
+    unborn.degraded = true;
+    unborn.degraded_reason = Some(format!(
+        "{}: `wip` has no commits yet",
+        git::DEGRADED_UNBORN
+    ));
+    assert!(!collide::collide::pairable(&unborn));
+
+    let mut joined = change_set(&[]);
+    joined.degraded = true;
+    joined.degraded_reason = Some(format!(
+        "{}: a merge is in progress; {}: `wip` was deleted",
+        git::DEGRADED_UNMERGED,
+        git::DEGRADED_BROKEN_HEAD
+    ));
+    assert!(!collide::collide::pairable(&joined));
+}
+
+/// The same trap on the severity ladder: a checkout is `Unknown` because the git
+/// pass could not read it, not because a ref happens to be named `unreadable`.
+#[test]
+fn a_ref_named_after_the_unreadable_code_does_not_force_unknown() {
+    let checkouts = vec![checkout("one", Path::new("/tmp/one"), "/repo/.git")];
+    let mut set = change_set(&["src/a.rs"]);
+    set.degraded = true;
+    set.degraded_reason = Some(format!(
+        "{}: `refs/heads/unreadable` does not resolve",
+        git::DEGRADED_MISSING_BASE_REF
+    ));
+    let changes = vec![("one".to_string(), set)];
+
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    assert_eq!(status_of(&report, "one").severity, Severity::Clean);
+
+    // And a genuinely unreadable checkout is still unknown.
+    let changes = vec![(
+        "one".to_string(),
+        change_set_degraded(&format!("{}: permission denied", git::DEGRADED_UNREADABLE)),
+    )];
+    let report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    assert_eq!(status_of(&report, "one").severity, Severity::Unknown);
+}
+
+/// Exactly one severity is live for every combination of inputs, and it is the
+/// one the documented ladder names.
+///
+/// The rung this pins was added without a test: swapping `Unknown` and
+/// `Runaway` in the ladder broke nothing in the suite, so the position of the
+/// severity the whole change was about could be moved by accident.
+///
+/// Three workspaces, because a failed prediction is per *pair*: `one` is paired
+/// with `two`, whose prediction succeeds and can produce a conflict or an
+/// overlap, and with `three`, whose prediction fails and produces the unknown.
+/// With only two workspaces the four inputs cannot be varied independently — a
+/// failed prediction swallows the whole pair.
+#[test]
+fn the_severity_ladder_is_total_and_ordered_as_documented() {
+    // `one` carries at most three shared files plus its private ones, so the
+    // threshold only trips when the case asks for it.
+    let config = Config {
+        runaway_files: 5,
+        ..config()
+    };
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+        checkout("three", Path::new("/tmp/three"), "/repo/.git"),
+    ];
+
+    for conflict in [false, true] {
+        for unknown in [false, true] {
+            for runaway in [false, true] {
+                for overlap in [false, true] {
+                    let mut mine: Vec<&str> = Vec::new();
+                    let mut predicted: Vec<&str> = Vec::new();
+                    let mut undecidable: Vec<&str> = Vec::new();
+                    if conflict {
+                        mine.push("c.rs");
+                        predicted.push("c.rs");
+                    }
+                    if overlap {
+                        mine.push("o.rs");
+                        predicted.push("o.rs");
+                    }
+                    if unknown {
+                        mine.push("u.rs");
+                        undecidable.push("u.rs");
+                    }
+                    if runaway {
+                        mine.extend(["r1.rs", "r2.rs", "r3.rs", "r4.rs", "r5.rs", "r6.rs"]);
+                    }
+                    let changes = vec![
+                        ("one".to_string(), change_set(&mine)),
+                        ("two".to_string(), change_set(&predicted)),
+                        ("three".to_string(), change_set(&undecidable)),
+                    ];
+
+                    let mut report =
+                        analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config);
+
+                    let mut verdicts = Vec::new();
+                    if conflict {
+                        verdicts.push(("c.rs".to_string(), true));
+                    }
+                    if overlap {
+                        verdicts.push(("o.rs".to_string(), false));
+                    }
+                    apply_predictions(
+                        &mut report,
+                        &[
+                            PairVerdicts {
+                                left_workspace_id: "one".to_string(),
+                                right_workspace_id: "two".to_string(),
+                                verdicts,
+                                failed: false,
+                                approximate: false,
+                            },
+                            // The pair that could not be decided.
+                            PairVerdicts {
+                                left_workspace_id: "one".to_string(),
+                                right_workspace_id: "three".to_string(),
+                                verdicts: Vec::new(),
+                                failed: true,
+                                approximate: false,
+                            },
+                        ],
+                        &changes,
+                        &config,
+                    );
+
+                    let status = status_of(&report, "one");
+                    let label = format!(
+                        "conflict={conflict} unknown={unknown} runaway={runaway} overlap={overlap}"
+                    );
+
+                    // The ladder, written out here rather than derived from the
+                    // implementation, so a change to either has to be made twice.
+                    let expected = if conflict {
+                        Severity::Conflict
+                    } else if unknown {
+                        Severity::Unknown
+                    } else if runaway {
+                        Severity::Runaway
+                    } else if overlap {
+                        Severity::Overlap
+                    } else {
+                        Severity::Clean
+                    };
+                    assert_eq!(status.severity, expected, "{label}");
+
+                    // Exactly one severity is live, and the counts underneath it
+                    // agree rather than drifting.
+                    assert_eq!(status.conflict_count, usize::from(conflict), "{label}");
+                    assert_eq!(status.unknown_count, usize::from(unknown), "{label}");
+                    assert_eq!(status.overlap_count, usize::from(overlap), "{label}");
+                    assert_eq!(status.runaway, runaway, "{label}");
+
+                    // ...and every fact survives its own demotion, which is what
+                    // makes the ordering a presentation choice rather than a
+                    // loss of information.
+                    if runaway {
+                        assert!(status.runaway, "{label}");
+                    }
+                    if conflict && unknown {
+                        assert!(status.unknown_count > 0, "{label}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The rung itself, stated once and directly: an unknown verdict outranks a
+/// runaway. See the argument on `model::Severity` — the runaway fact survives in
+/// `runaway`, in `--json` and in the pane, and the unknown has nowhere else to
+/// go in the sidebar.
+#[test]
+fn an_unknown_verdict_outranks_a_runaway() {
+    let config = Config {
+        runaway_files: 1,
+        runaway_lines: 10,
+        ..config()
+    };
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        (
+            "one".to_string(),
+            change_set(&["shared.rs", "big1.rs", "big2.rs", "big3.rs"]),
+        ),
+        ("two".to_string(), change_set(&["shared.rs"])),
+    ];
+
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config);
+    apply_predictions(
+        &mut report,
+        &[PairVerdicts {
+            left_workspace_id: "one".to_string(),
+            right_workspace_id: "two".to_string(),
+            verdicts: Vec::new(),
+            failed: true,
+            approximate: false,
+        }],
+        &changes,
+        &config,
+    );
+
+    let status = status_of(&report, "one");
+    assert_eq!(status.severity, Severity::Unknown);
+    assert_eq!(status.severity.token_name(), "collide_unknown");
+    // The runaway is not lost, it just does not own the badge.
+    assert!(status.runaway, "the runaway fact must survive the demotion");
+    assert!(status.changed_files >= 4);
+}
+
+/// The producer half of "a checkout we could not read is not clean".
+///
+/// The interpretation of a `DEGRADED_UNREADABLE` change set is tested
+/// elsewhere, from a hand-built fixture. This pins the place the fix actually
+/// lives: `gather_for` turning a `git::change_set` failure into a degraded
+/// change set rather than an empty one. Reverting that line used to leave the
+/// whole suite green.
+#[test]
+fn gather_for_marks_a_checkout_it_could_not_read_rather_than_clean() {
+    let fixture = Fixture::new("unreadable-checkout");
+    let healthy = fixture.worktree("healthy", "healthy");
+    let doomed = fixture.worktree("doomed", "doomed");
+
+    // Snapshot `doomed` while it is readable, then take the repository away
+    // underneath it: `repo_key` and the branch lookup have already run by the
+    // time `change_set` needs the object store, which is exactly the shape of a
+    // worktree pruned or unmounted mid-cycle.
+    let checkouts = vec![
+        checkout("healthy", &healthy, "unused"),
+        checkout("doomed", &doomed, "unused"),
+    ];
+
+    let cycle = collide::collide::gather_for(checkouts.clone(), &config()).expect("cycle");
+    assert_eq!(
+        status_of(&cycle.report, "doomed").severity,
+        Severity::Clean,
+        "a readable, unchanged worktree is clean"
+    );
+
+    // Now break it. Removing the worktree's own git dir leaves the directory in
+    // place but makes every object lookup fail.
+    let git_dir = fixture.repo.join(".git/worktrees/doomed");
+    std::fs::remove_dir_all(&git_dir).expect("remove worktree git dir");
+
+    let cycle = collide::collide::gather_for(checkouts, &config()).expect("cycle");
+    let doomed_status = cycle
+        .report
+        .statuses
+        .iter()
+        .find(|s| s.workspace_id == "doomed");
+
+    match doomed_status {
+        // Either it was dropped before analysis, in which case a note says so...
+        None => assert!(
+            cycle.notes.iter().any(|n| n.contains("doomed")),
+            "a checkout that vanished from the report must leave a note: {:?}",
+            cycle.notes
+        ),
+        // ...or it reached the report, and must not read as clean.
+        Some(status) => {
+            assert_ne!(
+                status.severity,
+                Severity::Clean,
+                "a checkout we could not read must not badge as clean; notes: {:?}",
+                cycle.notes
+            );
+            assert_eq!(status.severity, Severity::Unknown);
+            assert_eq!(collide::render::badge(status), "?");
+        }
+    }
+
+    // The healthy one is unaffected either way.
+    assert_eq!(
+        status_of(&cycle.report, "healthy").severity,
+        Severity::Clean
+    );
+}
+
+/// The repo header names the repository, in the nested layout too.
+///
+/// `agree_on_repo_root` used to derive the root from the repo key alone. With
+/// the main worktree open its top level is the exact answer — it is the tree
+/// that owns the `--git-common-dir` — so nothing has to be guessed.
+#[test]
+fn the_repo_root_is_the_main_worktree_not_a_nested_one() {
+    let fixture = Fixture::new("nested-repo-root");
+    let api = fixture.nested_worktree("api", "feature/api");
+    let main = fixture.repo.clone();
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("api", &api, "unused"),
+            checkout("main", &main, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+
+    let roots: BTreeSet<&Path> = cycle
+        .report
+        .checkouts
+        .iter()
+        .map(|c| c.repo_root.as_path())
+        .collect();
+    assert_eq!(roots.len(), 1, "one repository, one root: {roots:?}");
+
+    let root = std::fs::canonicalize(roots.into_iter().next().unwrap()).expect("canonical");
+    assert_eq!(
+        root,
+        std::fs::canonicalize(&main).expect("canonical main"),
+        "the root is the main worktree, not the nested one"
+    );
+    assert_ne!(root, std::fs::canonicalize(&api).expect("canonical api"));
 }

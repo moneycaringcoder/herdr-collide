@@ -182,6 +182,40 @@ impl Fixture {
         path
     }
 
+    /// A linked worktree *inside* the main worktree, under `.worktrees/`.
+    ///
+    /// This is the layout most agent-per-worktree setups use, so that the
+    /// worktrees travel with the repository, and it is the one a sibling
+    /// worktree cannot stand in for: the path sits underneath the main
+    /// worktree's, so anything deciding "same working tree?" by path prefix
+    /// wrongly calls it the same tree and stops comparing the two.
+    ///
+    /// The exclusion goes in `.git/info/exclude` rather than a committed
+    /// `.gitignore`, so the base commit every other fixture shares is untouched
+    /// and the nesting does not show up as a change of its own.
+    pub fn nested_worktree(&self, name: &str, branch: &str) -> PathBuf {
+        let exclude = self.repo.join(".git/info/exclude");
+        if let Some(parent) = exclude.parent() {
+            std::fs::create_dir_all(parent).expect("info dir");
+        }
+        std::fs::write(&exclude, ".worktrees/\n").expect("write exclude");
+
+        let path = self.repo.join(".worktrees").join(name);
+        self.git(
+            &self.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+                "main",
+            ],
+        );
+        path
+    }
+
     /// A linked worktree with a detached HEAD.
     pub fn detached_worktree(&self, name: &str) -> PathBuf {
         let path = self.root.join(name);

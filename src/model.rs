@@ -2,8 +2,8 @@
 //! socket client, the analysis pass, and the renderers, so that each can be
 //! developed and tested independently.
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 /// Canonical identity for "the same repository", taken from herdr's
 /// `workspace.worktree.repo_key` (the `.git` path). Two checkouts are only ever
@@ -24,6 +24,54 @@ pub struct Checkout {
     pub branch: Option<String>,
     /// Agent occupying this workspace, if herdr reports one.
     pub agent: Option<String>,
+}
+
+/// Where each checkout's working tree actually starts, keyed by workspace id.
+///
+/// This is *not* a field on [`Checkout`], because herdr does not report it and
+/// cannot: it is what `git rev-parse --show-toplevel` answers, and it has to be
+/// resolved from disk. `collide::gather_for` resolves it once per checkout and
+/// hands the result to the pure analysis pass, which keeps the filesystem out of
+/// [`collide::analyse`].
+///
+/// It exists because a path prefix is not a working tree. Two checkouts share a
+/// working tree exactly when their top levels are equal — a workspace opened on
+/// `<root>/src` resolves to `<root>` and really is the same tree, while a linked
+/// worktree at `<root>/.worktrees/api` resolves to itself and is a different one
+/// even though its path sits underneath. Deciding that by prefix silently
+/// stopped every worktree in a `.worktrees/` layout from being compared with the
+/// repository it lives in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkTrees {
+    roots: BTreeMap<String, PathBuf>,
+}
+
+impl WorkTrees {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, workspace_id: impl Into<String>, root: impl Into<PathBuf>) {
+        self.roots.insert(workspace_id.into(), root.into());
+    }
+
+    pub fn get(&self, workspace_id: &str) -> Option<&Path> {
+        self.roots.get(workspace_id).map(PathBuf::as_path)
+    }
+
+    /// Whether two workspaces are checked out on the same working tree.
+    ///
+    /// An unresolved top level answers `false`: "I do not know" must not become
+    /// "these are the same tree", because the consequence of that claim is a
+    /// pair silently dropped from the comparison. Pairing two checkouts that
+    /// turn out to share a tree costs a visible, explicable overlap; refusing to
+    /// pair two that do not costs a conflict nobody is ever shown.
+    pub fn same_tree(&self, left_workspace_id: &str, right_workspace_id: &str) -> bool {
+        match (self.get(left_workspace_id), self.get(right_workspace_id)) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
+    }
 }
 
 /// How a path came to be in a change set. Ordering is significance order: a
@@ -156,10 +204,36 @@ impl Pairing {
 
 /// Worst-case state for a single workspace, which is what the badge shows.
 ///
-/// The order is the precedence order, and `Unknown` deliberately sits above
-/// `Overlap` and `Runaway`: an overlap badge means "both of you touched this
-/// file and it merges clean", which is a claim, and a failed prediction is not
-/// entitled to make it.
+/// The order is the precedence order. Only one severity is ever live, so every
+/// rung is a decision about what the badge gives up.
+///
+/// `Unknown` above `Overlap`: an overlap badge means "both of you touched this
+/// file and it merges clean", which is a claim about a merge, and a prediction
+/// that could not run has not earned it.
+///
+/// `Unknown` above `Runaway` needs its own argument, because a runaway is not a
+/// claim about a merge and is known with certainty while an unknown verdict is
+/// the absence of knowledge. Three things decide it:
+///
+/// * **Nothing is lost.** A runaway that loses the badge still says so
+///   everywhere else — `WorkspaceStatus::runaway` stays true, `--json` reports
+///   it, and the detail pane prints the word `runaway` on the worktree line next
+///   to the badge. An unknown verdict that loses the badge has nowhere else to
+///   go in the sidebar. Demoting a runaway costs a decoration; demoting an
+///   unknown costs the only signal.
+/// * **Rarity should win.** A runaway is a slow-burn heuristic about one
+///   workspace's own size, and on a busy branch it is on almost permanently. A
+///   failed prediction is rare and transient. Ranking the common signal above
+///   the rare one means the rare one is never seen; ranking it the other way
+///   round costs the common one a badge it will get back on the next cycle.
+/// * **Shape.** This plugin exists to answer one question — are these two agents
+///   about to collide? A runaway is a side observation. `Unknown` is that
+///   question going unanswered, which is closer to `Conflict` than to anything
+///   measuring volume, and it belongs next to it.
+///
+/// The cost is real and worth stating: a workspace that is certainly a runaway
+/// and has one unpredictable shared file badges `?` rather than `⚠`, so the
+/// volume signal waits for the pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Severity {
     #[default]
