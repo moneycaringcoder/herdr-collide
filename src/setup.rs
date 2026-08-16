@@ -13,9 +13,17 @@
 //!   * the file's own line endings survive the edit;
 //!   * a failed reload restores the backup byte for byte;
 //!   * running it twice adds nothing, and running it after a new token was
-//!     introduced adds exactly that token;
+//!     introduced adds exactly that token, in the row its siblings are in;
+//!   * nothing outside `[ui.sidebar.spaces]` is ever read as configuration, and
+//!     nothing outside it is ever written to;
 //!   * when the file is a shape this splice cannot handle, it says so and fails
 //!     rather than reporting that there was nothing to do.
+//!
+//! That last rule is the one this module got wrong for longest, and the cost was
+//! the highest: the walk for the `rows` array stopped at `[table]` but not at
+//! `[[array.of.tables]]`, so an empty `[ui.sidebar.spaces]` sent it into the
+//! next `[[keys.command]]` block to splice four token tables into a keybinding —
+//! a file that parses, reloads and renders nothing, reported as a success.
 
 use std::path::{Path, PathBuf};
 
@@ -79,26 +87,69 @@ fn token_lines(tokens: &[(&str, &str)]) -> Vec<String> {
         .collect()
 }
 
-/// The token rows that are not in the file yet.
+/// The token rows that are not in the section this splice writes into.
 ///
 /// Per token, not all-or-nothing. The all-or-nothing version made `--setup` a
 /// no-op for every user who had installed before a new token existed: their
 /// file already named `$collide_overlap`, so the whole splice was skipped and
 /// the new severity could never render.
 ///
-/// A token named only inside a comment does not count as configured — herdr
-/// cannot render a commented-out row either.
-fn missing_tokens(text: &str) -> Vec<(&'static str, &'static str)> {
+/// Scoped to `[ui.sidebar.spaces]`, not to the whole file, and the difference is
+/// not academic: a token named in some *other* section — an experiment in
+/// `[ui.sidebar.agents]`, a half-finished move between sidebars — used to count
+/// as configured, so the splice omitted it from the section it was actually
+/// building. The token then rendered nowhere while `--setup` reported success
+/// and a second run answered "already configured". When there is no section at
+/// all the scope is empty and every token is missing, which is right: the
+/// section about to be appended contains none of them yet.
+///
+/// A token named only inside a comment does not count as configured either —
+/// herdr cannot render a commented-out row.
+fn missing_tokens(scope: &[&str]) -> Vec<(&'static str, &'static str)> {
     TOKEN_COLOURS
         .iter()
-        .filter(|(token, _)| !mentions(text, token))
+        .filter(|(token, _)| !mentions(scope, token))
         .copied()
         .collect()
 }
 
-fn mentions(text: &str, token: &str) -> bool {
+fn mentions(scope: &[&str], token: &str) -> bool {
     let needle = format!("\"${token}\"");
-    text.lines().any(|line| code_of(line).contains(&needle))
+    scope.iter().any(|line| code_of(line).contains(&needle))
+}
+
+/// The lines of the `[ui.sidebar.spaces]` table: its header, and everything up
+/// to the next table header.
+fn section_lines<'a>(lines: &[&'a str], section_start: usize) -> Vec<&'a str> {
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(section_start + 1)
+        .find(|(_, line)| is_table_header(line))
+        .map_or(lines.len(), |(offset, _)| offset);
+    lines[section_start..end].to_vec()
+}
+
+/// Whether a line opens a new TOML table.
+///
+/// `[[x]]` is an array-of-tables header and is every bit as much a new table as
+/// `[x]`; treating it as anything else is what let the row walk wander out of
+/// the section it was given and splice into a keybinding table.
+///
+/// A row inside a `rows` array also begins with `[`, so the bracket alone is not
+/// enough: a header's name is a bare key, which starts with a letter or an
+/// underscore, while a row starts with a quoted string. A *quoted* table header
+/// (`["my table"]`) would read as a row here — legal TOML, but not a shape
+/// herdr's own config uses, and the independent parser in `tests/setup_edit.rs`
+/// draws the line in the same place.
+fn is_table_header(line: &str) -> bool {
+    let trimmed = code_of(line).trim_start();
+    trimmed.starts_with('[')
+        && trimmed
+            .trim_start_matches('[')
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// What `plan_edit` decided.
@@ -124,16 +175,23 @@ pub struct Splice {
 /// Splices the missing token entries into an existing `[ui.sidebar.spaces]`
 /// rows array, or appends a complete section when the user has none.
 pub fn plan_edit(text: &str) -> EditPlan {
-    let missing = missing_tokens(text);
-    if missing.is_empty() {
-        return EditPlan::AlreadyConfigured;
-    }
-    let added: Vec<&'static str> = missing.iter().map(|(token, _)| *token).collect();
-
     let lines: Vec<&str> = text.lines().collect();
     let section_start = lines
         .iter()
         .position(|line| code_of(line).trim_start().starts_with(SECTION));
+
+    // Only the target section decides what is already configured. With no
+    // section there is nothing configured yet, whatever the rest of the file
+    // says.
+    let scope = match section_start {
+        Some(start) => section_lines(&lines, start),
+        None => Vec::new(),
+    };
+    let missing = missing_tokens(&scope);
+    if missing.is_empty() {
+        return EditPlan::AlreadyConfigured;
+    }
+    let added: Vec<&'static str> = missing.iter().map(|(token, _)| *token).collect();
 
     let Some(section_start) = section_start else {
         return EditPlan::Edit(Splice {
@@ -142,14 +200,22 @@ pub fn plan_edit(text: &str) -> EditPlan {
         });
     };
 
-    let span = match find_last_row(&lines, section_start) {
-        Ok(Some(span)) => span,
-        Ok(None) => {
-            return EditPlan::CouldNotPlace(format!(
-                "found {SECTION} but no row inside a `rows = [ ... ]` array to add to"
-            ))
-        }
+    let rows = match find_rows(&lines, section_start) {
+        Ok(rows) => rows,
         Err(reason) => return EditPlan::CouldNotPlace(reason),
+    };
+    // The row that already holds one of our tokens, so an upgrade keeps
+    // collide's badges together instead of scattering the new one into whatever
+    // row happens to be last. Falling back to the last row is the fresh-install
+    // case, where none of them is anywhere yet.
+    let Some(span) = rows
+        .iter()
+        .find(|span| row_mentions_ours(&lines, span))
+        .or_else(|| rows.last())
+    else {
+        return EditPlan::CouldNotPlace(format!(
+            "found {SECTION} but no row inside a `rows = [ ... ]` array to add to"
+        ));
     };
 
     let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
@@ -182,36 +248,62 @@ pub fn plan_edit(text: &str) -> EditPlan {
     })
 }
 
-/// Where the last row of the section's `rows` array lives.
+/// Where one row of the section's `rows` array lives.
 struct RowSpan {
     start_line: usize,
+    /// Byte index, within `start_line`, of the `[` that opened the row.
+    start_column: usize,
     end_line: usize,
     /// Byte index, within `end_line`, of the `]` that closed the row.
     end_column: usize,
 }
 
+/// Whether a row already names one of this plugin's tokens.
+fn row_mentions_ours(lines: &[&str], span: &RowSpan) -> bool {
+    let text = if span.start_line == span.end_line {
+        let code = code_of(lines[span.start_line]);
+        code.get(span.start_column..=span.end_column)
+            .unwrap_or(code)
+            .to_string()
+    } else {
+        lines[span.start_line..=span.end_line]
+            .iter()
+            .map(|line| code_of(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    TOKEN_COLOURS
+        .iter()
+        .any(|(token, _)| text.contains(&format!("\"${token}\"")))
+}
+
 /// Walks the `rows` array of the section starting at `section_start` and
-/// returns its last row.
+/// returns every row in it, in order.
 ///
 /// Depth 1 is inside `rows`, depth 2 is inside a row. Brackets inside comments
 /// and inside strings do not count — a commented-out row used to be picked as
 /// the last row, and the entries were then appended *inside the comment*, which
 /// leaves a file that parses, reloads and renders nothing at all.
-fn find_last_row(
-    lines: &[&str],
-    section_start: usize,
-) -> std::result::Result<Option<RowSpan>, String> {
+///
+/// The walk stops at the next table header of **any** kind. Exempting `[[x]]`
+/// was a real bug and a silent one: given a `[ui.sidebar.spaces]` with no rows
+/// of its own, the walk ran on into the following `[[keys.command]]` block,
+/// found *its* `rows` key, and spliced this plugin's token tables into a
+/// keybinding table. The file still parsed, herdr still reloaded it (it does not
+/// validate token names), the sidebar still rendered nothing — and `--setup`
+/// reported that it had added four rows. An array-of-tables header is a new
+/// table exactly as a plain one is.
+fn find_rows(lines: &[&str], section_start: usize) -> std::result::Result<Vec<RowSpan>, String> {
     let mut depth = 0usize;
     let mut in_rows = false;
-    let mut row_start: Option<usize> = None;
-    let mut span: Option<RowSpan> = None;
+    let mut row_start: Option<(usize, usize)> = None;
+    let mut rows: Vec<RowSpan> = Vec::new();
 
     for (offset, line) in lines.iter().enumerate().skip(section_start + 1) {
         let code = code_of(line);
         let mut from = 0usize;
         if !in_rows {
-            let trimmed = code.trim_start();
-            if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            if is_table_header(line) {
                 break; // next table; this section has no rows array
             }
             let Some(open) = rows_open(code)? else {
@@ -227,15 +319,16 @@ fn find_last_row(
                 Bracket::Open => {
                     depth += 1;
                     if depth == 2 && row_start.is_none() {
-                        row_start = Some(offset);
+                        row_start = Some((offset, column));
                     }
                 }
                 Bracket::Close => {
                     depth = depth.saturating_sub(1);
                     if depth == 1 {
-                        if let Some(start) = row_start.take() {
-                            span = Some(RowSpan {
-                                start_line: start,
+                        if let Some((start_line, start_column)) = row_start.take() {
+                            rows.push(RowSpan {
+                                start_line,
+                                start_column,
                                 end_line: offset,
                                 end_column: column,
                             });
@@ -252,7 +345,7 @@ fn find_last_row(
         }
     }
 
-    Ok(span)
+    Ok(rows)
 }
 
 /// The byte index of the `[` that opens a `rows = [` on this line, if it does.
@@ -439,6 +532,86 @@ fn name_list(tokens: &[&'static str]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// The tokens `--setup` writes that `text` does not name in its
+/// `[ui.sidebar.spaces]` rows.
+///
+/// Pure, and the same computation `plan_edit` uses to decide what to splice, so
+/// the two can never disagree about what "configured" means.
+pub fn unconfigured_tokens(text: &str) -> Vec<&'static str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let scope = match lines
+        .iter()
+        .position(|line| code_of(line).trim_start().starts_with(SECTION))
+    {
+        Some(start) => section_lines(&lines, start),
+        None => Vec::new(),
+    };
+    missing_tokens(&scope)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect()
+}
+
+/// A note for the daemon when herdr's sidebar cannot render a badge this plugin
+/// is about to compute.
+///
+/// The case that forced this: an installation that ran `--setup` before
+/// `collide_unknown` existed names the other three, so a workspace whose verdict
+/// is now `Unknown` clears its old token — correctly — and sets one herdr has
+/// never been told to render. The cell goes blank, which reads as clean. A
+/// severity added to stop things disappearing silently would itself disappear
+/// silently, and nothing anywhere would say why.
+///
+/// Compared against the tokens `--setup` writes rather than
+/// `Severity::ALL_TOKENS`, deliberately: `collide_clean` is in `ALL_TOKENS`
+/// because the sweep clears it defensively, but it is never *set* — a clean
+/// workspace clears its token instead — so a row naming it could never render
+/// anything and its absence is not a problem to report. Reporting it would make
+/// this note fire on every correctly configured installation, which is the
+/// fastest way to teach someone to ignore it.
+///
+/// Read-only, and never fatal: a missing or unreadable `config.toml` is
+/// something to say out loud, not something to stop the refresh loop for.
+pub fn sidebar_token_note() -> Option<String> {
+    let path = config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Some(format!(
+                "herdr has no {}, so no collide badge can render; \
+                 run the `{ACTION_TITLE}` action",
+                path.display()
+            ))
+        }
+        Err(err) => {
+            return Some(format!(
+                "could not read {} to check herdr's sidebar rows, so it is unknown whether \
+                 collide's badges can render at all: {err}",
+                path.display()
+            ))
+        }
+    };
+    let missing = unconfigured_tokens(&text);
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "herdr's sidebar does not name {}, so {} that severity renders as an empty cell \
+         rather than a badge; run the `{ACTION_TITLE}` action to add {} to {}",
+        name_list(&missing),
+        if missing.len() == 1 {
+            "a workspace at"
+        } else {
+            "a workspace at any of"
+        },
+        if missing.len() == 1 { "it" } else { "them" },
+        path.display()
+    ))
+}
+
+/// The action a user has to run, spelled as herdr's own menu spells it.
+const ACTION_TITLE: &str = "Collide: set up sidebar (start here)";
 
 pub fn run_setup() -> Result<()> {
     let config = config_path();

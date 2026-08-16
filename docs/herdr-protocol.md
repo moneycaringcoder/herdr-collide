@@ -294,6 +294,25 @@ handled:
   inline-table spelling of the section, cannot be handled by this approach at
   all. That has to be reported as a failure — "there was nothing to do" and "I
   could not do it" must never read the same.
+- **The next table, of either spelling.** The walk for the `rows` array must stop
+  at `[[array.of.tables]]` as well as at `[table]`. Stopping only at the latter
+  meant that a `[ui.sidebar.spaces]` with no rows of its own sent the walk on
+  into the following `[[keys.command]]` block, where it found *that* table's
+  `rows` key and spliced four token tables into a keybinding. Valid TOML, reloads
+  as `applied`, renders nothing — and reported as "added 4 sidebar rows". A row
+  begins with `[` too, so the test is "`[` followed by a bare key", not "`[`".
+- **Which section counts as configured.** "Is this token already here?" has to be
+  asked of `[ui.sidebar.spaces]`, not of the whole file. A token named in
+  `[ui.sidebar.agents]` cannot render in the spaces sidebar, and treating it as
+  configured made the splice omit it from the section it was building — nothing
+  rendered, the run reported success, and a second run said "already configured".
+  With no section at all, nothing is configured yet, whatever the rest of the
+  file says.
+- **Where a new token goes.** On an upgrade, add it to the row that already holds
+  one of this plugin's tokens, falling back to the last row only on a fresh
+  install. Always targeting the last row split collide's badges across two
+  sidebar rows the user never asked to have split.
+
 
 ## Daemon lifecycle
 
