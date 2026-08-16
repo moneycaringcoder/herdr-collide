@@ -12,10 +12,16 @@
 id = "moneycaringcoder.collide"
 name = "Collide"
 version = "0.1.0"
-# Oldest herdr with every API this plugin calls: the `tokens` metadata API on
-# workspace.report_metadata, which landed in 0.7.5. Developed and tested
-# against 0.8.0 / protocol 19.
-min_herdr_version = "0.7.5"
+# Oldest herdr this plugin has actually been run against. The `tokens` metadata
+# API on workspace.report_metadata landed in 0.7.5 and this used to claim that
+# version — but the setup action now reloads herdr's config over the socket
+# (`server.reload_config`) rather than shelling out to the `herdr` binary, which
+# is not on the PATH a plugin command gets, and there is no way to check from
+# here when that method appeared. Claiming a compatibility that has never been
+# exercised is the same habit as reporting a verdict that was never computed, so
+# this names the version everything here was verified against: 0.8.0, protocol
+# 19. Lower it again when someone has run the suite against an older server.
+min_herdr_version = "0.8.0"
 description = "Cross-worktree collision and conflict warnings for concurrent agents."
 platforms = ["linux", "macos"]
 

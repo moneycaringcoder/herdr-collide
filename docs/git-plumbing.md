@@ -7,18 +7,129 @@ worktree state. Timings are warm-cache on a 5000-file, 60 MB repo.
 
 ## Hard rules
 
-1. Always pass `--no-optional-locks` to `status`. Plain `status` takes
-   `<gitdir>/index.lock` to write back its stat cache — verified by watching the
-   index mtime advance. With the flag it does not.
+1. Set `GIT_OPTIONAL_LOCKS=0` in the environment of **every** invocation. Plain
+   `status` takes `<gitdir>/index.lock` to write back its stat cache — verified
+   by watching the index mtime advance — and so does `diff` against the working
+   tree. The `--no-optional-locks` flag is passed to `status` as well, but the
+   environment variable is the mechanism that actually covers every command; an
+   earlier version of this file credited the flag alone, which would have made
+   dropping the variable look safe.
 2. Never touch a worktree's real index. All staging goes through a temporary
    `GIT_INDEX_FILE`.
 3. Resolve both sides to 40-hex OIDs before calling `merge-tree`. See the
    exit-code trap below.
 4. Only compare worktrees whose canonicalized
    `git rev-parse --path-format=absolute --git-common-dir` is identical.
+5. Give every child its own process group and kill the *group* on expiry. See
+   "The deadline that was not one".
+6. Neutralise content filters for anything that hashes working-tree bytes. See
+   "Content filters".
 
 Everything except `status` is lock-free and safely parallel. A 120-process
 stress run produced zero errors and no leftover `index.lock`.
+
+## The deadline that was not one
+
+Killing a child on expiry does not bound the call. A pipe reaches EOF only when
+**every** holder of its write end has closed it, so any process git leaves
+behind that inherited git's stdout or stderr keeps `read_to_end` blocked long
+after git itself is dead. Reproduced with a `core.fsmonitor` hook and again with
+a `filter.<driver>.clean` that backgrounds a child:
+
+```sh
+# hook.sh — answers git immediately, leaves a holder behind on git's stderr
+#!/bin/sh
+sleep 90 >/dev/null &
+printf '/\0'
+```
+
+Measured: `git add` completes in 80 ms; the same command through a naive
+"kill the child, then join the reader threads" wrapper with a **2 s** deadline
+was still blocked at 40 s and had to be killed from outside. In a daemon that is
+not a wrong answer but a silent stop — the refresh loop parks, every badge
+freezes at its last value, and nothing is written to `notes`.
+
+Two defences, both required:
+
+* `setsid` in `pre_exec`, so the child leads its own process group and
+  `kill(-pid, SIGKILL)` reaches everything it spawned; and
+* a bounded wait on the drain threads, so even a group that escaped (a holder
+  that called `setsid` itself) costs one grace period rather than forever.
+
+The group is killed **only** when the child overran or a pipe failed to drain,
+never on the happy path: git legitimately starts background helpers
+(`fsmonitor--daemon`, `maintenance run --auto`) and killing those would be
+damage of our own.
+
+A drain that does not complete must be reported as a failure, not as a short
+answer. Undrained output is surfaced with no exit code at all, so no caller can
+mistake a truncated read for a successful command.
+
+## Content filters
+
+`git add` and `git diff --numstat HEAD` both run the repository's
+`filter.<driver>.clean` — or `.process`, which takes precedence over it — on the
+working-tree bytes. `git write-tree` runs it too, because it refreshes the index
+it is handed and re-hashes any stat-dirty entry. Measured on git 2.53.0:
+
+| command | clean-filter invocations |
+|---|---|
+| `status --porcelain=v2 -z -uall --renames` | 0 |
+| `diff --numstat -z HEAD` | 2 per changed file |
+| `diff --name-only -z <base>...HEAD` | 0 |
+| `diff --numstat -z <base>...HEAD` | 0 |
+| `add -A --` | 2 per changed file |
+| `write-tree` | 1 per stat-dirty entry |
+
+Those filters are arbitrary user programs. The one everybody has is git-lfs,
+whose clean filter writes into the user's own `.git/lfs/objects` every time it
+runs, so a plugin that promises to change nothing cannot execute them once per
+refresh cycle. Neutralise them per invocation:
+
+```sh
+git -c filter.<driver>.clean= \
+    -c filter.<driver>.process= \
+    -c filter.<driver>.required=false \
+    add -A --
+```
+
+All three overrides are needed. Emptying `clean` alone leaves `.process` in
+charge; emptying both while `required = true` — git-lfs's default — makes git
+refuse outright with `fatal: <path>: clean filter '<driver>' failed`. Verified
+each combination: with all three, the filter is not invoked and the blob is the
+raw working-tree bytes.
+
+Enumerate the drivers from the repository itself, since the set is per repo:
+
+```sh
+git config --name-only --get-regexp '^filter\.'   # exit 1 when there are none
+```
+
+Strip `filter.` and the trailing `.clean`/`.smudge`/`.process`/`.required`; a
+driver name may itself contain dots, so strip from the right.
+
+### What that costs, and the one case it gets wrong
+
+The snapshot tree then holds raw bytes for any filtered path `add` had to
+re-hash — for LFS the media rather than a pointer — while anything the seeded
+index still considers clean keeps its existing filtered blob. Prediction only
+ever compares one snapshot tree against another or against a commit tree, so a
+path both sides changed differently still differs and a path only one side
+changed still merges cleanly.
+
+Line counts for a filtered path then measure unfiltered bytes. For LFS that
+changes nothing: the diff is binary either way and `--numstat` reports `-`, which
+counts zero. For a text-transforming filter it overstates that path's volume,
+which the runaway thresholds treat as an order-of-magnitude signal anyway.
+
+**Known limitation.** A filtered path that is stat-dirty but content-identical is
+re-hashed to raw bytes and therefore looks modified against a base holding the
+filtered blob. Demonstrated with an LFS-shaped filter and a `touch`: `status`
+reports the worktree clean, the snapshot tree differs from HEAD for that path.
+If the sibling worktree genuinely changed the same file, the pair is reported as
+conflicting on a file one side never touched. Closing this needs the `add`
+scoped to the paths `status` reported, which needs the raw path bytes the change
+set does not keep — it renders paths as `String`.
 
 ## Repo identity
 
@@ -56,6 +167,18 @@ git -C <wt> --no-optional-locks status --porcelain=v2 -z --untracked-files=all -
 `-z` disables path quoting, so paths are **raw bytes** — verified with a
 filename containing a literal newline.
 
+Those bytes become `String` at this boundary, and the conversion has to be
+injective or change sets stop meaning what they say. Replacement alone is not:
+`\xff.txt` and `\xfe.txt` both render as `<?>.txt`, and because change sets are
+intersected by string, two worktrees holding two *different* files were reported
+as sharing one — with a verdict attached. Control characters have to go too, or
+a filename containing `ESC [ 2 J` clears the pane it is drawn into. So: replace
+invalid bytes and control characters, then append a digest of the raw bytes.
+Identical bytes always render identically, which is what keeps `status` output
+and `merge-tree` output matching each other; different bytes never collide. The
+cost is that such a path no longer addresses its file on disk, so an untracked
+file named that way is line-counted as zero.
+
 Record grammar, split on NUL then on ASCII space with a bounded `splitn`:
 
 | kind | layout | fields before path |
@@ -84,6 +207,37 @@ The three-dot form already means "from the merge base to HEAD", so no separate
 `merge-base` call is needed.
 
 The worktree's change set is the union of the two.
+
+Disk reads for untracked line counts must be joined onto
+`rev-parse --show-toplevel`, not onto the path the caller handed in.
+`status --porcelain` reports paths relative to the repository **root** whatever
+directory git ran in, so a checkout path pointing at a subdirectory otherwise
+addresses `<root>/pkg/pkg/file` and silently counts zero lines.
+
+### Choosing the integration ref
+
+There is no configured one, so it is probed. First match wins:
+
+1. `refs/remotes/origin/HEAD`, `refs/remotes/origin/main`,
+   `refs/remotes/origin/master`
+2. `refs/heads/main`, `refs/heads/master`, `refs/heads/trunk`
+3. `refs/remotes/<remote>/HEAD` for every other configured remote — a fork with
+   an `upstream` and no `origin` has nothing above this
+4. `refs/heads/<init.defaultBranch>`
+
+**Never fall back to `HEAD`.** `HEAD...HEAD` is empty by construction, and
+because both the base ref and the merge base then resolve, nothing is marked
+degraded either — a repository whose trunk is `develop` reported every workspace
+as clean while two agents committed conflicting edits to the same line of the
+same file. When the chain finds nothing, hand the change set a sentinel that is
+not a legal ref name (`<` and `>` are forbidden by `git check-ref-format`) and
+degrade with `missing-base-ref`. An unmeasurable checkout must never be
+indistinguishable from a clean one.
+
+Every probe must also distinguish "git said no" from "git could not answer".
+`rev-parse --verify -q` exits 1 for "does not resolve" and 128 for a real error,
+and a command killed on our own deadline has no exit code at all; only the first
+is an answer.
 
 ## Conflict prediction
 
@@ -171,9 +325,19 @@ in `-z` mode emits exactly one field, so `fields.len() == 1` means clean. The
 human message carries a trailing newline — trim it.
 
 Key off the machine-stable conflict-type tokens, never the prose:
-`CONFLICT (contents)`, `CONFLICT (rename/rename)`, `CONFLICT (modify/delete)`.
-Note that an add/add conflict reports the token `CONFLICT (contents)`; only the
-human message says "add/add", so there is no `CONFLICT (add/add)` token to match.
+`CONFLICT (contents)`, `CONFLICT (rename/rename)`, `CONFLICT (modify/delete)`,
+`CONFLICT (directory rename suggested)`. Note that an add/add conflict reports
+the token `CONFLICT (contents)`; only the human message says "add/add", so there
+is no `CONFLICT (add/add)` token to match.
+
+**Not every message record is a conflict.** git emits an `Auto-merging` record
+for each file it merged *successfully*, in exactly the same framing, and the
+records interleave. A two-file conflict yields
+`Auto-merging, CONFLICT (contents), Auto-merging, CONFLICT (contents)`. Keep only
+the fields beginning `CONFLICT (`, and deduplicate with a set — `Vec::dedup`
+removes only *adjacent* duplicates and leaves that sequence untouched. An
+assertion of the form `any(|t| t.starts_with("CONFLICT ("))` passes happily on
+the noisy list, so pin the whole list instead.
 
 `--write-tree` writes loose objects into the real ODB. Redirect them, always:
 
@@ -195,9 +359,9 @@ tree. Snapshot it through a throwaway index:
 ```sh
 GD=$(git -C "$WT" rev-parse --path-format=absolute --git-dir)
 IDX=$(mktemp)
-cp "$GD/index" "$IDX" 2>/dev/null || :        # seeding keeps the stat cache
-GIT_INDEX_FILE="$IDX" git -C "$WT" add -A --
-GIT_INDEX_FILE="$IDX" git -C "$WT" write-tree
+cp "$GD/index" "$IDX"                         # seeding keeps the stat cache
+GIT_INDEX_FILE="$IDX" git -C "$WT" $FILTER_OVERRIDES add -A --
+GIT_INDEX_FILE="$IDX" git -C "$WT" $FILTER_OVERRIDES write-tree
 rm -f "$IDX" "$IDX.lock"
 ```
 
@@ -210,6 +374,16 @@ out-of-cone paths.
 
 Seeding with `cp` costs 29 ms; `read-tree HEAD` instead costs 123 ms because it
 discards the stat cache and rehashes every file.
+
+The seeding `cp` must not be best-effort. A missing index is the one benign
+failure — a worktree that has none legitimately starts from empty — but every
+other failure has to be an error, because seeding is exactly what preserves the
+entries `add` will not revisit. Demonstrated on a cone-mode sparse checkout: the
+seeded snapshot tree contains the out-of-cone `out/o.txt`, the unseeded one does
+not, and merge-tree then reports one-sided deletions for files nobody touched.
+(A *truncated* copy fails loudly on its own — `fatal: <path>: index file smaller
+than expected` — so only a source that cannot be opened at all takes the silent
+route.)
 
 Then merge with an explicit base tree:
 
@@ -227,21 +401,80 @@ Caveats to encode:
   advisory.
 - Passing `--merge-base` forces a single base. If `git merge-base --all` returns
   more than one, flag the result as approximate.
+- **No common ancestor is not a prediction.** Substituting the empty tree for the
+  base turns every shared path into an add/add and reports a confident conflict
+  on all of them, while the commit form of the same pair lets merge-tree refuse
+  with `refusing to merge unrelated histories` (exit 128). The same two orphan
+  branches then flip between "unknown" and "everything conflicts" depending on
+  whether one of them happens to have a stray untracked file. Detect the empty
+  `merge-base --all` explicitly and give both shapes the same answer: unknown.
+
+### Do not prefilter twice
+
+The pairing pass owns the decision about which pairs are worth predicting,
+because it is the only place that holds both change sets. A second prefilter
+inside the predictor — "skip a pair with no shared path unless a side renamed
+something" — sounds equivalent and is not: the predictor derives "renamed" from
+`status`, which shows only *uncommitted* renames. A worktree that had committed
+a directory rename and was otherwise clean therefore short-circuited to a
+conflict-free verdict, while merge-tree on the very same pair exits 1:
+
+```sh
+# A renames docs/ to guide/ and commits; B adds docs/notes-c.md and commits.
+# Change sets: {docs/*, guide/*} and {docs/notes-c.md} — intersection empty.
+git -C repo merge-tree --write-tree -z --name-only wa wb
+# exit 1, conflicted file `guide/notes-c.md`,
+# token `CONFLICT (directory rename suggested)`
+```
+
+A clean pair costs 1.77 ms to answer properly. That is the whole saving the
+prefilter was buying, against losing a conflict.
 
 ## Degenerate cases
 
 | case | detection | action |
 |---|---|---|
 | detached HEAD | `worktree list` → `detached`; `symbolic-ref -q HEAD` exits 1 | usable, use the raw OID |
-| unborn branch | `HEAD 0000…`; `rev-parse --verify -q 'HEAD^{commit}'` exits 1; **no** `logs/HEAD` | exclude from pairing; change set is every `A.` entry |
-| branch deleted underneath | as unborn, but the worktree **has** a non-empty `logs/HEAD` | exclude from pairing, report as broken |
+| no commit on this branch | `symbolic-ref -q HEAD` exits 0; `rev-parse --verify -q 'HEAD^{commit}'` exits 1; `show-ref --verify --quiet <ref>` exits 1 | exclude from pairing; change set is every `A.` entry |
+| broken HEAD | as above, but `show-ref --verify --quiet <ref>` exits 0 or 128 — the ref is there and still yields no commit | exclude from pairing, report as broken |
+| HEAD git cannot read at all | any probe exits 128, times out, or has no exit code | error, and degrade with `unreadable` — never "no commit" |
 | foreign repo | differing common-dir | never compare |
 
-Correction to an earlier note here: `symbolic-ref -q HEAD` does **not**
-distinguish unborn from deleted-branch. On git 2.53.0 it exits 0 and prints the
-same ref name in both cases. The discriminator that works is the worktree's own
-HEAD reflog: a worktree that ever had a commit checked out has `logs/HEAD`, a
-freshly initialised one does not.
+### Unborn versus deleted: two wrong answers, recorded
+
+This file has twice asserted a discriminator between "this branch never had a
+commit" and "this branch was deleted underneath the worktree". Both were tested
+and both are wrong.
+
+1. `symbolic-ref -q HEAD` was said to exit 1 for unborn and 0 for deleted. On
+   git 2.53.0 it exits 0 and prints the same ref name in both cases.
+2. The worktree's `logs/HEAD` was then said to be the discriminator that works —
+   a worktree that ever had a commit checked out has one. It is wrong in **both**
+   directions:
+
+   ```sh
+   # genuinely unborn, and it has a reflog: the old rule says "deleted"
+   git checkout --orphan fresh          # in a worktree that already had commits
+
+   # genuinely deleted, and it has no reflog: the old rule says "unborn"
+   git config core.logAllRefUpdates false
+   git worktree add -b doomed ../doomed main
+   git update-ref -d refs/heads/doomed
+   ```
+
+The honest conclusion is that the two are the **same observable state**: HEAD is
+a symref to a ref that is not in the ref store. Nothing in the ref store, the
+index or the worktree tells them apart, and reflogging is a configuration choice
+rather than evidence about commits. Report both as "no commit on this branch",
+which is the part that is true and the part that decides what happens next —
+either way the checkout cannot be merged against anything.
+
+What the ref store *can* prove is the genuinely broken case: the ref exists and
+still yields no commit, because it points at a missing object or at a non-commit.
+`show-ref --verify --quiet` answers that in one command — 0 the ref resolves,
+1 there is no such ref, 128 the ref is there but its object is not. Note that a
+worktree in that state cannot even be `status`ed (`fatal: bad object HEAD`), so
+it fails loudly one step earlier.
 
 ## Cost, and the resulting pipeline
 
@@ -280,12 +513,14 @@ worth the parsing complexity.
 
 Pipeline for N worktrees (N(N−1)/2 pairs):
 
-1. **Prefilter, free.** Intersect change sets. Skip pairs with an empty
-   intersection — they cannot conflict. Exception: do not skip when either side
-   has a rename record.
-2. **Predict, ~2 ms/pair.** `merge-tree --write-tree -z --name-only` on the
-   survivors, in parallel, with objects redirected. One phase. Do not add a
-   `--quiet` pre-check: see "The --quiet trap".
+1. **Prefilter, free, and in one place only.** Intersect change sets in the
+   pairing pass. Skip pairs with an empty intersection — they cannot conflict.
+   Exception: do not skip when either side has a rename, *committed or
+   uncommitted*. See "Do not prefilter twice" for what happens when the predictor
+   second-guesses this with a narrower notion of "rename".
+2. **Predict, ~2 ms/pair.** `merge-tree --write-tree -z --name-only` on every
+   pair it hands over, in parallel, with objects redirected. One phase. Do not
+   add a `--quiet` pre-check: see "The --quiet trap".
 
 Snapshot each worktree once and reuse its tree OID across all of its pairs.
 
@@ -294,9 +529,44 @@ of prediction plus ~230 ms of snapshotting — about 6 % of one interval, before
 the parallel fan-out. Prediction is not the term that matters; the per-worktree
 snapshot is.
 
+Two invocations were added since those numbers were taken, both once per
+worktree per cycle: `rev-parse --show-toplevel` and
+`config --name-only --get-regexp '^filter\.'`. Each is in the 1–2 ms band with
+`rev-parse`, so the budget above is unchanged in any way that matters.
+
+## Known limitations
+
+- **A dirty submodule reads as an overlap, never as a conflict.** `status`
+  reports it as one changed path (`1 .M S.MU … sub`, parsed correctly), but the
+  snapshot's `add -A` records the submodule's *committed* gitlink, so merge-tree
+  compares two identical gitlinks and finds nothing. Two agents editing the same
+  submodule therefore always read as touching the same file harmlessly. The
+  directory also line-counts as zero, so the work is invisible to the runaway
+  thresholds. Predicting inside a submodule means treating it as a repository in
+  its own right, which is a larger change than the gitlink comparison.
+- **A stat-dirty but content-identical filtered path can be reported as
+  conflicting.** See "What that costs, and the one case it gets wrong".
+
+## Filename encoding differs by platform
+
+macOS (APFS and HFS+) enforces valid UTF-8 in filenames and answers `EILSEQ`;
+Linux filesystems accept any byte except `/` and NUL. So the case where two
+files' names differ only in an invalid byte — the one the path digest exists to
+keep apart — **cannot be constructed on macOS at all**. Observed on CI: the
+fixture that creates `\xff.txt` fails there with
+`Os { code: 92, message: "Illegal byte sequence" }`.
+
+The on-disk test therefore skips itself, loudly, where the filesystem refuses
+the names, and the parser half is covered everywhere from captured bytes
+instead. Do not "fix" that skip by dropping the case: it is a real difference
+between the two supported platforms, and on macOS the bug it guards against
+cannot happen.
+
 ## Unverified
 
-Cold-cache timings; `core.fsmonitor`, `feature.manyFiles`, split index and
-untracked-cache interactions with the seeded temp index; Windows and
-case-insensitive or NFD filesystems; submodules and `.gitattributes` merge
-drivers; worktrees relocated across mounts.
+Cold-cache timings; `feature.manyFiles`, split index and untracked-cache
+interactions with the seeded temp index; Windows and case-insensitive or NFD
+filesystems; `.gitattributes` **merge** drivers (clean/smudge filters are
+covered above); worktrees relocated across mounts. `core.fsmonitor` is now
+exercised as a pipe-leak fixture in `tests/read_only.rs`, but its effect on the
+seeded temp index is still untested.

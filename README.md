@@ -9,7 +9,7 @@ each other — and whether their edits merely overlap or will actually conflict.
 
 [![CI](https://github.com/moneycaringcoder/herdr-collide/actions/workflows/ci.yml/badge.svg)](https://github.com/moneycaringcoder/herdr-collide/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![herdr](https://img.shields.io/badge/herdr-%E2%89%A5%200.7.5-8b949e.svg)](https://herdr.dev)
+[![herdr](https://img.shields.io/badge/herdr-%E2%89%A5%200.8.0-8b949e.svg)](https://herdr.dev)
 [![read-only](https://img.shields.io/badge/your%20repos-never%20written%20to-2da44e.svg)](#how-it-works)
 
 </div>
@@ -47,16 +47,19 @@ expensive work happens, which is what keeps the comparison cheap as the number o
 In the sidebar, each workspace picks up a short badge next to its branch name:
 
 ```
-  api      feature/api    ✘ 2
-  ui       feature/ui     ✘ 2
-  docs     docs/readme    ⧉ 1
-  spike    spike/parser   ⚠ 4.1k
-  notes    notes/inbox
+  api       feature/api     ✘ 2
+  ui        feature/ui      ✘ 2
+  docs      docs/readme     ? 1
+  spike     spike/parser    ⚠ 4.2k
+  vendored  vendor/import   ? 1
+  deploy    chore/bump
 ```
 
 `✘ 2` means two files are predicted to conflict and `⧉ 1` means one file is shared but merges cleanly.
-`⚠ 4.1k` is a runaway: 4100 changed lines in one worktree, which is a count of the change set rather
-than of shared files — a runaway agent is usually one that shares nothing with anybody. A clean
+`⚠ 4.2k` is a runaway: 4200 changed lines in one worktree, which is a count of the change set rather
+than of shared files — a runaway agent is usually one that shares nothing with anybody. `? 1` is the
+badge that matters most: it means `collide` could not work out an answer for that file, and it is
+deliberately not folded into `⧉`, whose whole meaning is *"I checked, and it merges clean"*. A clean
 workspace shows nothing at all. Numbers abbreviate once they get long — `1.2k`, `12k`, `1.2M` — so a
 badge never grows wide enough to push the branch name off the row.
 
@@ -66,38 +69,46 @@ Worktrees are grouped by repository, and every pairing that shares anything is l
 ```
 collide · shared files
 
-repo /home/you/repos/app
-  api [feature/api] @claude  ✘ 2
-  ui [feature/ui] @codex  ✘ 2
-  docs [docs/readme] @claude  ⧉ 1
-  spike [spike/parser] @pi  ⚠ 4.1k
-  salvage [no branch] (no agent)
-      degraded: `wip/salvage` has no commits yet — unborn branch, so this
-      checkout has no commit and is not paired with its siblings.
+repo /tmp/collide-demo/app
+  api [feature/api] (no agent)  ✘ 2
+  app [main] (no agent)
+  docs [docs/readme] (no agent)  ? 1
+  salvage [wip/salvage] (no agent)
+      degraded: `wip/salvage` does not exist, so this checkout has no commit —
+      left out of pairing: there is nothing to merge against.
+  spike [spike/parser] (no agent)  runaway  ⚠ 4.2k
+  ui [feature/ui] (no agent)  ✘ 2
+  vendored [vendor/import] (no agent)  ? 1
+      degraded: no common ancestor with `refs/heads/main` — so there is no range
+      to measure against, and only uncommitted work is counted.
 
   api <-> ui
     ✘ conflict  src/collide.rs
     ✘ conflict  src/git.rs
     ⧉ overlap   src/model.rs
 
+  api <-> vendored
+    ? unknown   README.md
+
+  docs <-> vendored
+    ? unknown   README.md
+
   api <-> docs
     ⧉ overlap   README.md
-
-  ui <-> docs
-    ? unknown   …e-core/src/analysis/pairing/heuristics/very_long_module_name.rs
-
-repo /home/you/repos/infra
-  deploy [chore/bump] @codex
 
 legend
   ✘  conflict predicted on merge
   ⧉  same file, merges clean
   ?  conflict prediction unavailable
+  ⚠  runaway change set (f = files)
 ```
 
-Conflicts sort above overlaps, long paths are trimmed from the left so the informative tail survives,
-a checkout that could only be read in part says which part and why, and the view reflows down to very
-narrow panes.
+That block is a capture from a real run against a six-worktree fixture, not a mock-up — which is why
+`vendored` is there: it is an orphan branch with no common ancestor, so its pairings honestly say
+`? unknown` rather than guessing. Pairings sort worst first, long paths are trimmed from the left so
+the informative tail survives, a checkout that could only be read in part says which part and what
+follows from it, and the view reflows down to very narrow panes — at 40 columns the badge is the last
+thing given up, not the first.
 
 ## Install
 
@@ -141,10 +152,17 @@ none of it.
 
 The quickest route is the bundled action — run **Collide: set up sidebar (start here)**. It splices
 the rows below into your `config.toml`, takes a `config.toml.collide-backup` alongside it first, and
-reloads herdr; if the reload fails it puts the backup back byte for byte. **Collide: undo sidebar
-setup** restores that backup.
+reloads herdr; if the reload does not come back clean it puts the backup back byte for byte.
+**Collide: undo sidebar setup** restores that backup.
 
-To do it by hand, add the three tokens to `[ui.sidebar.spaces]` in `~/.config/herdr/config.toml`:
+Setup adds only the rows your config is missing, and tells you which ones it added — so running it
+again after an upgrade picks up a newly introduced token without disturbing anything else, and
+running it when everything is already there does nothing at all. If you removed a row deliberately,
+setup will put it back; **Collide: undo sidebar setup** reverses the whole edit. When your config is
+a shape the splice cannot safely edit, it says which shape and exits non-zero rather than reporting
+that there was nothing to do.
+
+To do it by hand, add the four tokens to `[ui.sidebar.spaces]` in `~/.config/herdr/config.toml`:
 
 ```toml
 [ui.sidebar.spaces]
@@ -153,6 +171,7 @@ rows = [
   ["branch",
     { token = "$collide_overlap",  fg = "#FFC799" },
     { token = "$collide_runaway",  fg = "#FFB27F" },
+    { token = "$collide_unknown",  fg = "#9399B2" },
     { token = "$collide_conflict", fg = "#FF8080" }],
 ]
 ```
@@ -165,20 +184,26 @@ herdr server reload-config
 
 Sidebar rows reload live — no restart, and no losing your panes.
 
-### Why there are three tokens instead of one
+### Why there are four tokens instead of one
 
 herdr renders a token's *value* as flat text and cannot colour it by content. A single
 `$collide_status` token could say `✘ 2`, but it could never say it in red. So severity is encoded in
-the token *name*: the plugin lights exactly one of `collide_overlap`, `collide_runaway`, or
-`collide_conflict` at a time and clears the other two, and each name carries its own `fg` in your
-config. The `$` prefix belongs to herdr's config row syntax only; the names sent over the wire have
-no `$`.
+the token *name*: the plugin lights exactly one of `collide_overlap`, `collide_runaway`,
+`collide_unknown` or `collide_conflict` at a time and clears the others, and each name carries its
+own `fg` in your config. The `$` prefix belongs to herdr's config row syntax only; the names sent
+over the wire have no `$`.
+
+`collide_unknown` is grey rather than a warning colour on purpose. It means the plugin could not
+work out an answer — a conflict prediction that failed, or a checkout git would not let it read —
+and an absence of information is not a severity. It exists because the alternative is worse: before
+it, a prediction that failed was rolled into the overlap badge, whose legend reads *"same file,
+merges clean"*. That is not a missing answer, it is the opposite one.
 
 There is deliberately no token for a clean workspace. A workspace with nothing to report clears its
 badge instead of writing one, so its sidebar cell is empty by design — an empty cell means "no
 collisions", not "the plugin is broken".
 
-Change the colours to taste. The names must stay exactly as written, and all three should be present —
+Change the colours to taste. The names must stay exactly as written, and all four should be present —
 if you leave one out, workspaces at that severity simply show nothing.
 
 ## Actions and panes
@@ -316,14 +341,29 @@ Worth knowing before you trust it:
 - **Lockfiles are ignored by default.** `Cargo.lock`, `package-lock.json`, and friends overlap in
   almost every pair of worktrees and almost never mean anything. If you want them counted, override
   `ignore_suffixes`.
-- **Non-UTF-8 paths are rendered lossily.** Git reports raw bytes; anything that is not valid UTF-8 is
-  replaced before display, so such a path may render differently from how it appears on disk.
+- **Non-UTF-8 paths are rendered lossily.** Git reports raw bytes; anything that is not valid UTF-8,
+  and anything that could take control of your terminal, is replaced before display — so such a path
+  renders differently from how it appears on disk. A short digest of the original bytes is appended
+  so that two files whose names differ only in the replaced part stay distinct, rather than being
+  reported as one file both worktrees changed.
+- **Content filters are not run.** `git add` would otherwise execute whatever `filter.*.clean` or
+  `filter.*.process` program your repository configures, on every refresh — and for git-lfs that
+  writes into your own `.git/lfs`, which is not something a read-only tool may do. They are disabled
+  for the snapshot instead. The consequence is that a filtered file is compared as its raw bytes: for
+  git-lfs that changes nothing useful, and for a filter that rewrites text it makes that file's line
+  count reflect the unfiltered content.
+- **A dirty submodule is seen but not compared.** It shows up as one changed path, but the snapshot
+  records the submodule's committed pointer rather than its contents, so two worktrees editing the
+  same submodule read as a harmless overlap and never as a conflict. The work inside it is also
+  invisible to the runaway thresholds.
 - **A checkout can be readable only in part.** An unborn branch, a branch deleted underneath a
   worktree, a base ref that does not resolve, or two histories with no common ancestor all limit what
   can be compared. Rather than quietly reporting such a checkout as clean, the detail pane marks it
   `degraded:` and states which of those it was and what the consequence is — excluded from pairing, or
   counted on uncommitted work only. A pair whose prediction could not run is shown as `? unknown`
-  instead of being downgraded to a plain overlap.
+  instead of being downgraded to a plain overlap, and the workspace badges `?` rather than going
+  quiet. Two histories with no common ancestor are refused outright rather than guessed at: there is
+  no merge to predict, so the answer is "cannot tell" and not "everything conflicts".
 - **Linux and macOS only.** The daemon relies on Unix process and signal behaviour, and the plugin
   declares those two platforms.
 - **Repository identity across linked worktrees is observed rather than specified.** It holds for

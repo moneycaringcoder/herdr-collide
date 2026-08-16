@@ -21,6 +21,22 @@ use crate::Result;
 /// wedge behind one call.
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Pause before the single retry.
+///
+/// The retry exists to carry the client across a `herdr update --handoff`,
+/// where the old server unlinks the socket and the new one binds it. A retry
+/// fired immediately does not do that: measured back to back, the two attempts
+/// were 0.05 ms apart, which is one attempt as far as the handoff window is
+/// concerned. This is long enough to land on the other side of a rebind and
+/// short enough that a refresh cycle never notices.
+const RETRY_BACKOFF: Duration = Duration::from_millis(150);
+
+/// How many times `connect` dials before giving up. `connect` is a call like
+/// any other — `--disable`'s sweep, `--once` and the daemon's shutdown clear
+/// all go through it — so it gets the same one retry the protocol notes require
+/// of every call.
+const CONNECT_ATTEMPTS: usize = 2;
+
 /// herdr rejects a `ttl_ms` outside this range with `invalid_metadata_ttl`.
 /// Clamping is better than losing the push: the protocol notes say to clamp the
 /// cadence, and a badge with a slightly wrong TTL still renders.
@@ -61,20 +77,38 @@ enum Failure {
 pub struct Herdr {
     socket_path: PathBuf,
     next_id: u64,
+    skipped_worktrees: usize,
 }
 
 impl Herdr {
     pub fn connect() -> Result<Self> {
-        let socket_path = socket_path()?;
-        // Dial once so a missing server is reported here, with the path, rather
-        // than as a confusing failure inside the first call. The connection is
+        let socket_path = socket_path();
+        // Dial so a missing server is reported here, with the path, rather than
+        // as a confusing failure inside the first call. The connection is
         // dropped immediately: one request per connection means there is
         // nothing worth holding open.
-        dial(&socket_path)?;
-        Ok(Self {
-            socket_path,
-            next_id: 0,
-        })
+        //
+        // Retried with the same backoff `call` uses, because a handoff can just
+        // as easily land here as in the middle of a call.
+        let mut last = None;
+        for attempt in 0..CONNECT_ATTEMPTS {
+            match dial(&socket_path) {
+                Ok(_) => {
+                    return Ok(Self {
+                        socket_path,
+                        next_id: 0,
+                        skipped_worktrees: 0,
+                    })
+                }
+                Err(err) => {
+                    last = Some(err);
+                    if attempt + 1 < CONNECT_ATTEMPTS {
+                        std::thread::sleep(RETRY_BACKOFF);
+                    }
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| "could not reach herdr".into()))
     }
 
     /// One `session.snapshot` call, reduced to the git-backed workspaces.
@@ -96,7 +130,69 @@ impl Herdr {
                 text(&result, "type").unwrap_or("missing")
             )
         })?;
-        Ok(reduce_snapshot(snapshot))
+        // The same argument one level down. `workspaces` is a required field of
+        // `SessionSnapshot`, so its absence is a protocol break, not an idle
+        // session — and treating it as an empty array would hide the break
+        // exactly the way reading the arrays off `result` used to.
+        if snapshot.get("workspaces").is_none() {
+            return Err(format!(
+                "session.snapshot carried no `workspaces` array (snapshot keys: {})",
+                key_list(snapshot)
+            )
+            .into());
+        }
+        if !snapshot
+            .get("workspaces")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Err("session.snapshot `workspaces` was not an array".into());
+        }
+        let (checkouts, skipped) = reduce_snapshot(snapshot);
+        self.skipped_worktrees = skipped;
+        Ok(checkouts)
+    }
+
+    /// Workspaces the last `checkouts` call dropped because their `worktree`
+    /// object was there but unreadable — a `worktree` that is not an object at
+    /// all, or a workspace missing its `workspace_id`, `repo_key` or
+    /// `checkout_path`. Zero is the normal case; anything else means the plugin
+    /// is quietly seeing fewer repos than the session has, which is worth a
+    /// note rather than silence.
+    pub fn skipped_worktrees(&self) -> usize {
+        self.skipped_worktrees
+    }
+
+    /// Asks herdr to re-read `config.toml`.
+    ///
+    /// The reply is **not** `{"type":"ok"}`. Captured from a live 0.8.0 server:
+    ///
+    /// ```text
+    /// {"type":"config_reload","status":"applied","diagnostics":[]}
+    /// {"type":"config_reload","status":"partial","diagnostics":["invalid theme config: …"]}
+    /// {"type":"config_reload","status":"failed","diagnostics":["config parse error: …"]}
+    /// ```
+    ///
+    /// Only `applied` means the file took effect, so anything else is an error
+    /// carrying the diagnostics. Note that herdr does not validate sidebar
+    /// token *names*: a row naming a token nobody sets still reloads as
+    /// `applied`, so this proves the file parsed, not that the badge will show.
+    pub fn reload_config(&mut self) -> Result<()> {
+        let result = self.call("server.reload_config", json!({}))?;
+        let status = text(&result, "status").unwrap_or("missing");
+        if status == "applied" {
+            return Ok(());
+        }
+        let diagnostics: Vec<String> = array(&result, "diagnostics")
+            .iter()
+            .map(|d| d.as_str().unwrap_or("").trim().to_string())
+            .filter(|d| !d.is_empty())
+            .collect();
+        let detail = if diagnostics.is_empty() {
+            "no diagnostics were reported".to_string()
+        } else {
+            diagnostics.join("; ")
+        };
+        Err(format!("herdr reported config reload status `{status}`: {detail}").into())
     }
 
     /// Sets one badge token on a workspace, with a TTL so it self-clears if
@@ -137,29 +233,31 @@ impl Herdr {
         Ok(())
     }
 
-    pub fn notify(&mut self, title: &str, body: &str) -> Result<()> {
-        self.call("notification.show", json!({ "title": title, "body": body }))?;
-        Ok(())
-    }
-
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next_id += 1;
         let id = format!("collide:{}", self.next_id);
         match self.call_once(&id, method, &params) {
             Ok(result) => Ok(result),
             Err(Failure::Protocol(err)) => Err(Box::new(err)),
-            // One request per connection is the normal path, not an error path:
-            // the server EOFs after answering, so the connection we would reuse
-            // is already gone. The same retry carries the client across a
-            // `herdr update --handoff`, where the first attempt lands on a
-            // socket the old server has just unlinked.
-            Err(Failure::Transport(first)) => match self.call_once(&id, method, &params) {
-                Ok(result) => Ok(result),
-                Err(Failure::Protocol(err)) => Err(Box::new(err)),
-                Err(Failure::Transport(second)) => {
-                    Err(format!("{method} failed twice: {first}; on retry: {second}").into())
+            // Every attempt dials its own connection — the server answers one
+            // request and closes, so there is nothing to reuse and nothing to
+            // keep open. A transport failure is therefore a real failure rather
+            // than the protocol's normal end-of-message, and the one thing worth
+            // retrying it for is a `herdr update --handoff`, where the first
+            // attempt lands on a socket the old server has just unlinked. That
+            // only works with the pause below: the new server needs a moment to
+            // bind, and two attempts fired back to back were measured 0.05 ms
+            // apart.
+            Err(Failure::Transport(first)) => {
+                std::thread::sleep(RETRY_BACKOFF);
+                match self.call_once(&id, method, &params) {
+                    Ok(result) => Ok(result),
+                    Err(Failure::Protocol(err)) => Err(Box::new(err)),
+                    Err(Failure::Transport(second)) => {
+                        Err(format!("{method} failed twice: {first}; on retry: {second}").into())
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -228,17 +326,25 @@ fn dial(socket_path: &Path) -> Result<UnixStream> {
     Ok(stream)
 }
 
-fn socket_path() -> Result<PathBuf> {
+/// Where herdr's socket lives.
+///
+/// The fallback goes through `config::xdg_dir` rather than reading
+/// `XDG_CONFIG_HOME` itself. It used to do the latter, and the two then disagreed
+/// about the same variable: `xdg_dir` ignores a *relative* `XDG_CONFIG_HOME`, as
+/// the spec requires, while this read it and resolved it against the process
+/// cwd — which for a plugin command is the plugin root. `--setup` would edit the
+/// right `config.toml` and then dial a socket somewhere else entirely, and since
+/// a reload that does not succeed rolls the edit back, `--setup` could never
+/// succeed at all.
+fn socket_path() -> PathBuf {
     // herdr injects this into everything it spawns; the fallback exists only
     // for hand invocation from a shell.
     if let Some(path) = config::non_empty_env("HERDR_SOCKET_PATH") {
-        return Ok(PathBuf::from(path));
+        return PathBuf::from(path);
     }
-    let config_home = config::non_empty_env("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| config::non_empty_env("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or("HERDR_SOCKET_PATH is unset and neither XDG_CONFIG_HOME nor HOME is set")?;
-    Ok(config_home.join("herdr").join("herdr.sock"))
+    config::xdg_dir("XDG_CONFIG_HOME", ".config")
+        .join("herdr")
+        .join("herdr.sock")
 }
 
 /// Non-empty string field, since herdr reports absent context as an empty
@@ -253,6 +359,16 @@ fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value.get(key).and_then(Value::as_array).map_or(&[], |a| a)
+}
+
+/// The keys an object carries, for an error that says what arrived instead of
+/// what was expected.
+fn key_list(value: &Value) -> String {
+    match value.as_object() {
+        Some(object) if !object.is_empty() => object.keys().cloned().collect::<Vec<_>>().join(", "),
+        Some(_) => "none".to_string(),
+        None => "not an object".to_string(),
+    }
 }
 
 /// Reduces a `session.snapshot` result to the git-backed workspaces. The flat
@@ -276,7 +392,10 @@ fn tidy_path(raw: &str) -> PathBuf {
     }
 }
 
-fn reduce_snapshot(snapshot: &Value) -> Vec<Checkout> {
+/// Reduces the snapshot to git-backed checkouts, and counts the workspaces that
+/// carried a `worktree` object we could not read. A workspace with no
+/// `worktree` at all is data, not a problem, and is not counted.
+fn reduce_snapshot(snapshot: &Value) -> (Vec<Checkout>, usize) {
     let mut agents: Vec<(String, String)> = Vec::new();
     let mut record_agent = |workspace_id: Option<&str>, name: Option<&str>| {
         if let (Some(workspace_id), Some(name)) = (workspace_id, name) {
@@ -297,10 +416,22 @@ fn reduce_snapshot(snapshot: &Value) -> Vec<Checkout> {
     }
 
     let mut checkouts = Vec::new();
+    let mut skipped = 0usize;
     for workspace in array(snapshot, "workspaces") {
         // No `worktree` key means the workspace is not a repo. That is data,
-        // not an error: most sessions have at least one such workspace.
-        let Some(worktree) = workspace.get("worktree").filter(|w| w.is_object()) else {
+        // not an error: most sessions have at least one such workspace. A
+        // `worktree` that is present but not an object is a protocol break, and
+        // is counted. (The schema permits an explicit `null` here, which the
+        // live server does not currently send; `null` is "not a repo", not a
+        // break.)
+        let Some(worktree) = workspace.get("worktree") else {
+            continue;
+        };
+        if worktree.is_null() {
+            continue;
+        }
+        let Some(worktree) = Some(worktree).filter(|w| w.is_object()) else {
+            skipped += 1;
             continue;
         };
         let (Some(workspace_id), Some(repo_key), Some(checkout_path)) = (
@@ -308,6 +439,11 @@ fn reduce_snapshot(snapshot: &Value) -> Vec<Checkout> {
             text(worktree, "repo_key"),
             text(worktree, "checkout_path"),
         ) else {
+            // A repo we can see but cannot address — no `workspace_id` on the
+            // workspace, or no `repo_key`/`checkout_path` on the worktree.
+            // Silently dropping it makes the session look smaller than it is,
+            // which is the failure this count exists to surface.
+            skipped += 1;
             continue;
         };
         let repo_root = text(worktree, "repo_root").unwrap_or(checkout_path);
@@ -321,8 +457,10 @@ fn reduce_snapshot(snapshot: &Value) -> Vec<Checkout> {
                 .get("is_linked_worktree")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            // Branch names are absent from the workspace object; a later pass
-            // fills them from `worktree.list`.
+            // Branch names are absent from the workspace object. `collide`
+            // fills them in later by asking git directly
+            // (`git::current_branch`), not by calling `worktree.list` — this
+            // client never calls that method at all.
             branch: None,
             agent: agents
                 .iter()
@@ -330,5 +468,5 @@ fn reduce_snapshot(snapshot: &Value) -> Vec<Checkout> {
                 .map(|(_, name)| name.clone()),
         });
     }
-    checkouts
+    (checkouts, skipped)
 }

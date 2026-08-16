@@ -9,6 +9,16 @@
 //!
 //! The formatting half of the module is pure and is what `tests/render.rs`
 //! exercises. Only `run_watch` talks to herdr or git.
+//!
+//! # Width model
+//!
+//! Everything here is measured in terminal display columns, never in bytes or
+//! `chars()`. [`char_columns`] scores an East-Asian-*Ambiguous* character — `…`
+//! and `·` among them — as one column. That is right for the common default and
+//! one column short in a terminal explicitly configured ambiguous-wide, which is
+//! a setting some CJK users enable; a truncated line would then be one column
+//! over its budget. Taking the other side would cost a column on every line for
+//! every other user, so the narrow reading stands.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -39,13 +49,30 @@ const OVERLAP_MARK: &str = "\u{29c9}"; // ⧉
 const RUNAWAY_MARK: &str = "\u{26a0}"; // ⚠
 const UNKNOWN_MARK: &str = "?";
 const ELLIPSIS: char = '\u{2026}'; // …
+/// Variation selector 16. A scalar followed by this one takes emoji
+/// presentation, which is two columns wide even when the scalar alone is one.
+const VS16: char = '\u{fe0f}';
 
 const TITLE: &str = "collide \u{b7} shared files";
 const NO_BRANCH: &str = "no branch";
 const NO_AGENT: &str = "(no agent)";
+const RUNAWAY_WORD: &str = "  runaway";
 
 /// `"    "` + mark + `" "` + an eight-column verdict word + `"  "`.
 const FILE_PREFIX_COLUMNS: usize = 16;
+
+/// `"    "` + mark + `"  "`. Below [`NARROW_COLUMNS`] the verdict word costs
+/// more than it is worth: spending nine of twenty columns naming what the mark
+/// already says leaves too little for the path, and both ends of it end up
+/// elided.
+const NARROW_FILE_PREFIX_COLUMNS: usize = 7;
+
+/// Width below which the verdict word is dropped from a file line.
+const NARROW_COLUMNS: usize = 30;
+
+/// Smallest label stub a worktree line will settle for before it starts
+/// dropping lower-value tokens from the tail instead.
+const LABEL_MIN_COLUMNS: usize = 12;
 
 /// Last resort, used only when the report carries no change set at all for a
 /// checkout, so there is no reason code to explain.
@@ -56,32 +83,54 @@ const NO_BRANCH_NOTE: &str = "degraded: no branch reported for this checkout \u{
 // Badge
 // ---------------------------------------------------------------------------
 
-/// Badge text for one workspace, e.g. `✘ 2` or `⧉ 3`. Severity itself is
-/// carried by the token *name*, not this string.
+/// Badge text for one workspace, e.g. `✘ 2`, `⧉ 3`, `? 1` or `⚠ 60f`. Severity
+/// itself is carried by the token *name*, not this string.
 ///
 /// A clean workspace renders the empty string, which the daemon treats as
 /// "clear the badge" rather than "write an empty badge".
 pub fn badge(status: &WorkspaceStatus) -> String {
-    // A runaway is measured in change-set size, not in shared files: the whole
-    // point of the severity is a workspace that has grown huge on its own,
-    // usually sharing nothing at all with its siblings.
     let (mark, magnitude) = match status.severity {
         Severity::Clean => return String::new(),
-        Severity::Conflict => (CONFLICT_MARK, status.conflict_count as u64),
-        Severity::Runaway => (RUNAWAY_MARK, status.lines_changed),
-        Severity::Overlap => (OVERLAP_MARK, status.overlap_count as u64),
+        Severity::Conflict => (CONFLICT_MARK, count(status.conflict_count)),
+        // A failed prediction is its own severity, not a quiet overlap. The
+        // count can legitimately be zero: a checkout the git pass could not
+        // read at all is unknown without any shared file to point at, and the
+        // bare mark is then the honest badge.
+        Severity::Unknown => (UNKNOWN_MARK, count(status.unknown_count)),
+        Severity::Runaway => (RUNAWAY_MARK, runaway_magnitude(status)),
+        Severity::Overlap => (OVERLAP_MARK, count(status.overlap_count)),
     };
 
     // Zero has nothing to say; the mark alone is the whole message.
-    let text = if magnitude == 0 {
-        mark.to_string()
-    } else {
-        format!("{mark} {}", abbreviate(magnitude))
+    let text = match magnitude {
+        Some(magnitude) => format!("{mark} {magnitude}"),
+        None => mark.to_string(),
     };
 
-    // Belt and braces: `abbreviate` is bounded at four columns, so this only
-    // ever fires if the marks change.
+    // Belt and braces: every magnitude above is bounded at four columns, so
+    // this only ever fires if the marks change.
     truncate_right(&text, BADGE_COLUMNS)
+}
+
+/// A shared-file count, or `None` when there is nothing worth printing.
+fn count(n: usize) -> Option<String> {
+    (n > 0).then(|| abbreviate(n as u64))
+}
+
+/// What a runaway badge reports.
+///
+/// A runaway is measured in change-set size, not in shared files: the whole
+/// point of the severity is a workspace that has grown huge on its own, usually
+/// sharing nothing at all with its siblings. Either threshold can trip it
+/// though, and a workspace that crossed the *file* threshold can carry no
+/// counted lines at all — hundreds of untracked binaries, say. Rendering a bare
+/// `⚠` there tells the user only that something is wrong, so the file count
+/// stands in, with a `f` so the two units cannot be confused.
+fn runaway_magnitude(status: &WorkspaceStatus) -> Option<String> {
+    if status.lines_changed > 0 {
+        return Some(abbreviate(status.lines_changed));
+    }
+    (status.changed_files > 0).then(|| abbreviate_files(status.changed_files))
 }
 
 /// Compact magnitude, never wider than four display columns: `999`, `1.2k`,
@@ -98,6 +147,17 @@ pub fn abbreviate(n: u64) -> String {
     }
 }
 
+/// Compact *file* count, never wider than four display columns **including** the
+/// `f` that distinguishes it from a line count: `999f`, `99kf`, `99k+`. Same
+/// truncating arithmetic as [`abbreviate`], so it never overstates either.
+pub fn abbreviate_files(n: usize) -> String {
+    match n {
+        0..=999 => format!("{n}f"),
+        1_000..=99_999 => format!("{}kf", n / 1_000),
+        _ => "99k+".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Detail view
 // ---------------------------------------------------------------------------
@@ -110,9 +170,21 @@ pub fn detail(report: &Report) -> String {
 /// `detail`, at an explicit width. No line in the result exceeds `columns`
 /// display columns (or `MIN_COLUMNS`, whichever is larger).
 pub fn detail_at(report: &Report, columns: usize) -> String {
+    detail_with_notes(report, &[], columns)
+}
+
+/// [`detail_at`], with the gathering pass's non-fatal notes placed directly
+/// under the title.
+///
+/// They go first because [`draw`] truncates from the *bottom*: a note saying a
+/// checkout could not be read is the only signal that the clean-looking report
+/// below it is incomplete, and putting it last made it the first thing a short
+/// pane threw away.
+pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> String {
     let width = columns.max(MIN_COLUMNS);
     let mut out = String::new();
     push_line(&mut out, TITLE, width);
+    out.push_str(&notes_section(notes, width));
 
     if report.checkouts.is_empty() {
         out.push('\n');
@@ -143,7 +215,14 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
     }
 
     let mut saw_shared = false;
-    let mut saw_unknown = false;
+    let mut saw_runaway = false;
+    // A workspace can be unknown without any single file being unknown — a
+    // checkout the git pass could not read at all — so the legend keys off the
+    // severity as well as the per-file verdicts.
+    let mut saw_unknown = report
+        .statuses
+        .iter()
+        .any(|s| s.severity == Severity::Unknown);
 
     for (repo_key, mut group) in repos {
         group.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
@@ -158,7 +237,10 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
 
         for checkout in &group {
             let status = status_by_id.get(checkout.workspace_id.as_str()).copied();
-            push_line(&mut out, &worktree_line(checkout, status), width);
+            push_line(&mut out, &worktree_line(checkout, status, width), width);
+            if status.map(|s| s.runaway).unwrap_or(false) {
+                saw_runaway = true;
+            }
             for note in degraded_notes(report.change_set(&checkout.workspace_id), checkout) {
                 push_wrapped(&mut out, "      ", "      ", &note, width);
             }
@@ -170,15 +252,42 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
             .filter(|p| pairing_repo(p, &checkout_by_id) == Some(repo_key))
             .filter(|p| !p.shared.is_empty())
             .collect();
+        // Worst first. The pane does not scroll and `draw` cuts the tail, so
+        // with twenty worktrees — a hundred and ninety pairings — an
+        // alphabetical order put the one conflicting pair off the bottom of the
+        // screen behind six screens of clean overlaps.
         pairings.sort_by_key(|p| {
             (
+                std::cmp::Reverse(p.conflicts()),
+                std::cmp::Reverse(p.unknowns()),
                 display_label(&p.left_workspace_id, &checkout_by_id),
                 display_label(&p.right_workspace_id, &checkout_by_id),
             )
         });
 
         if pairings.is_empty() {
-            push_line(&mut out, "  no files shared with a sibling worktree", width);
+            // "Nothing shared" is a comparison result. A repo with only one
+            // worktree that can be paired has no comparison to report, and the
+            // two must not read the same.
+            let pairable = group
+                .iter()
+                .filter(|c| {
+                    report
+                        .change_set(&c.workspace_id)
+                        .map(crate::collide::pairable)
+                        // A checkout with no change set at all was not judged
+                        // unpairable; it was simply not read.
+                        .unwrap_or(true)
+                })
+                .count();
+            let message = if group.len() < 2 {
+                "only one worktree open for this repository \u{2014} nothing to compare"
+            } else if pairable < 2 {
+                "no sibling worktree here can be compared \u{2014} see the notes above"
+            } else {
+                "no files shared with a sibling worktree"
+            };
+            push_wrapped(&mut out, "  ", "  ", message, width);
             continue;
         }
 
@@ -213,6 +322,21 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
                 );
             }
 
+            // The same reasoning as the advisory above: a verdict computed
+            // against a merge base that had to be guessed at is a weaker claim
+            // than one computed against the real base, and only the pane can
+            // say so.
+            if pairing.approximate {
+                push_wrapped(
+                    &mut out,
+                    "    ",
+                    "    ",
+                    "approximate: these two histories offer no single merge base, so one was \
+                     forced and the verdicts below approximate what a real merge would do.",
+                    width,
+                );
+            }
+
             let mut files: Vec<&crate::model::SharedFile> = pairing.shared.iter().collect();
             // Conflicts first, then the ones we could not decide, then plain
             // overlaps; alphabetical within each band.
@@ -222,7 +346,15 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
                     .then_with(|| a.path.cmp(&b.path))
             });
 
-            let path_budget = width.saturating_sub(FILE_PREFIX_COLUMNS).max(8);
+            // Narrow panes drop the verdict word; the mark says the same thing
+            // in one column instead of nine, and the legend spells it out.
+            let narrow = width < NARROW_COLUMNS;
+            let prefix_columns = if narrow {
+                NARROW_FILE_PREFIX_COLUMNS
+            } else {
+                FILE_PREFIX_COLUMNS
+            };
+            let path_budget = width.saturating_sub(prefix_columns).max(4);
             for file in files {
                 if file.verdict == FileVerdict::Unknown {
                     saw_unknown = true;
@@ -230,7 +362,12 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
                 let (mark, word) = verdict_marks(file.verdict);
                 // Paths truncate from the LEFT: the tail is the informative half.
                 let path = truncate_left(&file.path, path_budget);
-                push_line(&mut out, &format!("    {mark} {word:<8}  {path}"), width);
+                let line = if narrow {
+                    format!("    {mark}  {path}")
+                } else {
+                    format!("    {mark} {word:<8}  {path}")
+                };
+                push_line(&mut out, &line, width);
             }
         }
     }
@@ -252,6 +389,16 @@ pub fn detail_at(report: &Report, columns: usize) -> String {
             push_line(
                 &mut out,
                 &format!("  {UNKNOWN_MARK}  conflict prediction unavailable"),
+                width,
+            );
+        }
+        // The runaway mark reaches the worktree lines through `badge`, so it
+        // needs explaining wherever it can appear. `⚠ 4.1k` counts lines and
+        // `⚠ 60f` counts files, and nothing else on screen says which.
+        if saw_runaway {
+            push_line(
+                &mut out,
+                &format!("  {RUNAWAY_MARK}  runaway change set (f = files)"),
                 width,
             );
         }
@@ -290,7 +437,15 @@ fn pairing_repo<'a>(
         .map(|c| &c.repo_key)
 }
 
-fn worktree_line(checkout: &Checkout, status: Option<&WorkspaceStatus>) -> String {
+/// One worktree's line, composed against `width` rather than truncated into it.
+///
+/// The badge is the highest-value token on the line and it lives at the far
+/// right, so blind right-truncation dropped exactly the thing the pane exists to
+/// show — a 40-column pane would render a conflicting worktree with no mark on
+/// it at all. Here the badge is reserved first, the `runaway` word is the slack
+/// that gets dropped when the line will not fit, and the identity on the left is
+/// truncated around what is left.
+fn worktree_line(checkout: &Checkout, status: Option<&WorkspaceStatus>, width: usize) -> String {
     let branch = checkout
         .branch
         .as_deref()
@@ -307,17 +462,41 @@ fn worktree_line(checkout: &Checkout, status: Option<&WorkspaceStatus>) -> Strin
         None => NO_AGENT.to_string(),
     };
 
-    let mut line = format!("  {} [{branch}] {agent}", label_of(checkout));
-    if let Some(status) = status {
-        if status.runaway {
-            line.push_str("  runaway");
-        }
-        let badge_text = badge(status);
-        if !badge_text.is_empty() {
-            line.push_str("  ");
-            line.push_str(&badge_text);
-        }
+    let head = format!("  {} [{branch}] {agent}", label_of(checkout));
+    let Some(status) = status else {
+        return truncate_right(&head, width);
+    };
+
+    let badge_text = badge(status);
+    let badge_tail = if badge_text.is_empty() {
+        String::new()
+    } else {
+        format!("  {badge_text}")
+    };
+    let badge_columns = display_width(&badge_tail);
+
+    // Everything the badge does not claim is available to the identity and, if
+    // it still fits afterwards, the `runaway` word.
+    let rest = width.saturating_sub(badge_columns);
+    let runaway_columns = if status.runaway {
+        display_width(RUNAWAY_WORD)
+    } else {
+        0
+    };
+    let floor = LABEL_MIN_COLUMNS.min(rest);
+    let keep_runaway = status.runaway && rest.saturating_sub(runaway_columns) >= floor;
+
+    let head_budget = if keep_runaway {
+        rest - runaway_columns
+    } else {
+        rest
+    };
+
+    let mut line = truncate_right(&head, head_budget);
+    if keep_runaway {
+        line.push_str(RUNAWAY_WORD);
     }
+    line.push_str(&badge_tail);
     line
 }
 
@@ -363,17 +542,20 @@ fn explain_reason(reason: &str) -> String {
     };
 
     let consequence = match code {
-        git::DEGRADED_UNBORN => {
-            "unborn branch, so this checkout has no commit and is not paired with its siblings"
-        }
+        // Both of these follow a git message that already says the checkout
+        // has no commit, so the explanation states the consequence rather than
+        // repeating the cause back at the reader.
+        git::DEGRADED_UNBORN => "left out of pairing: there is nothing to merge against",
         git::DEGRADED_BROKEN_HEAD => {
-            "broken HEAD, so this checkout has no commit and is not paired with its siblings"
+            "left out of pairing: its HEAD is broken, so there is nothing to merge against"
         }
         git::DEGRADED_MISSING_BASE_REF => {
-            "the base ref does not resolve here, so only uncommitted work is counted"
+            "so the committed half of this change set could not be measured, and \
+             only uncommitted work is counted"
         }
         git::DEGRADED_NO_MERGE_BASE => {
-            "no common ancestor with the base ref, so only uncommitted work is counted"
+            "so there is no range to measure against, and only uncommitted work \
+             is counted"
         }
         git::DEGRADED_UNMERGED => {
             "this side is snapshotted with its conflict markers still in place, so any \
@@ -421,74 +603,176 @@ fn verdict_marks(verdict: FileVerdict) -> (&'static str, &'static str) {
 // Text helpers
 // ---------------------------------------------------------------------------
 
-/// Width of `text` in terminal display columns. Hand-rolled because the crate
-/// takes no width dependency: control characters and CSI escape sequences count
-/// zero, combining marks count zero, and the common East Asian wide blocks
-/// count two.
-pub fn display_width(text: &str) -> usize {
-    let mut width = 0;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for tail in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&tail) {
+/// One indivisible piece of a string, and the display columns it occupies.
+///
+/// A unit is a base scalar plus every zero-width scalar that follows it —
+/// combining marks, variation selectors, zero-width joiners — or a whole CSI
+/// escape sequence, which occupies nothing. Measuring and cutting in units
+/// rather than in `char`s is what makes the two agree: a `char`-wise cut can
+/// strand a combining mark on the ellipsis or split an escape sequence, and a
+/// `char`-wise measure cannot see that `⚠` followed by U+FE0F is two columns
+/// wide and not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unit<'a> {
+    text: &'a str,
+    columns: usize,
+}
+
+/// Splits `text` into measurable units, left to right.
+fn units(text: &str) -> Vec<Unit<'_>> {
+    let mut out = Vec::new();
+    let mut rest = text;
+
+    while !rest.is_empty() {
+        let mut chars = rest.char_indices();
+        let (_, first) = chars.next().expect("rest is not empty");
+
+        // A CSI sequence draws nothing, and cutting inside one would leave the
+        // terminal reading the tail of it as text.
+        if first == '\u{1b}' {
+            let mut end = first.len_utf8();
+            if let Some((_, '[')) = chars.next() {
+                end += 1;
+                for (i, ch) in chars {
+                    end = i + ch.len_utf8();
+                    if ('\u{40}'..='\u{7e}').contains(&ch) {
                         break;
                     }
                 }
             }
+            out.push(Unit {
+                text: &rest[..end],
+                columns: 0,
+            });
+            rest = &rest[end..];
             continue;
         }
-        width += char_columns(ch);
+
+        // Absorb the trailing zero-width scalars, noting whether one of them
+        // switches the base scalar into emoji presentation.
+        let mut end = first.len_utf8();
+        let mut emoji = false;
+        for (i, ch) in rest.char_indices().skip(1) {
+            if ch != VS16 && !is_zero_width(ch) {
+                break;
+            }
+            emoji |= ch == VS16;
+            end = i + ch.len_utf8();
+        }
+
+        out.push(Unit {
+            text: &rest[..end],
+            columns: char_columns(first, emoji),
+        });
+        rest = &rest[end..];
     }
-    width
+    out
 }
 
-fn char_columns(ch: char) -> usize {
+/// Width of `text` in terminal display columns. Hand-rolled because the crate
+/// takes no width dependency: control characters and CSI escape sequences count
+/// zero, combining marks count zero, and the East Asian wide blocks — plus
+/// anything wearing an emoji presentation selector — count two.
+pub fn display_width(text: &str) -> usize {
+    units(text).iter().map(|unit| unit.columns).sum()
+}
+
+fn is_zero_width(ch: char) -> bool {
     if ch.is_control() {
-        return 0;
+        return true;
     }
-    let code = ch as u32;
-    let zero_width = matches!(code,
+    matches!(ch as u32,
         0x0300..=0x036f      // combining diacriticals
         | 0x1ab0..=0x1aff    // combining diacriticals extended
         | 0x20d0..=0x20ff    // combining marks for symbols
         | 0x200b..=0x200f    // zero width space .. RLM
         | 0xfe00..=0xfe0f    // variation selectors
         | 0xfe20..=0xfe2f    // combining half marks
-        | 0xfeff);
-    if zero_width {
+        | 0xfeff)
+}
+
+/// Columns for one base scalar. `emoji_presentation` is set when a variation
+/// selector U+FE0F followed it, which promotes an otherwise one-column scalar
+/// such as `⚠` to the two columns its emoji glyph actually takes.
+fn char_columns(ch: char, emoji_presentation: bool) -> usize {
+    if is_zero_width(ch) {
         return 0;
     }
-    let wide = matches!(code,
-        0x1100..=0x115f
-        | 0x2e80..=0x303e
-        | 0x3041..=0x33ff
-        | 0x3400..=0x4dbf
-        | 0x4e00..=0x9fff
-        | 0xa000..=0xa4cf
-        | 0xac00..=0xd7a3
-        | 0xf900..=0xfaff
-        | 0xfe10..=0xfe19
-        | 0xfe30..=0xfe6f
-        | 0xff00..=0xff60
-        | 0xffe0..=0xffe6
-        | 0x1f300..=0x1f64f
-        | 0x1f900..=0x1f9ff
-        | 0x20000..=0x2fffd
-        | 0x30000..=0x3fffd);
-    if wide {
+    if emoji_presentation || is_wide(ch as u32) {
         2
     } else {
         1
     }
 }
 
+/// East Asian Wide and Fullwidth, plus the emoji blocks that render two columns
+/// wide without any selector.
+///
+/// The emoji ranges are deliberately over-inclusive: `0x1f300..=0x1faff` sweeps
+/// in a handful of genuinely narrow scalars (ornamental dingbats, chess
+/// symbols) along with everything wide. Over-counting costs a column of unused
+/// room at the end of a line; under-counting overflows the pane and wraps the
+/// frame, so the error is taken in the safe direction. Two earlier versions of
+/// this table had gaps at `0x1f650..=0x1f8ff` and `0x1fa00..=0x1faff`, which is
+/// how `🚀` came to measure one column and push a 40-column pane to 41.
+fn is_wide(code: u32) -> bool {
+    matches!(code,
+        0x1100..=0x115f
+        | 0x231a..=0x231b    // ⌚⌛
+        | 0x23e9..=0x23ec
+        | 0x23f0
+        | 0x23f3
+        | 0x25fd..=0x25fe
+        | 0x2614..=0x2615
+        | 0x2648..=0x2653
+        | 0x267f
+        | 0x2693
+        | 0x26a1
+        | 0x26aa..=0x26ab
+        | 0x26bd..=0x26be
+        | 0x26c4..=0x26c5
+        | 0x26ce
+        | 0x26d4
+        | 0x26ea
+        | 0x26f2..=0x26f3
+        | 0x26f5
+        | 0x26fa
+        | 0x26fd
+        | 0x2705
+        | 0x270a..=0x270b
+        | 0x2728
+        | 0x274c
+        | 0x274e
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2795..=0x2797
+        | 0x27b0
+        | 0x27bf
+        | 0x2b1b..=0x2b1c
+        | 0x2b50
+        | 0x2b55
+        | 0x2e80..=0x303e
+        | 0x3041..=0x33ff
+        | 0x3400..=0x4dbf
+        | 0x4e00..=0x9fff
+        | 0xa000..=0xa4cf
+        | 0xa960..=0xa97c    // Hangul Jamo Extended-A
+        | 0xac00..=0xd7a3
+        | 0xf900..=0xfaff
+        | 0xfe10..=0xfe19
+        | 0xfe30..=0xfe6f
+        | 0xff00..=0xff60
+        | 0xffe0..=0xffe6
+        | 0x1f300..=0x1faff
+        | 0x20000..=0x2fffd
+        | 0x30000..=0x3fffd)
+}
+
 /// Trims `text` to `max` display columns, dropping characters from the LEFT and
 /// marking the cut with `…`. Used for paths, whose tail is the informative half.
 pub fn truncate_left(text: &str, max: usize) -> String {
-    if display_width(text) <= max {
+    let units = units(text);
+    if units.iter().map(|unit| unit.columns).sum::<usize>() <= max {
         return text.to_string();
     }
     if max == 0 {
@@ -499,27 +783,28 @@ pub fn truncate_left(text: &str, max: usize) -> String {
     }
 
     let budget = max - 1;
-    let mut kept: Vec<char> = Vec::new();
     let mut used = 0;
-    for ch in text.chars().rev() {
-        let columns = char_columns(ch);
-        if used + columns > budget {
+    let mut first_kept = units.len();
+    for (i, unit) in units.iter().enumerate().rev() {
+        if used + unit.columns > budget {
             break;
         }
-        used += columns;
-        kept.push(ch);
+        used += unit.columns;
+        first_kept = i;
     }
-    kept.reverse();
 
     let mut out = String::from(ELLIPSIS);
-    out.extend(kept);
+    for unit in &units[first_kept..] {
+        out.push_str(unit.text);
+    }
     out
 }
 
 /// Trims `text` to `max` display columns from the right, marking the cut with
 /// `…`. Used for labels and headings, whose head is the informative half.
 pub fn truncate_right(text: &str, max: usize) -> String {
-    if display_width(text) <= max {
+    let units = units(text);
+    if units.iter().map(|unit| unit.columns).sum::<usize>() <= max {
         return text.to_string();
     }
     if max == 0 {
@@ -532,13 +817,12 @@ pub fn truncate_right(text: &str, max: usize) -> String {
     let budget = max - 1;
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let columns = char_columns(ch);
-        if used + columns > budget {
+    for unit in &units {
+        if used + unit.columns > budget {
             break;
         }
-        used += columns;
-        out.push(ch);
+        used += unit.columns;
+        out.push_str(unit.text);
     }
     out.push(ELLIPSIS);
     out
@@ -614,11 +898,7 @@ fn watch_loop(config: &Config, stop: &AtomicBool, out: &mut impl Write) -> Resul
         // `collide::gather` is the one gathering pipeline; the pane renders what
         // it produces rather than assembling a second, subtly different one.
         let frame = match crate::collide::gather(config) {
-            Ok(cycle) => {
-                let mut frame = detail_at(&cycle.report, columns);
-                frame.push_str(&notes_section(&cycle.notes, columns.max(MIN_COLUMNS)));
-                frame
-            }
+            Ok(cycle) => detail_with_notes(&cycle.report, &cycle.notes, columns),
             Err(err) => error_frame(&err.to_string(), columns),
         };
         draw(out, &frame, rows)?;

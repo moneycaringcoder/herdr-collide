@@ -2,26 +2,49 @@
 //!
 //! Every invocation is read-only against the user's repository. The only writes
 //! this module ever performs are to temporary index files under the plugin
-//! state dir, via `GIT_INDEX_FILE`, and every invocation passes
-//! `--no-optional-locks` so it cannot contend with an agent's own git commands.
+//! state dir, via `GIT_INDEX_FILE`.
+//!
+//! Lock avoidance is done with the `GIT_OPTIONAL_LOCKS=0` environment variable,
+//! which [`run_git`] sets for *every* command. That is the mechanism that
+//! actually holds: a plain `status` or `diff` would otherwise take
+//! `<gitdir>/index.lock` to write back its stat cache and contend with the very
+//! agent we are watching. The `--no-optional-locks` flag is passed to `status`
+//! as well, but only as belt and braces — removing the environment variable
+//! would silently reintroduce index writeback on every `diff`.
 //!
 //! Object writes are redirected too. `git add` (index snapshot) and
-//! `merge-tree --write-tree` (phase 2) both create loose objects; both are run
-//! with `GIT_OBJECT_DIRECTORY` pointed at a scratch directory and
+//! `merge-tree --write-tree` both create loose objects; both are run with
+//! `GIT_OBJECT_DIRECTORY` pointed at a scratch directory and
 //! `GIT_ALTERNATE_OBJECT_DIRECTORIES` pointed at the real object store, so the
 //! user's ODB never grows and never needs a `gc` it did not ask for.
 //!
+//! Content filters are neutralised for the snapshot. `git add` would otherwise
+//! run every configured `filter.<driver>.clean`/`.process` program — arbitrary
+//! user code, which for git-lfs writes into the user's own `.git/lfs`. See
+//! [`Predictor::filter_overrides`].
+//!
+//! Every child is put in its own process group and the *group* is killed on
+//! expiry, because a git that leaves a descendant behind holding the stdout or
+//! stderr pipe would otherwise park the refresh loop for as long as that
+//! descendant lives — a timeout that only kills the direct child is not a
+//! timeout.
+//!
 //! Paths come out of git as raw bytes. `model::ChangedPath` uses `String`, so
-//! every path is converted with `String::from_utf8_lossy` at this boundary;
-//! non-UTF-8 path bytes are replaced rather than preserved.
+//! every path is converted at this boundary by [`lossy`], which replaces
+//! non-UTF-8 bytes and control characters and then appends a digest of the raw
+//! bytes so that two different files can never collapse onto one string.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::config;
@@ -37,17 +60,43 @@ pub const DEGRADED_BROKEN_HEAD: &str = "broken-head";
 pub const DEGRADED_MISSING_BASE_REF: &str = "missing-base-ref";
 pub const DEGRADED_NO_MERGE_BASE: &str = "no-merge-base";
 pub const DEGRADED_UNMERGED: &str = "merge-in-progress";
+/// The git pass failed outright for this checkout. Distinct from every reason
+/// above, which all describe a checkout we *did* read: this one means we did
+/// not, so an empty change set carries no information at all.
+pub const DEGRADED_UNREADABLE: &str = "unreadable";
+/// Line counts could only be read in part, so the runaway thresholds are
+/// measured against an understated total.
+pub const DEGRADED_PARTIAL_VOLUME: &str = "partial-volume";
 
 /// Reason codes that exclude a checkout from pairing entirely.
 pub const UNPAIRABLE_REASONS: [&str; 2] = [DEGRADED_UNBORN, DEGRADED_BROKEN_HEAD];
 
-/// The empty tree, used as a stand-in base when there is no merge base.
-const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// The `base` [`change_set`] is handed when [`integration_ref`] found nothing.
+///
+/// A repository whose trunk is not `main`, `master` or `trunk` and that has no
+/// remote used to be measured against `HEAD`, which makes the committed half of
+/// every change set empty *and reports no degradation at all* — two agents
+/// about to collide head-on then read as two clean workspaces. There is no
+/// honest ref to substitute, so the caller passes this instead and the checkout
+/// is visibly degraded.
+///
+/// `<` and `>` are forbidden in ref names by `git check-ref-format`, so this can
+/// never be mistaken for one a user configured.
+pub const NO_INTEGRATION_REF: &str = "<no-integration-ref>";
 
 /// Untracked files are line-counted by reading them, since no `diff` covers
 /// them. Anything larger than this is counted as zero lines rather than paying
 /// to read it; runaway detection only needs an order of magnitude.
 const MAX_UNTRACKED_READ: u64 = 8 * 1024 * 1024;
+
+/// How long to keep waiting for a child's pipes after the child itself is gone.
+///
+/// The child cannot exit until it has written everything, and it can only write
+/// while we drain, so by the time we get here all but the last pipe-buffer's
+/// worth is already read and EOF is imminent. Anything longer than this means a
+/// descendant is holding the write end open, which is a different problem and is
+/// solved by killing the process group rather than by waiting.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Process plumbing
@@ -55,10 +104,15 @@ const MAX_UNTRACKED_READ: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 struct GitOut {
-    /// `None` when the child was killed by a signal or by our own deadline.
+    /// `None` when the child was killed by a signal, killed by our own deadline,
+    /// or exited cleanly but left its output undrained. The last case is
+    /// deliberately folded in here: a caller that sees `Some(0)` is entitled to
+    /// treat `stdout` as the whole answer, and after a truncated read it is not.
     code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// The deadline fired, or the pipes could not be drained within
+    /// [`PIPE_DRAIN_GRACE`] of the child exiting.
     timed_out: bool,
 }
 
@@ -76,13 +130,29 @@ impl GitOut {
     }
 }
 
-/// Runs one git command with a hard deadline.
+/// Runs one git command with a deadline that actually holds.
 ///
 /// A hung git (a stuck credential helper, an NFS stall, an fsmonitor that never
 /// answers) must not stall the refresh loop, so the child is polled and killed
 /// on expiry. The pipes are drained on separate threads because a child that
 /// fills a 64 KiB pipe buffer blocks forever otherwise, and `status -uall` on a
 /// big repo comfortably exceeds that.
+///
+/// Killing the child is not enough on its own, and this was a real bug rather
+/// than a theoretical one. A pipe reaches EOF only when *every* holder of its
+/// write end has closed it, so a process git leaves behind — a
+/// `.gitattributes` clean filter that daemonises, a `core.fsmonitor` hook, a
+/// credential helper — keeps `read_to_end` blocked long after git itself is
+/// dead. Measured: a `git add` that finishes in 80 ms took over 40 s to return
+/// through this function under a 2 s deadline. Two defences, both needed:
+///
+/// * the child gets its own process group (`setsid`), so the whole group can be
+///   killed on expiry rather than just the process we spawned; and
+/// * the drain threads are joined with a bounded wait, so even a group we
+///   cannot kill can only cost [`PIPE_DRAIN_GRACE`] rather than forever.
+///
+/// A drain that does not finish is reported as `timed_out` with a `None` exit
+/// code, never as a successful command with short output.
 fn run_git(
     dir: &Path,
     args: &[&str],
@@ -116,21 +186,44 @@ fn run_git(
         cmd.env(key, value);
     }
 
+    // Own process group, so anything git spawns can be killed with it. `setsid`
+    // also drops the controlling terminal, which is a second reason a helper
+    // cannot block us waiting for input. It fails only if the caller is already
+    // a group leader, which a freshly forked child never is; `setpgid` is the
+    // fallback for the paranoid case. Neither failure is worth aborting the
+    // spawn for — the bounded drain below still bounds the damage.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                libc::setpgid(0, 0);
+            }
+            Ok(())
+        });
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to run git in {}: {e}", dir.display()))?;
+    let child_pid = child.id();
 
     let mut out_pipe = child.stdout.take().expect("stdout piped");
     let mut err_pipe = child.stderr.take().expect("stderr piped");
-    let out_thread = std::thread::spawn(move || {
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    // Detached deliberately: if a descendant holds the write end open these
+    // threads outlive the call. One blocked thread holding one file descriptor
+    // is the price of never blocking the refresh loop, and it ends by itself the
+    // moment the descendant exits.
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = out_pipe.read_to_end(&mut buf);
-        buf
+        let _ = out_tx.send(buf);
     });
-    let err_thread = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = err_pipe.read_to_end(&mut buf);
-        buf
+        let _ = err_tx.send(buf);
     });
 
     let deadline = Instant::now() + timeout;
@@ -142,6 +235,7 @@ fn run_git(
             None => {
                 if Instant::now() >= deadline {
                     timed_out = true;
+                    kill_process_group(child_pid);
                     let _ = child.kill();
                     break child.wait()?;
                 }
@@ -151,15 +245,48 @@ fn run_git(
         }
     };
 
-    let stdout = out_thread.join().unwrap_or_default();
-    let stderr = err_thread.join().unwrap_or_default();
+    let mut stdout = out_rx.recv_timeout(PIPE_DRAIN_GRACE).ok();
+    let mut stderr = err_rx.recv_timeout(PIPE_DRAIN_GRACE).ok();
+    if stdout.is_none() || stderr.is_none() {
+        // The child is gone and the pipe is still open, so something it spawned
+        // inherited it. Kill the group — but only now, so that a git which
+        // legitimately started a background helper (`fsmonitor--daemon`,
+        // `maintenance run --auto`) and then exited promptly keeps it.
+        kill_process_group(child_pid);
+        if stdout.is_none() {
+            stdout = out_rx.recv_timeout(PIPE_DRAIN_GRACE).ok();
+        }
+        if stderr.is_none() {
+            stderr = err_rx.recv_timeout(PIPE_DRAIN_GRACE).ok();
+        }
+    }
+
+    let drained = stdout.is_some() && stderr.is_some();
     Ok(GitOut {
-        code: status.code(),
-        stdout,
-        stderr,
-        timed_out,
+        code: if drained { status.code() } else { None },
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+        timed_out: timed_out || !drained,
     })
 }
+
+/// Kills the process group led by `pid`.
+///
+/// The child called `setsid`, so its process-group id is its own pid and a
+/// negative pid addresses the whole group. The `pid > 1` guard matters: `kill`
+/// with a pgid of 0 means "everyone in *my* group", which would include this
+/// process.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    if pid > 1 {
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 fn git(dir: &Path, args: &[&str], timeout: Duration) -> Result<GitOut> {
     run_git(dir, args, &[], timeout)
@@ -184,8 +311,83 @@ fn git_ok(dir: &Path, args: &[&str], timeout: Duration) -> Result<GitOut> {
     Ok(out)
 }
 
+/// Runs a probe whose only meaningful answers are "yes" (exit 0, with output)
+/// and "no" (exit 1).
+///
+/// This exists because folding every other outcome into "no" is how a healthy
+/// checkout gets diagnosed as having no commit. `symbolic-ref` and `rev-parse
+/// --verify -q` both exit 1 for "that does not resolve" and 128 for "I could
+/// not look" — and a command we killed on our own deadline has no exit code at
+/// all. Only the first of those is an answer; the rest have to be errors, or a
+/// stalled git silently removes a workspace from every pairing while telling
+/// the user its branch has no commits.
+fn probe(dir: &Path, args: &[&str], timeout: Duration) -> Result<Option<String>> {
+    let out = git(dir, args, timeout)?;
+    if out.timed_out {
+        return Err(format!("git {} timed out in {}", args.join(" "), dir.display()).into());
+    }
+    match out.code {
+        Some(0) => Ok(Some(out.stdout_trimmed())),
+        Some(1) => Ok(None),
+        _ => Err(format!(
+            "git {} could not answer in {}: {}",
+            args.join(" "),
+            dir.display(),
+            out.stderr_text()
+        )
+        .into()),
+    }
+}
+
+/// Converts a raw git path to a `String`, replacing anything that is not valid
+/// UTF-8 **and** anything that would take control of a terminal, then making
+/// the result unique.
+///
+/// Paths arrive from `-z` output as raw bytes and are drawn verbatim into a
+/// pane that redraws in place. A filename containing `ESC [ 2 J` would clear
+/// that pane; one containing a newline would escape the line budget entirely
+/// and corrupt every row below it. Both are legal on disk.
+///
+/// Replacement alone is not enough, because it is not injective: `\xff.txt` and
+/// `\xfe.txt` both become `<?>.txt`, and change sets are intersected by string,
+/// so two worktrees holding two *different* files were reported as sharing one.
+/// Appending a digest of the raw bytes restores injectivity in the direction
+/// that matters — identical raw bytes always produce an identical string, so
+/// `status` output and `merge-tree` output still match each other, while
+/// different bytes stop merging into one phantom shared path.
+///
+/// The cost, unchanged: a path that had to be replaced no longer addresses its
+/// file on disk, so an untracked file named that way is line-counted as zero.
+/// That is a fair trade against a pane that a filename can hijack.
 fn lossy(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+    let text = String::from_utf8_lossy(bytes);
+    // `from_utf8_lossy` borrows iff the input was already valid UTF-8.
+    let invalid_utf8 = matches!(text, Cow::Owned(_));
+    if !invalid_utf8 && !text.chars().any(char::is_control) {
+        return text.into_owned();
+    }
+    let replaced: String = text
+        .chars()
+        .map(|ch| {
+            if ch.is_control() {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                ch
+            }
+        })
+        .collect();
+    format!("{replaced}~{:08x}", fnv1a(bytes))
+}
+
+/// FNV-1a, 32-bit. Not a hash with any security property — it only has to be
+/// deterministic and stable, which `DefaultHasher` explicitly is not.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in bytes {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -213,9 +415,15 @@ pub enum HeadState {
     Branch { name: String, oid: String },
     /// Detached HEAD. Perfectly usable for analysis; we just use the raw OID.
     Detached { oid: String },
-    /// HEAD names a branch that has never had a commit.
+    /// HEAD names a branch that does not exist in the ref store, so this
+    /// checkout has no commit.
+    ///
+    /// "Never had one" and "had one until someone deleted the branch" are the
+    /// same observable state — see [`head_state`] — so both land here.
     Unborn { name: String },
-    /// HEAD names a branch that was deleted underneath this worktree.
+    /// HEAD names a ref that *does* exist but does not yield a commit: it points
+    /// at a missing object, or at an object that is not a commit. A genuinely
+    /// broken repository rather than an empty one.
     BrokenHead { name: String },
 }
 
@@ -228,57 +436,78 @@ impl HeadState {
     }
 }
 
-/// Classifies HEAD.
+/// Classifies HEAD, or fails if git could not tell us.
 ///
-/// docs/git-plumbing.md claims `symbolic-ref -q HEAD` exits 1 for an unborn
-/// branch and 0 for a deleted one. It does not: git 2.53.0 exits 0 in both
-/// cases and prints the same ref name, so the two states really are
-/// indistinguishable by that command. The discriminator that does work is the
-/// worktree's own HEAD reflog: a worktree that ever had a commit checked out
-/// has `logs/HEAD`, a freshly initialised one does not.
+/// Two earlier discriminators were wrong and both are worth recording, because
+/// the plumbing notes asserted each of them as verified fact:
+///
+/// 1. `symbolic-ref -q HEAD` was said to exit 1 for an unborn branch and 0 for a
+///    deleted one. It does not: git 2.53.0 exits 0 and prints the same ref name
+///    in both cases.
+/// 2. The worktree's `logs/HEAD` was then said to be the discriminator that
+///    works — a worktree that ever had a commit checked out has one. It is wrong
+///    in *both* directions, with a reproducer each way:
+///    `git checkout --orphan fresh` in an existing worktree is genuinely unborn
+///    and has a reflog; a branch deleted under a worktree with
+///    `core.logAllRefUpdates=false` has none.
+///
+/// The honest conclusion is that "never had a commit" and "had one until the
+/// branch was deleted" are the *same observable state*: HEAD is a symref to a
+/// ref that is not in the ref store. Nothing in the ref store, the index or the
+/// worktree distinguishes them, so this function stops pretending and reports
+/// both as [`HeadState::Unborn`]. What the ref store *can* prove is the
+/// genuinely broken case — the ref is there and still yields no commit — which
+/// is what [`HeadState::BrokenHead`] now means.
+///
+/// Every probe is routed through [`probe`], so a git that could not answer
+/// raises an error instead of being read as "no commit here".
 pub fn head_state(checkout: &Path, timeout: Duration) -> Result<HeadState> {
-    let symref = git(
-        checkout,
-        &["symbolic-ref", "-q", "--short", "HEAD"],
-        timeout,
-    )?;
-    let resolved = git(
+    // The full ref name, not `--short`: the ref-store lookup below needs it, and
+    // stripping `refs/heads/` gives the same short name a pane wants.
+    let symref = probe(checkout, &["symbolic-ref", "-q", "HEAD"], timeout)?;
+    let oid = probe(
         checkout,
         &["rev-parse", "--verify", "-q", "HEAD^{commit}"],
         timeout,
     )?;
 
-    let oid = if resolved.ok() {
-        Some(resolved.stdout_trimmed())
-    } else {
-        None
-    };
+    let short = |full: &str| full.strip_prefix("refs/heads/").unwrap_or(full).to_string();
 
-    match (symref.ok(), oid) {
-        (true, Some(oid)) => Ok(HeadState::Branch {
-            name: symref.stdout_trimmed(),
+    match (symref, oid) {
+        (Some(full), Some(oid)) => Ok(HeadState::Branch {
+            name: short(&full),
             oid,
         }),
-        (false, Some(oid)) => Ok(HeadState::Detached { oid }),
-        (symbolic, None) => {
-            let name = if symbolic {
-                symref.stdout_trimmed()
-            } else {
-                "HEAD".to_string()
-            };
-            let reflog = git(checkout, &["rev-parse", "--git-path", "logs/HEAD"], timeout)?;
-            let has_reflog = reflog.ok()
-                && checkout
-                    .join(reflog.stdout_trimmed())
-                    .metadata()
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
-            if has_reflog {
-                Ok(HeadState::BrokenHead { name })
-            } else {
+        (None, Some(oid)) => Ok(HeadState::Detached { oid }),
+        (Some(full), None) => {
+            // `show-ref --verify` answers straight from the ref store: 0 the ref
+            // is there, 1 it is not, 128 it is there but its object is not.
+            let exists = git(
+                checkout,
+                &["show-ref", "--verify", "--quiet", &full],
+                timeout,
+            )?;
+            if exists.timed_out || exists.code.is_none() {
+                return Err(format!(
+                    "git show-ref could not answer for {} in {}: {}",
+                    full,
+                    checkout.display(),
+                    exists.stderr_text()
+                )
+                .into());
+            }
+            let name = short(&full);
+            if exists.code == Some(1) {
                 Ok(HeadState::Unborn { name })
+            } else {
+                Ok(HeadState::BrokenHead { name })
             }
         }
+        // HEAD is not a symref and does not resolve: detached at something that
+        // is not there.
+        (None, None) => Ok(HeadState::BrokenHead {
+            name: "HEAD".to_string(),
+        }),
     }
 }
 
@@ -294,17 +523,53 @@ pub fn current_branch(checkout: &Path, timeout: Duration) -> Result<Option<Strin
 }
 
 /// Best guess at the integration ref to diff against, since `Config` carries no
-/// explicit one. First match wins.
-pub fn integration_ref(checkout: &Path, timeout: Duration) -> Result<String> {
-    for candidate in [
+/// explicit one. First match wins; `Ok(None)` means the chain found nothing.
+///
+/// This used to fall back to `HEAD`, which is not a guess but a fabrication:
+/// `HEAD...HEAD` is empty by construction, and because both the base ref and the
+/// merge base then resolve, [`change_set`] recorded no degradation either. A
+/// repository whose trunk is `develop` reported every workspace as clean, with
+/// two agents committing conflicting edits to the same line. Callers with no
+/// answer should pass [`NO_INTEGRATION_REF`] instead, which degrades visibly.
+///
+/// The chain is deliberately wider than the original six. `origin` first,
+/// because a fork's local `main` is usually staler than what it was forked from;
+/// then the conventional local trunks; then the recorded HEAD of any other
+/// remote, which is what a repository with an `upstream` but no `origin` has;
+/// then whatever `init.defaultBranch` says this user names their trunks.
+pub fn integration_ref(checkout: &Path, timeout: Duration) -> Result<Option<String>> {
+    let mut candidates: Vec<String> = [
         "refs/remotes/origin/HEAD",
         "refs/remotes/origin/main",
         "refs/remotes/origin/master",
         "refs/heads/main",
         "refs/heads/master",
         "refs/heads/trunk",
-    ] {
-        let out = git(
+    ]
+    .iter()
+    .map(|c| c.to_string())
+    .collect();
+
+    if let Some(remotes) = probe(checkout, &["remote"], timeout)? {
+        for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+            if remote != "origin" {
+                candidates.push(format!("refs/remotes/{remote}/HEAD"));
+            }
+        }
+    }
+    if let Some(default) = probe(
+        checkout,
+        &["config", "--get", "init.defaultBranch"],
+        timeout,
+    )? {
+        let default = default.trim();
+        if !default.is_empty() {
+            candidates.push(format!("refs/heads/{default}"));
+        }
+    }
+
+    for candidate in candidates {
+        let resolved = probe(
             checkout,
             &[
                 "rev-parse",
@@ -314,13 +579,11 @@ pub fn integration_ref(checkout: &Path, timeout: Duration) -> Result<String> {
             ],
             timeout,
         )?;
-        if out.ok() {
-            return Ok(candidate.to_string());
+        if resolved.is_some() {
+            return Ok(Some(candidate));
         }
     }
-    // No integration ref: fall back to HEAD, which makes the committed half of
-    // the change set empty and leaves the dirty half intact.
-    Ok("HEAD".to_string())
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -531,13 +794,95 @@ fn count_of(field: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
+/// `-c` overrides that stop git running the repository's content filters.
+///
+/// Two commands here would otherwise run them: the snapshot's `git add`, and
+/// `git diff --numstat HEAD`, which cleans the working-tree side before
+/// comparing it. Both were measured invoking a `filter.<driver>.clean` on git
+/// 2.53.0; `status --porcelain=v2` was measured *not* to.
+///
+/// Those filters are arbitrary user programs, and the one everybody has is
+/// git-lfs, whose clean filter writes into the user's own `.git/lfs/objects`
+/// every time it runs. A tool whose whole claim is that it changes nothing in
+/// the repository cannot execute them on every refresh cycle. With these
+/// overrides the filter is not invoked at all — and `.required` has to be
+/// overridden alongside `clean` and `process`, or git refuses with
+/// `fatal: <path>: clean filter '<driver>' failed`. `required = true` is
+/// git-lfs's default, so without that third override this fix would do nothing
+/// for the case that motivates it.
+///
+/// Two consequences, both deliberate and both recorded in docs/git-plumbing.md:
+///
+/// * The snapshot tree holds the working tree's **raw bytes** for any filtered
+///   path `add` had to re-hash — for LFS, the media rather than a pointer —
+///   while anything the seeded index still considers clean keeps its existing
+///   filtered blob. Conflict prediction only ever compares one snapshot tree
+///   against another or against a commit tree, so a path both sides changed
+///   differently still differs and a path only one side changed still merges.
+/// * Line counts for a filtered path measure the unfiltered bytes. For LFS that
+///   changes nothing (binary diffs report `-` and count zero either way); for a
+///   text-transforming filter it overstates that path's volume, which the
+///   runaway thresholds treat as an order-of-magnitude signal anyway.
+fn filter_overrides(checkout: &Path, timeout: Duration) -> Vec<String> {
+    let Ok(out) = git(
+        checkout,
+        &["config", "--name-only", "--get-regexp", "^filter\\."],
+        timeout,
+    ) else {
+        return Vec::new();
+    };
+    // Exit 1 simply means the repository configures no filters.
+    if !out.ok() {
+        return Vec::new();
+    }
+    let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut drivers: BTreeSet<&str> = BTreeSet::new();
+    for line in listing.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("filter.") else {
+            continue;
+        };
+        // A driver name may itself contain dots, so strip from the right.
+        for suffix in [".clean", ".smudge", ".process", ".required"] {
+            if let Some(name) = rest.strip_suffix(suffix) {
+                if !name.is_empty() {
+                    drivers.insert(name);
+                }
+                break;
+            }
+        }
+    }
+    let mut args = Vec::new();
+    for driver in drivers {
+        for key in ["clean", "process"] {
+            args.push("-c".to_string());
+            args.push(format!("filter.{driver}.{key}="));
+        }
+        args.push("-c".to_string());
+        args.push(format!("filter.{driver}.required=false"));
+    }
+    args
+}
+
 /// Everything `checkout` has changed relative to its merge base with `base`:
 /// staged, unstaged, untracked, conflicted, and committed-since-merge-base.
 ///
-/// Degrades rather than failing for detached HEAD, an unborn branch, or a
-/// deleted branch — the returned `ChangeSet` carries `degraded` in those cases.
+/// Degrades rather than failing for detached HEAD, an unborn branch, a deleted
+/// branch, or a HEAD git could not read at all — the returned `ChangeSet`
+/// carries `degraded` in those cases.
+///
+/// Pass [`NO_INTEGRATION_REF`] as `base` when there is no integration ref to
+/// measure against; the result is a visibly degraded change set rather than a
+/// silently empty one.
 pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<ChangeSet> {
     let mut kinds: BTreeMap<String, ChangeKind> = BTreeMap::new();
+    // Line volume, attributed per path so that a path dropped by
+    // `ignore_suffixes` takes its lines with it rather than leaving them to
+    // trip the runaway threshold on their own.
+    let mut volume: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    // The *original* half of a rename. It belongs in the change set — a
+    // sibling editing the old name really does collide — but one rename is one
+    // changed file, so this half must not count twice toward `runaway_files`.
+    let mut rename_origins: BTreeSet<String> = BTreeSet::new();
     let mut set = ChangeSet::default();
     let mut reasons: Vec<String> = Vec::new();
 
@@ -562,11 +907,15 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
         if entry.kind == ChangeKind::Conflicted {
             unmerged = true;
         }
+        if entry.is_rename {
+            set.has_rename = true;
+        }
         note(&mut kinds, entry.path.clone(), entry.kind);
         if let Some(origin) = &entry.origin {
             // Both halves of a rename belong to the change set: another
             // worktree editing the original path collides with this one.
             note(&mut kinds, origin.clone(), entry.kind);
+            rename_origins.insert(origin.clone());
         }
     }
     if unmerged {
@@ -575,40 +924,75 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
         ));
     }
 
-    let head = head_state(checkout, timeout)?;
-    match &head {
-        HeadState::Unborn { name } => {
-            reasons.push(format!("{DEGRADED_UNBORN}: `{name}` has no commits yet"));
+    // A HEAD git could not read is not a HEAD with no commit. Reporting it as
+    // one would quietly drop the checkout from every pairing, so it gets its own
+    // reason and the rest of the change set is still assembled from `status`.
+    let head = match head_state(checkout, timeout) {
+        Ok(head) => Some(head),
+        Err(err) => {
+            reasons.push(format!("{DEGRADED_UNREADABLE}: could not read HEAD: {err}"));
+            None
         }
-        HeadState::BrokenHead { name } => {
+    };
+    match &head {
+        Some(HeadState::Unborn { name }) => {
             reasons.push(format!(
-                "{DEGRADED_BROKEN_HEAD}: `{name}` was deleted underneath this worktree"
+                "{DEGRADED_UNBORN}: `{name}` does not exist, so this checkout has no commit"
+            ));
+        }
+        Some(HeadState::BrokenHead { name }) => {
+            reasons.push(format!(
+                "{DEGRADED_BROKEN_HEAD}: `{name}` does not resolve to a commit"
             ));
         }
         _ => {}
     }
 
-    if let Some(head_oid) = head.oid() {
+    if let Some(head_oid) = head.as_ref().and_then(HeadState::oid) {
         // Dirty-side line volume: everything between HEAD and the working tree.
-        let dirty = git(checkout, &["diff", "--numstat", "-z", "HEAD"], timeout)?;
+        // This is the second command that would run the repository's content
+        // filters, so it gets the same overrides as the snapshot.
+        let overrides = filter_overrides(checkout, timeout);
+        let mut dirty_args: Vec<&str> = overrides.iter().map(String::as_str).collect();
+        dirty_args.extend(["diff", "--numstat", "-z", "HEAD"]);
+        let dirty = git(checkout, &dirty_args, timeout)?;
         if dirty.ok() {
             for stat in parse_numstat_z(&dirty.stdout) {
-                set.lines_added += stat.added;
-                set.lines_removed += stat.removed;
+                add_volume(&mut volume, &stat);
             }
+        } else {
+            // Losing the dirty-side volume silently would understate a runaway
+            // by exactly the work that is still uncommitted, which is the work
+            // a runaway agent has most of.
+            reasons.push(format!(
+                "{DEGRADED_PARTIAL_VOLUME}: could not measure uncommitted line counts: {}",
+                dirty.stderr_text()
+            ));
         }
 
-        let base_oid = git(
-            checkout,
-            &["rev-parse", "--verify", "-q", &format!("{base}^{{commit}}")],
-            timeout,
-        )?;
-        if !base_oid.ok() {
-            reasons.push(format!(
-                "{DEGRADED_MISSING_BASE_REF}: `{base}` does not resolve"
-            ));
+        // `NO_INTEGRATION_REF` is not a ref and must never be handed to git; it
+        // is the caller saying "the probe chain found nothing", which is a
+        // missing base ref by another route.
+        let base_oid = if base == NO_INTEGRATION_REF {
+            None
         } else {
-            let base_oid = base_oid.stdout_trimmed();
+            probe(
+                checkout,
+                &["rev-parse", "--verify", "-q", &format!("{base}^{{commit}}")],
+                timeout,
+            )?
+        };
+        if base_oid.is_none() {
+            reasons.push(if base == NO_INTEGRATION_REF {
+                format!(
+                    "{DEGRADED_MISSING_BASE_REF}: no integration ref found, \
+                     so only uncommitted work is counted"
+                )
+            } else {
+                format!("{DEGRADED_MISSING_BASE_REF}: `{base}` does not resolve")
+            });
+        }
+        if let Some(base_oid) = base_oid {
             let merge_base = git(checkout, &["merge-base", &base_oid, head_oid], timeout)?;
             if !merge_base.ok() {
                 reasons.push(format!(
@@ -625,45 +1009,96 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
                 let stats = git(checkout, &["diff", "--numstat", "-z", &range], timeout)?;
                 if stats.ok() {
                     for stat in parse_numstat_z(&stats.stdout) {
-                        set.lines_added += stat.added;
-                        set.lines_removed += stat.removed;
                         // `--name-only` collapses a rename to the new path
                         // only; `--numstat` reports both, so this is where the
                         // pre-rename path enters the committed change set.
-                        for path in stat.paths {
-                            note(&mut kinds, path, ChangeKind::Committed);
+                        if stat.paths.len() > 1 {
+                            set.has_rename = true;
+                            // `parse_numstat_z` yields the old path first.
+                            rename_origins.insert(stat.paths[0].clone());
                         }
+                        for path in &stat.paths {
+                            note(&mut kinds, path.clone(), ChangeKind::Committed);
+                        }
+                        add_volume(&mut volume, &stat);
                     }
+                } else {
+                    reasons.push(format!(
+                        "{DEGRADED_PARTIAL_VOLUME}: could not measure committed line counts: {}",
+                        stats.stderr_text()
+                    ));
                 }
             }
         }
     }
 
+    // `status --porcelain` always reports paths relative to the repository
+    // *root*, never to git's working directory, so a `checkout` that points at a
+    // subdirectory would turn every disk read into `<root>/pkg/pkg/file` and
+    // silently count zero lines. Resolve the top level once and join against it.
+    let top_level = PathBuf::from(
+        git_ok(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+            timeout,
+        )?
+        .stdout_trimmed(),
+    );
+
     // Untracked files are invisible to every `diff`, so count them from disk.
     for entry in &entries {
         if entry.kind == ChangeKind::Untracked {
-            set.lines_added += count_lines_on_disk(&checkout.join(&entry.path));
+            let lines = count_lines_on_disk(&top_level.join(&entry.path));
+            volume.entry(entry.path.clone()).or_default().0 += lines;
         }
     }
-    // On an unborn branch there is no HEAD to diff against, so the staged
+    // With no usable HEAD there is nothing to diff against, so the staged
     // additions are counted the same way.
-    if head.oid().is_none() {
+    if head.as_ref().and_then(HeadState::oid).is_none() {
         for entry in &entries {
             if entry.kind == ChangeKind::Staged || entry.kind == ChangeKind::Unstaged {
-                set.lines_added += count_lines_on_disk(&checkout.join(&entry.path));
+                let lines = count_lines_on_disk(&top_level.join(&entry.path));
+                volume.entry(entry.path.clone()).or_default().0 += lines;
             }
         }
     }
 
     set.paths = kinds
         .into_iter()
-        .map(|(path, kind)| ChangedPath { path, kind })
+        .map(|(path, kind)| {
+            let (added, removed) = volume.get(&path).copied().unwrap_or((0, 0));
+            ChangedPath {
+                is_rename_origin: rename_origins.contains(&path),
+                path,
+                kind,
+                lines_added: added,
+                lines_removed: removed,
+            }
+        })
         .collect();
+    // The totals are the sum of the parts, so a caller that filters paths and
+    // one that reads the totals can never disagree.
+    set.lines_added = set.paths.iter().map(|p| p.lines_added).sum();
+    set.lines_removed = set.paths.iter().map(|p| p.lines_removed).sum();
     if !reasons.is_empty() {
         set.degraded = true;
         set.degraded_reason = Some(reasons.join("; "));
     }
     Ok(set)
+}
+
+/// Attributes one `--numstat` record's line counts to the path it describes.
+///
+/// A rename record carries two paths; the counts describe the single file that
+/// moved, so they are attributed to the new path only. Charging both halves
+/// would double a refactor's apparent volume.
+fn add_volume(volume: &mut BTreeMap<String, (u64, u64)>, stat: &NumStat) {
+    let Some(path) = stat.paths.last() else {
+        return;
+    };
+    let entry = volume.entry(path.clone()).or_default();
+    entry.0 = entry.0.saturating_add(stat.added);
+    entry.1 = entry.1.saturating_add(stat.removed);
 }
 
 /// Keeps the most significant reason a path is in the change set.
@@ -741,7 +1176,6 @@ struct Side {
     tree: Option<String>,
     dirty: bool,
     unmerged: bool,
-    has_rename: bool,
 }
 
 impl Side {
@@ -877,7 +1311,6 @@ impl Predictor {
         let entries = parse_status_v2(&status.stdout);
         let dirty = !entries.is_empty();
         let unmerged = entries.iter().any(|e| e.kind == ChangeKind::Conflicted);
-        let has_rename = entries.iter().any(|e| e.is_rename);
 
         let tree = if dirty {
             Some(self.snapshot_tree(checkout, &common_dir)?)
@@ -891,7 +1324,6 @@ impl Predictor {
             tree,
             dirty,
             unmerged,
-            has_rename,
         })
     }
 
@@ -915,13 +1347,31 @@ impl Predictor {
 
         let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
         let index = TempIndex::new(self.scratch.join(format!("index-{seq}")))?;
-        // Best effort: a worktree with no index yet just starts from empty.
-        let _ = fs::copy(git_dir.join("index"), &index.path);
+        // A worktree with no index yet legitimately starts from empty. Every
+        // *other* failure must not: seeding is what preserves the entries `add`
+        // will not revisit, so an unreadable index silently drops every
+        // sparse-checkout and skip-worktree path out of the snapshot tree, and
+        // the pair then reports one-sided deletions for files nobody touched.
+        match fs::copy(git_dir.join("index"), &index.path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "{}: could not seed the snapshot index from {}: {err}",
+                    checkout.display(),
+                    git_dir.join("index").display()
+                )
+                .into())
+            }
+        }
 
         let mut env = self.odb_env(common_dir);
         env.push(("GIT_INDEX_FILE", index.path.clone().into_os_string()));
 
-        let add = run_git(checkout, &["add", "-A", "--"], &env, self.timeout)?;
+        let overrides = filter_overrides(checkout, self.timeout);
+        let mut add_args: Vec<&str> = overrides.iter().map(String::as_str).collect();
+        add_args.extend(["add", "-A", "--"]);
+        let add = run_git(checkout, &add_args, &env, self.timeout)?;
         if !add.ok() {
             return Err(format!(
                 "{}: could not snapshot working tree: {}",
@@ -930,7 +1380,13 @@ impl Predictor {
             )
             .into());
         }
-        let tree = run_git(checkout, &["write-tree"], &env, self.timeout)?;
+        // `write-tree` needs the overrides too, and this was worth measuring
+        // rather than assuming: it refreshes the index it is handed, so a
+        // stat-dirty entry is re-hashed here — running the filter — even though
+        // `add` above already visited it.
+        let mut tree_args: Vec<&str> = overrides.iter().map(String::as_str).collect();
+        tree_args.push("write-tree");
+        let tree = run_git(checkout, &tree_args, &env, self.timeout)?;
         if !tree.ok() {
             return Err(format!(
                 "{}: could not write snapshot tree: {}",
@@ -978,14 +1434,18 @@ impl Predictor {
             ..Default::default()
         };
 
-        // Prefilter, free: with no shared path there is nothing to conflict
-        // over. The exception is a rename on either side, where the merge can
-        // conflict on a path that appears under different names in the two
-        // change sets.
-        if paths.is_empty() && !l.has_rename && !r.has_rename {
-            return Ok(prediction);
-        }
-
+        // There is deliberately no prefilter here. There used to be one — skip
+        // the pair when `paths` is empty, unless either side has a rename — and
+        // it was unreachable for the case it existed to catch. `Side::has_rename`
+        // was built from `status`, so it only ever saw *uncommitted* renames; a
+        // worktree that had committed a directory rename and was otherwise clean
+        // short-circuited to a conflict-free verdict while `merge-tree` on the
+        // same pair exited 1 with `CONFLICT (directory rename suggested)`.
+        //
+        // Deciding which pairs are worth predicting belongs to `collide::analyse`,
+        // which has both change sets. A second, differently-informed filter one
+        // layer down can only disagree with it, and a clean pair costs 1.77 ms
+        // to answer properly (docs/git-plumbing.md, "merge-tree cost").
         let (args_owned, approximate) = self.merge_tree_args(left, l, r)?;
         prediction.approximate = approximate;
         let base_args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
@@ -1053,6 +1513,17 @@ impl Predictor {
 
     /// Builds the trailing merge-tree arguments and reports whether a single
     /// merge base had to be forced.
+    ///
+    /// Two checkouts with no common ancestor get one answer here regardless of
+    /// how dirty they are: an error, which the caller turns into "prediction
+    /// could not run". The dirty path used to substitute the empty tree as the
+    /// base, which makes every shared path an add/add and reports a confident
+    /// conflict on all of them, while the clean path let `merge-tree` refuse
+    /// with `refusing to merge unrelated histories`. The same two orphan
+    /// branches therefore flipped between "unknown" and "everything conflicts"
+    /// depending on whether one of them happened to have a stray untracked file.
+    /// With no common ancestor there is no merge to predict, and `Unknown` is
+    /// the honest verdict.
     fn merge_tree_args(&self, cwd: &Path, l: &Side, r: &Side) -> Result<(Vec<String>, bool)> {
         if !l.dirty && !r.dirty {
             // Both sides are commits, so no `--merge-base`: merge-tree then
@@ -1068,29 +1539,37 @@ impl Predictor {
             &["merge-base", "--all", &l.head, &r.head],
             self.timeout,
         )?;
-        let (base_tree, approximate) = if bases.ok() {
-            let list: Vec<String> = bases
-                .stdout_trimmed()
-                .lines()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let first = list
-                .first()
-                .cloned()
-                .unwrap_or_else(|| EMPTY_TREE.to_string());
-            let tree = git_ok(
-                cwd,
-                &["rev-parse", &format!("{first}^{{tree}}")],
-                self.timeout,
-            )?
-            .stdout_trimmed();
-            (tree, list.len() > 1)
-        } else {
-            // Unrelated histories: the empty tree is the honest base, and every
-            // shared path then shows up as add/add.
-            (EMPTY_TREE.to_string(), true)
-        };
+        if bases.timed_out || bases.code.is_none() {
+            return Err(format!(
+                "merge-base could not answer in {}: {}",
+                cwd.display(),
+                bases.stderr_text()
+            )
+            .into());
+        }
+        let list: Vec<String> = bases
+            .stdout_trimmed()
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !bases.ok() || list.is_empty() {
+            return Err(format!(
+                "no common ancestor between {} and {}, so this pair cannot be predicted",
+                l.head, r.head
+            )
+            .into());
+        }
+        // Passing `--merge-base` forces a single base; say so when there is more
+        // than one, because the answer is then an approximation of the recursive
+        // merge git itself would do.
+        let approximate = list.len() > 1;
+        let base_tree = git_ok(
+            cwd,
+            &["rev-parse", &format!("{}^{{tree}}", list[0])],
+            self.timeout,
+        )?
+        .stdout_trimmed();
 
         Ok((
             vec![
@@ -1119,9 +1598,17 @@ impl Drop for Predictor {
 /// directory whose pid is gone is provably garbage. Directories belonging to a
 /// live process — including this one, and including a concurrently running
 /// second collide — are never touched.
+///
+/// Both locations are swept. `Predictor::new` falls back to
+/// `std::env::temp_dir()` when the state dir cannot be created, and sweeping
+/// only the state dir meant those fallbacks leaked forever.
 pub fn sweep_scratch() {
-    let root = config::state_dir().join("scratch");
-    let Ok(entries) = fs::read_dir(&root) else {
+    sweep_scratch_in(&config::state_dir().join("scratch"));
+    sweep_scratch_in(&std::env::temp_dir());
+}
+
+fn sweep_scratch_in(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     let self_pid = std::process::id();
@@ -1130,6 +1617,8 @@ pub fn sweep_scratch() {
         let Some(rest) = name.strip_prefix("collide-") else {
             continue;
         };
+        // Only `collide-<pid>-<seq>`. Anything whose first segment is not a
+        // number is somebody else's directory that happens to share the prefix.
         let Some(Ok(pid)) = rest.split('-').next().map(str::parse::<u32>) else {
             continue;
         };
@@ -1214,6 +1703,14 @@ pub fn parse_merge_tree_z(bytes: &[u8]) -> MergeTreeOutput {
 
     // Message records. Parsing is best-effort: the file section above is the
     // authoritative answer, these only add the machine-stable type token.
+    //
+    // Not every message record is a conflict. git emits an `Auto-merging`
+    // record for each file it merged successfully, in exactly the same shape,
+    // and taking every type field verbatim filled this list with noise — for a
+    // two-file conflict, `["Auto-merging", "CONFLICT (contents)", "Auto-merging",
+    // "CONFLICT (contents)"]`, which `Vec::dedup` cannot collapse because it only
+    // removes *adjacent* duplicates. Keep the conflict tokens, and use a set.
+    let mut types: BTreeSet<String> = BTreeSet::new();
     while i < fields.len() {
         let Ok(count) = std::str::from_utf8(fields[i])
             .unwrap_or("")
@@ -1226,10 +1723,13 @@ pub fn parse_merge_tree_z(bytes: &[u8]) -> MergeTreeOutput {
         if type_at >= fields.len() {
             break;
         }
-        out.conflict_types.push(lossy(fields[type_at]));
+        let token = lossy(fields[type_at]);
+        if token.starts_with("CONFLICT (") {
+            types.insert(token);
+        }
         i = type_at + 2; // skip the human message too
     }
-    out.conflict_types.dedup();
+    out.conflict_types = types.into_iter().collect();
     out
 }
 

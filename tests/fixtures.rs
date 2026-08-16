@@ -182,6 +182,40 @@ impl Fixture {
         path
     }
 
+    /// A linked worktree *inside* the main worktree, under `.worktrees/`.
+    ///
+    /// This is the layout most agent-per-worktree setups use, so that the
+    /// worktrees travel with the repository, and it is the one a sibling
+    /// worktree cannot stand in for: the path sits underneath the main
+    /// worktree's, so anything deciding "same working tree?" by path prefix
+    /// wrongly calls it the same tree and stops comparing the two.
+    ///
+    /// The exclusion goes in `.git/info/exclude` rather than a committed
+    /// `.gitignore`, so the base commit every other fixture shares is untouched
+    /// and the nesting does not show up as a change of its own.
+    pub fn nested_worktree(&self, name: &str, branch: &str) -> PathBuf {
+        let exclude = self.repo.join(".git/info/exclude");
+        if let Some(parent) = exclude.parent() {
+            std::fs::create_dir_all(parent).expect("info dir");
+        }
+        std::fs::write(&exclude, ".worktrees/\n").expect("write exclude");
+
+        let path = self.repo.join(".worktrees").join(name);
+        self.git(
+            &self.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+                "main",
+            ],
+        );
+        path
+    }
+
     /// A linked worktree with a detached HEAD.
     pub fn detached_worktree(&self, name: &str) -> PathBuf {
         let path = self.root.join(name);
@@ -226,6 +260,93 @@ impl Fixture {
             &self.repo,
             &["update-ref", "-d", &format!("refs/heads/{branch}")],
         );
+        path
+    }
+
+    /// A linked worktree whose HEAD is a symref to a ref that exists but whose
+    /// object does not. The genuinely broken case, as distinct from a branch
+    /// that simply has no commit.
+    pub fn dangling_head_worktree(&self, name: &str, branch: &str) -> PathBuf {
+        let path = self.worktree(name, branch);
+        // Write the ref by hand rather than through git: no plumbing command
+        // will point a branch at an object that is not there, which is the whole
+        // point of the state.
+        let common_dir = PathBuf::from(self.git(
+            &path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        let ref_path = common_dir.join("refs/heads").join(branch);
+        std::fs::create_dir_all(ref_path.parent().expect("refs/heads")).expect("create refs/heads");
+        std::fs::write(&ref_path, "0123456789abcdef0123456789abcdef01234567\n")
+            .expect("write dangling ref");
+        path
+    }
+
+    /// A linked worktree whose `.git/HEAD` is not a ref at all. Every HEAD probe
+    /// then exits 128 — "I could not look", which must never be read as "there
+    /// is no commit".
+    pub fn garbage_head_worktree(&self, name: &str) -> PathBuf {
+        let path = self.worktree(name, name);
+        let git_dir =
+            PathBuf::from(self.git(&path, &["rev-parse", "--path-format=absolute", "--git-dir"]));
+        std::fs::write(git_dir.join("HEAD"), "this is not a ref\n").expect("write garbage HEAD");
+        path
+    }
+
+    /// A worktree switched to an orphan branch *in place*, so it is genuinely
+    /// unborn while still carrying the reflog of the branch it came from. The
+    /// counter-example that disproves the `logs/HEAD` discriminator in one
+    /// direction.
+    pub fn orphaned_in_place_worktree(&self, name: &str, branch: &str) -> PathBuf {
+        let path = self.worktree(name, name);
+        self.git(&path, &["checkout", "-q", "--orphan", branch]);
+        path
+    }
+
+    /// A repository with reflogging switched off, in which a branch is then
+    /// deleted underneath its worktree. The counter-example that disproves the
+    /// `logs/HEAD` discriminator in the other direction: the branch really was
+    /// deleted, and there is no reflog to say so.
+    pub fn deleted_branch_worktree_without_reflog(&self, name: &str, branch: &str) -> PathBuf {
+        self.git(&self.repo, &["config", "core.logAllRefUpdates", "false"]);
+        let path = self.worktree(name, branch);
+        self.git(
+            &self.repo,
+            &["update-ref", "-d", &format!("refs/heads/{branch}")],
+        );
+        self.git(&self.repo, &["config", "core.logAllRefUpdates", "true"]);
+        path
+    }
+
+    /// A repository whose trunk is named something the probe chain does not
+    /// guess, with no remotes at all. Measured against `HEAD` this reports every
+    /// workspace as clean however much they conflict.
+    pub fn trunkless_repo(&self, name: &str, branch: &str) -> PathBuf {
+        let path = self.root.join(name);
+        std::fs::create_dir_all(&path).expect("create repo dir");
+        self.git(&path, &["init", "-q", "-b", branch]);
+        self.git(&path, &["config", "user.email", "fixture@example.invalid"]);
+        self.git(&path, &["config", "user.name", "collide fixture"]);
+        self.git(&path, &["config", "commit.gpgsign", "false"]);
+        self.git(
+            &path,
+            &[
+                "config",
+                "core.excludesFile",
+                self.root.join("empty-excludes").to_str().unwrap(),
+            ],
+        );
+        self.git(
+            &path,
+            &[
+                "config",
+                "core.hooksPath",
+                self.root.join("no-hooks").to_str().unwrap(),
+            ],
+        );
+        self.write(&path, "conflict.txt", "alpha\nbeta\ngamma\n");
+        self.git(&path, &["add", "-A"]);
+        self.commit(&path, "base");
         path
     }
 
@@ -514,10 +635,172 @@ impl Fixture {
         (spaced, newline)
     }
 
+    /// Two untracked files whose names are *different* invalid UTF-8. Returns
+    /// their raw byte names. Replacing the bad bytes maps both onto the same
+    /// display string, so anything that keys on that string alone reports two
+    /// worktrees as sharing a file neither of them has.
+    ///
+    /// Returns `None` when the filesystem refuses the names outright. macOS's
+    /// APFS and HFS+ enforce valid UTF-8 in filenames and answer `EILSEQ`,
+    /// where ext4 and friends take any byte but `/` and NUL. That is a real
+    /// difference between the platforms this plugin supports, not a flaw in the
+    /// test, so the caller skips the on-disk half rather than the suite failing
+    /// on a machine where the situation cannot arise.
+    #[cfg(unix)]
+    pub fn distinct_invalid_utf8_untracked(&self, cwd: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // The names differ *only* in the invalid byte, so replacement alone
+        // renders them identically and nothing but the digest tells them apart.
+        let first = b"\xff.txt".to_vec();
+        let second = b"\xfe.txt".to_vec();
+        for (name, body) in [(&first, "first\n"), (&second, "second\nsecond\n")] {
+            let path = cwd.join(OsStr::from_bytes(name));
+            if std::fs::write(&path, body).is_err() {
+                return None;
+            }
+        }
+        Some((first, second))
+    }
+
     /// Files that `.gitignore` covers, which must never enter a change set.
     pub fn ignored_files(&self, cwd: &Path) {
         self.write(cwd, "ignored/artifact.bin", "junk\n");
         self.write(cwd, "build.log", "noise\n");
+    }
+
+    /// Two worktrees whose committed state shares no path at all, because one
+    /// renamed a whole directory and the other added a file into the old one. A
+    /// real `CONFLICT (directory rename suggested)` that a path intersection
+    /// cannot see.
+    pub fn committed_directory_rename_pair(&self) -> (PathBuf, PathBuf) {
+        let a = self.worktree("dirrename-a", "dirrename-a");
+        self.git(&a, &["mv", "docs", "guide"]);
+        self.commit(&a, "a renames the directory");
+
+        let b = self.worktree("dirrename-b", "dirrename-b");
+        self.write(&b, "docs/notes-c.md", "notes c\n");
+        self.commit_all(&b, "b adds into the old directory");
+        (a, b)
+    }
+
+    /// Two worktrees that committed conflicting edits to *two* files, so
+    /// merge-tree emits more than one conflict record — and therefore more than
+    /// one `Auto-merging` record interleaved with them.
+    pub fn two_file_conflict_pair(&self) -> (PathBuf, PathBuf) {
+        let a = self.worktree("twofile-a", "twofile-a");
+        self.write(&a, "conflict.txt", "A-ONE\nbeta\ngamma\n");
+        self.write(&a, "renamed.txt", "A-TWO\n");
+        self.commit_all(&a, "a edits both");
+
+        let b = self.worktree("twofile-b", "twofile-b");
+        self.write(&b, "conflict.txt", "B-ONE\nbeta\ngamma\n");
+        self.write(&b, "renamed.txt", "B-TWO\n");
+        self.commit_all(&b, "b edits both");
+        (a, b)
+    }
+
+    /// Two worktrees of one repository with no common ancestor: one on `main`,
+    /// one on an orphan branch that added the same file independently.
+    pub fn unrelated_history_pair(&self) -> (PathBuf, PathBuf) {
+        let a = self.worktree("unrelated-a", "unrelated-a");
+        self.write(&a, "conflict.txt", "A-SIDE\nbeta\ngamma\n");
+        self.commit_all(&a, "a edits");
+
+        let b = self.root.join("unrelated-b");
+        self.git(
+            &self.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--orphan",
+                "-b",
+                "unrelated-b",
+                b.to_str().unwrap(),
+            ],
+        );
+        self.write(&b, "conflict.txt", "B-SIDE\nbeta\ngamma\n");
+        self.commit_all(&b, "b starts a history of its own");
+        (a, b)
+    }
+
+    /// A `core.fsmonitor` hook that answers git immediately but leaves a
+    /// background process behind holding git's stderr.
+    ///
+    /// This is the shape that turned a "hard deadline" into no deadline at all:
+    /// git itself finishes in milliseconds, and the pipe it wrote to only
+    /// reaches EOF when the last holder of the write end closes it. Returns the
+    /// number of seconds the holder lives.
+    pub fn leaking_fsmonitor(&self, cwd: &Path, holder_seconds: u32) -> u32 {
+        let hook = self.root.join(format!(
+            "fsmonitor-{}.sh",
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        // stdout goes to /dev/null so git is not kept waiting for the hook's own
+        // output; stderr is deliberately inherited, which is the leak.
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nsleep {holder_seconds} >/dev/null &\nprintf '/\\0'\n"),
+        )
+        .expect("write fsmonitor hook");
+        self.make_executable(&hook);
+        self.git(cwd, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        holder_seconds
+    }
+
+    /// Configures a `filter.<driver>.clean` for the whole repository that
+    /// records every invocation into a log, in the shape git-lfs uses. Returns
+    /// the log path, which must still not exist after a full pipeline run.
+    ///
+    /// Repository-wide on purpose: linked worktrees share one `config`, so
+    /// configuring this per worktree would silently leave only the last one in
+    /// force and the assertion on the others would prove nothing.
+    ///
+    /// `required = true` matters too — that is git-lfs's default, and a filter
+    /// cannot be neutralised by emptying `clean`/`process` while it is set.
+    pub fn recording_clean_filter(&self) -> PathBuf {
+        let log = self.root.join("filter-ran.log");
+        let script = self
+            .root
+            .join(format!("clean-{}.sh", SEQ.fetch_add(1, Ordering::Relaxed)));
+        std::fs::write(
+            &script,
+            // The calling command is recorded where /proc allows it, so a
+            // failure names the git invocation that ran the filter instead of
+            // only counting it. `echo ran` is unconditional, so the log still
+            // appears where /proc does not exist.
+            format!(
+                "#!/bin/sh\n{{ echo -n 'ran: '; tr '\\0' ' ' < /proc/$PPID/cmdline 2>/dev/null; \
+                 echo; }} >> '{}'\nexec cat\n",
+                log.to_string_lossy()
+            ),
+        )
+        .expect("write clean filter");
+        self.make_executable(&script);
+        self.git(
+            &self.repo,
+            &["config", "filter.demo.clean", script.to_str().unwrap()],
+        );
+        self.git(&self.repo, &["config", "filter.demo.required", "true"]);
+        log
+    }
+
+    /// Gives one worktree something for the filter above to bite on: an
+    /// attributes file selecting the driver, plus a matching payload.
+    pub fn filtered_payload(&self, cwd: &Path, body: &str) {
+        self.write(cwd, ".gitattributes", "*.bin filter=demo\n");
+        self.write(cwd, "payload.bin", body);
+    }
+
+    fn make_executable(&self, path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
     }
 
     /// Byte-for-byte copy of a worktree's real index, for asserting that
@@ -553,11 +836,61 @@ pub fn change_set(paths: &[&str]) -> collide::model::ChangeSet {
     collide::model::ChangeSet {
         paths: paths
             .iter()
-            .map(|p| collide::model::ChangedPath {
-                path: p.to_string(),
-                kind: collide::model::ChangeKind::Unstaged,
+            .map(|p| collide::model::ChangedPath::new(*p, collide::model::ChangeKind::Unstaged))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// A `ChangeSet` whose paths each carry a line count, so tests can tell the
+/// difference between "this path was dropped" and "this path's volume was
+/// dropped with it".
+pub fn change_set_with_lines(paths: &[(&str, u64)]) -> collide::model::ChangeSet {
+    let mut set = collide::model::ChangeSet {
+        paths: paths
+            .iter()
+            .map(|(path, added)| collide::model::ChangedPath {
+                lines_added: *added,
+                ..collide::model::ChangedPath::new(*path, collide::model::ChangeKind::Unstaged)
             })
             .collect(),
+        ..Default::default()
+    };
+    set.lines_added = set.paths.iter().map(|p| p.lines_added).sum();
+    set
+}
+
+/// A `ChangeSet` describing `count` renames, both halves recorded exactly as
+/// `git::change_set` records them: `old-<n>` as the rename origin and
+/// `new-<n>` as the surviving path.
+pub fn change_set_renamed(count: usize) -> collide::model::ChangeSet {
+    let mut paths = Vec::new();
+    for n in 0..count {
+        paths.push(collide::model::ChangedPath {
+            is_rename_origin: true,
+            ..collide::model::ChangedPath::new(
+                format!("old-{n}.rs"),
+                collide::model::ChangeKind::Unstaged,
+            )
+        });
+        paths.push(collide::model::ChangedPath::new(
+            format!("new-{n}.rs"),
+            collide::model::ChangeKind::Unstaged,
+        ));
+    }
+    collide::model::ChangeSet {
+        paths,
+        has_rename: true,
+        ..Default::default()
+    }
+}
+
+/// A `ChangeSet` carrying a degraded reason code, for the paths where "we could
+/// not read this" must not look like "there was nothing to read".
+pub fn change_set_degraded(reason: &str) -> collide::model::ChangeSet {
+    collide::model::ChangeSet {
+        degraded: true,
+        degraded_reason: Some(reason.to_string()),
         ..Default::default()
     }
 }
