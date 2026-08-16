@@ -20,6 +20,15 @@ quietly edited, because a note that has been wrong once is worth re-checking:
 
 ## Transport
 
+Both fall back to `$XDG_CONFIG_HOME` or `$HOME/.config` when nothing is
+injected, and the two must resolve it the same way: a *relative*
+`XDG_CONFIG_HOME` is ignored per the spec. They disagreed once — the socket path
+read the variable directly and honoured a relative value, resolving it against
+the process cwd, which for a plugin command is the plugin root. `--setup` then
+edited the right `config.toml` and dialled a socket somewhere else, and because a
+reload that does not succeed rolls the edit back, `--setup` could never succeed
+at all.
+
 `HERDR_SOCKET_PATH` is injected into every command herdr spawns (build hooks,
 startup hooks, actions, panes). Fall back to `$XDG_CONFIG_HOME/herdr/herdr.sock`
 (macOS/Linux) only for hand invocation. Treat an empty-string env var as unset.

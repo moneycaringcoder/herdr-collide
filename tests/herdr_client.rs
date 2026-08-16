@@ -379,13 +379,14 @@ fn a_call_survives_the_socket_being_unlinked_and_rebound() {
     let mut client = Herdr::connect().expect("connect before the handoff");
     drop(listener);
 
-    // The old server goes away; a new one binds the same path 60 ms later,
-    // comfortably inside the client's retry pause and far outside a retry with
-    // no pause at all.
+    // The old server goes away; a new one binds the same path 25 ms later —
+    // far outside a retry with no pause at all (two such attempts were measured
+    // 0.05 ms apart), and with 125 ms of the client's 150 ms pause still to
+    // spare, so a scheduling stall cannot turn a real pass into a flake.
     let server = HandoffServer::start(
         dir,
         path,
-        Duration::from_millis(60),
+        Duration::from_millis(25),
         vec![snapshot_line(snapshot_with_one_repo())],
     );
 
@@ -405,7 +406,7 @@ fn connect_survives_the_socket_being_unlinked_and_rebound() {
     let path = dir.join("s.sock");
     point_at(&path);
 
-    let server = HandoffServer::start(dir, path, Duration::from_millis(60), vec![]);
+    let server = HandoffServer::start(dir, path, Duration::from_millis(25), vec![]);
 
     Herdr::connect().expect("connect must retry across a rebind");
     drop(server);
@@ -829,5 +830,46 @@ fn connect_reports_the_socket_path_when_there_is_no_server() {
     assert!(
         err.to_string().contains("/nonexistent/collide-test.sock"),
         "the message must name the path: {err}"
+    );
+}
+
+/// With nothing injected, the socket path falls back to the XDG config
+/// directory — resolved by the *same* helper `setup` uses for herdr's
+/// `config.toml`, which ignores a relative `XDG_CONFIG_HOME` as the spec
+/// requires.
+///
+/// Reading the variable here directly made the two disagree: `--setup` edited
+/// `$HOME/.config/herdr/config.toml` and then dialled a socket under a path
+/// resolved against the process cwd, which for a plugin command is the plugin
+/// root. The reload failed, and since a reload that does not succeed rolls the
+/// edit back, `--setup` could never succeed at all.
+#[test]
+fn the_socket_falls_back_to_the_same_config_dir_setup_edits() {
+    let _guard = env_lock();
+    let saved: Vec<(&str, Option<String>)> = ["HERDR_SOCKET_PATH", "XDG_CONFIG_HOME", "HOME"]
+        .iter()
+        .map(|name| (*name, std::env::var(name).ok()))
+        .collect();
+    std::env::remove_var("HERDR_SOCKET_PATH");
+    std::env::set_var("XDG_CONFIG_HOME", "relative/config");
+    std::env::set_var("HOME", "/home/collide-test");
+
+    let err = Herdr::connect().expect_err("nothing is listening there");
+    let message = err.to_string();
+
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    assert!(
+        message.contains("/home/collide-test/.config/herdr/herdr.sock"),
+        "a relative XDG_CONFIG_HOME must be ignored, as it is everywhere else: {message}"
+    );
+    assert!(
+        !message.contains("relative/config"),
+        "the relative value was honoured: {message}"
     );
 }

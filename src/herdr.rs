@@ -82,7 +82,7 @@ pub struct Herdr {
 
 impl Herdr {
     pub fn connect() -> Result<Self> {
-        let socket_path = socket_path()?;
+        let socket_path = socket_path();
         // Dial so a missing server is reported here, with the path, rather than
         // as a confusing failure inside the first call. The connection is
         // dropped immediately: one request per connection means there is
@@ -153,7 +153,8 @@ impl Herdr {
     }
 
     /// Workspaces the last `checkouts` call dropped because their `worktree`
-    /// object was there but unreadable — a missing `repo_key` or
+    /// object was there but unreadable — a `worktree` that is not an object at
+    /// all, or a workspace missing its `workspace_id`, `repo_key` or
     /// `checkout_path`. Zero is the normal case; anything else means the plugin
     /// is quietly seeing fewer repos than the session has, which is worth a
     /// note rather than silence.
@@ -238,12 +239,15 @@ impl Herdr {
         match self.call_once(&id, method, &params) {
             Ok(result) => Ok(result),
             Err(Failure::Protocol(err)) => Err(Box::new(err)),
-            // One request per connection is the normal path, not an error path:
-            // the server EOFs after answering, so the connection we would reuse
-            // is already gone. The same retry carries the client across a
-            // `herdr update --handoff`, where the first attempt lands on a
-            // socket the old server has just unlinked — but only with the pause
-            // below, since the new server needs a moment to bind.
+            // Every attempt dials its own connection — the server answers one
+            // request and closes, so there is nothing to reuse and nothing to
+            // keep open. A transport failure is therefore a real failure rather
+            // than the protocol's normal end-of-message, and the one thing worth
+            // retrying it for is a `herdr update --handoff`, where the first
+            // attempt lands on a socket the old server has just unlinked. That
+            // only works with the pause below: the new server needs a moment to
+            // bind, and two attempts fired back to back were measured 0.05 ms
+            // apart.
             Err(Failure::Transport(first)) => {
                 std::thread::sleep(RETRY_BACKOFF);
                 match self.call_once(&id, method, &params) {
@@ -322,17 +326,25 @@ fn dial(socket_path: &Path) -> Result<UnixStream> {
     Ok(stream)
 }
 
-fn socket_path() -> Result<PathBuf> {
+/// Where herdr's socket lives.
+///
+/// The fallback goes through `config::xdg_dir` rather than reading
+/// `XDG_CONFIG_HOME` itself. It used to do the latter, and the two then disagreed
+/// about the same variable: `xdg_dir` ignores a *relative* `XDG_CONFIG_HOME`, as
+/// the spec requires, while this read it and resolved it against the process
+/// cwd — which for a plugin command is the plugin root. `--setup` would edit the
+/// right `config.toml` and then dial a socket somewhere else entirely, and since
+/// a reload that does not succeed rolls the edit back, `--setup` could never
+/// succeed at all.
+fn socket_path() -> PathBuf {
     // herdr injects this into everything it spawns; the fallback exists only
     // for hand invocation from a shell.
     if let Some(path) = config::non_empty_env("HERDR_SOCKET_PATH") {
-        return Ok(PathBuf::from(path));
+        return PathBuf::from(path);
     }
-    let config_home = config::non_empty_env("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| config::non_empty_env("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or("HERDR_SOCKET_PATH is unset and neither XDG_CONFIG_HOME nor HOME is set")?;
-    Ok(config_home.join("herdr").join("herdr.sock"))
+    config::xdg_dir("XDG_CONFIG_HOME", ".config")
+        .join("herdr")
+        .join("herdr.sock")
 }
 
 /// Non-empty string field, since herdr reports absent context as an empty
@@ -427,9 +439,10 @@ fn reduce_snapshot(snapshot: &Value) -> (Vec<Checkout>, usize) {
             text(worktree, "repo_key"),
             text(worktree, "checkout_path"),
         ) else {
-            // A repo we can see but cannot address. Silently dropping it makes
-            // the session look smaller than it is, which is the failure this
-            // count exists to surface.
+            // A repo we can see but cannot address — no `workspace_id` on the
+            // workspace, or no `repo_key`/`checkout_path` on the worktree.
+            // Silently dropping it makes the session look smaller than it is,
+            // which is the failure this count exists to surface.
             skipped += 1;
             continue;
         };
