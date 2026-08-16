@@ -28,7 +28,8 @@ Sidebar setup:
 Other:
   --interval <SECS>   Refresh interval for --watch and --daemon
   --base-ref <REF>    Ref each change set is measured against
-                      (default: origin/HEAD)
+                      (default: the repository's integration ref, probed —
+                      origin/HEAD, then the conventional trunks)
   --version           Print version and exit
   --help              Show this help
 ";
@@ -79,9 +80,13 @@ const VERBS: [&str; 13] = [
 /// An argument that is neither a known verb nor a known option is an error
 /// rather than a shrug: `collide --intervl 5 --once` used to ignore the typo and
 /// run with the default interval.
+///
+/// A *second* verb is an error for the same reason. `collide --disable --enable`
+/// silently ran only the first of the two, which for a pair of verbs that undo
+/// each other is the worst possible way to be wrong.
 fn verb_of(args: &[String]) -> Result<&str> {
     let mut skip_value = false;
-    let mut verb = None;
+    let mut verb: Option<&str> = None;
     for arg in args {
         if skip_value {
             skip_value = false;
@@ -94,8 +99,15 @@ fn verb_of(args: &[String]) -> Result<&str> {
             continue;
         }
         if VERBS.contains(&arg.as_str()) {
-            if verb.is_none() {
-                verb = Some(arg.as_str());
+            match verb {
+                None => verb = Some(arg.as_str()),
+                Some(first) if first == arg.as_str() => {}
+                Some(first) => {
+                    return Err(format!(
+                        "more than one verb given: `{first}` and `{arg}`\n\n{USAGE}"
+                    )
+                    .into())
+                }
             }
             continue;
         }
@@ -180,6 +192,25 @@ mod tests {
         // And once such a flag is genuinely added, it belongs in one of the two
         // lists; nothing else may reach the verb position.
         assert!(!VERBS.contains(&"--force-dirty"));
+    }
+
+    /// `--disable --enable` used to run `--disable` and say nothing about the
+    /// other half, which for two verbs that undo each other is the quietest
+    /// possible way to do the wrong thing.
+    #[test]
+    fn a_second_verb_is_an_error_naming_both() {
+        let err = verb_of(&args(&["--disable", "--enable"])).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("--disable"), "{text}");
+        assert!(text.contains("--enable"), "{text}");
+        assert!(text.contains("more than one verb"), "{text}");
+
+        // Order does not matter, and options between them do not hide it.
+        let err = verb_of(&args(&["--json", "--interval", "5", "--once"])).unwrap_err();
+        assert!(err.to_string().contains("more than one verb"));
+
+        // The same verb twice is a harmless repetition, not a contradiction.
+        assert_eq!(verb(&["--once", "--once"]), "--once");
     }
 
     #[test]
