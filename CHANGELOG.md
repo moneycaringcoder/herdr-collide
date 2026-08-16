@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- An advisory upstream canary. Once a day it resolves one exact herdr `master`
+  commit, fetches the API schema herdr generates from its own types at that
+  revision, and checks that the three methods collide calls, the parameters it
+  sends, and the workspace and worktree fields it reads are all still there. It
+  is scheduled and manual only, it is not a required check, and a red canary is
+  a signal to read herdr's recent changes rather than a reason to hold a pull
+  request.
+
 ## [0.1.0] - 2026-08-16
 
 First release.
