@@ -2,9 +2,10 @@
 //! pushes, and cleanup that survives being killed. See docs/herdr-protocol.md
 //! for the lifecycle contract these verbs implement.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -32,7 +33,20 @@ const STOP_POLL: Duration = Duration::from_millis(25);
 
 /// Cap on `updater.log`. The daemon truncates its own stderr when it grows past
 /// this, so a daemon that fails every cycle for a week cannot fill the disk.
-const MAX_LOG_BYTES: u64 = 1 << 20;
+pub const MAX_LOG_BYTES: u64 = 1 << 20;
+
+/// Which token names this plugin believes herdr is currently rendering, per
+/// workspace.
+///
+/// A *set* per workspace, not one name, because a clear that herdr did not
+/// confirm has to stay on the list. One name per workspace could not express
+/// that: on a severity flip whose clear failed and whose set succeeded, the new
+/// name overwrote the old one, and the old token — which herdr was still
+/// rendering — was never cleared again. Two collide badges on one workspace,
+/// which is precisely what the one-token-per-workspace design exists to prevent.
+/// With a set, the unconfirmed name stays and `badge_plan` reissues its clear on
+/// the next cycle.
+pub type LitTokens = BTreeMap<String, BTreeSet<String>>;
 
 /// The main loop wakes at least this often so a stop request is noticed
 /// promptly even with a long refresh interval.
@@ -69,24 +83,66 @@ pub fn enable(args: &[String]) -> Result<()> {
     spawn_detached(&forwarded)
 }
 
+/// Stops the daemon and clears every badge, reporting everything that went
+/// wrong rather than the first thing.
+///
+/// The sweep is attempted whatever happened to the stop, because clearing the
+/// badges is the part the user actually asked for and the part they can see. An
+/// earlier version returned on the first failure, so exactly when a badge was
+/// most likely to be stranded — an unwritable state dir, a daemon that would not
+/// die — was exactly when nothing tried to clear it.
 pub fn disable() -> Result<()> {
-    // The same lock `--enable` takes, so an `--enable` cannot land in the
-    // middle of the teardown, see the doomed daemon's pid, and decline to
-    // spawn. Released before the sweep, which is slow and does not need it.
-    let stopped = {
-        let _lock = SpawnLock::acquire()?;
+    let mut problems: Vec<String> = Vec::new();
+    let mut daemon_survived = false;
+
+    // The same lock `--enable` takes, so an `--enable` cannot land in the middle
+    // of the teardown, see the doomed daemon's pid, and decline to spawn.
+    // Released before the sweep, which is slow and does not need it.
+    {
+        let _lock = match SpawnLock::acquire() {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                // Without the lock the stop races a concurrent `--enable`, but
+                // stopping unguarded still beats leaving the daemon running.
+                problems.push(format!("{err} (the stop below ran unguarded)"));
+                None
+            }
+        };
 
         // Mark first, so nothing that observes the markers mid-teardown
         // concludes the daemon is still wanted.
         mark_enabled(false);
-        stop_daemon()
-    };
-    stopped?;
+        if let Err(err) = stop_daemon() {
+            daemon_survived = true;
+            problems.push(err.to_string());
+        }
+    }
 
     // Fresh connection, and every current workspace: the daemon may have died
     // without clearing, and it only ever tracked the workspaces it had seen.
-    let mut client = Herdr::connect()?;
-    sweep(&mut client)
+    match Herdr::connect() {
+        Ok(mut client) => {
+            if let Err(err) = sweep(&mut client) {
+                problems.push(err.to_string());
+            } else if daemon_survived {
+                problems.push(
+                    "the badges were cleared, but the updater that would not stop may \
+                           light them again"
+                        .to_string(),
+                );
+            }
+        }
+        Err(err) => problems.push(format!(
+            "could not reach herdr to clear the badges, so any that are lit will stay until \
+             their TTL expires: {err}"
+        )),
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; ").into())
+    }
 }
 
 /// Stops a running daemon and clears its marker, escalating to `SIGKILL`.
@@ -138,6 +194,12 @@ pub fn restore() -> Result<()> {
     if live_pid().is_some() {
         return Ok(());
     }
+    // herdr spawned this hook, so its stderr does reach `herdr plugin log list`
+    // — unlike the daemon's, which is why the daemon repeats the check in its
+    // own loop.
+    if let Some(note) = crate::setup::sidebar_token_note() {
+        eprintln!("collide: {note}");
+    }
     // A startup hook has no user command line to forward; the child falls back
     // to the config file, which is the only durable record of the user's
     // choices anyway.
@@ -148,10 +210,10 @@ pub fn restore() -> Result<()> {
 pub fn run(config: &Config) -> Result<()> {
     write_pid(std::process::id());
 
-    // Which token name is currently lit per workspace. A severity flip has to
+    // Which token names are currently lit per workspace. A severity flip has to
     // clear the old name before setting the new one, or herdr renders two
     // badges at once — the merge patch only touches names we mention.
-    let active: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let active: Arc<Mutex<LitTokens>> = Arc::new(Mutex::new(LitTokens::new()));
     let stopping = Arc::new(AtomicBool::new(false));
     spawn_signal_thread(Arc::clone(&active), Arc::clone(&stopping))?;
 
@@ -174,6 +236,16 @@ pub fn run(config: &Config) -> Result<()> {
     // Notes repeat every cycle for as long as their cause lasts, so only the
     // ones that are new since the last cycle are worth printing.
     let mut reported_notes: Vec<String> = Vec::new();
+
+    // Said at startup as well as from the loop, because the loop's first note
+    // has to wait for a working connection and this one does not depend on herdr
+    // answering. Seeded into `reported_notes` so the first refresh does not
+    // repeat it a second later.
+    if let Some(note) = crate::setup::sidebar_token_note() {
+        eprintln!("collide: {note}");
+        reported_notes.push(note);
+    }
+
     loop {
         if stopping.load(Ordering::SeqCst) {
             // The signal thread owns shutdown from here: it clears state over
@@ -207,22 +279,47 @@ pub fn run(config: &Config) -> Result<()> {
     }
 }
 
-/// Truncates our own stderr when it grows past the cap.
+/// Whether the daemon may truncate the file behind its own stderr.
 ///
-/// Done on the descriptor rather than on the path, so it works regardless of
-/// which file `--enable` handed us, and does nothing at all when stderr is a
-/// terminal or a pipe — a foreground `--daemon` must keep printing to whatever
-/// the user pointed it at.
+/// The identity check is the whole point. An earlier version tested only
+/// "is stderr a regular file?", which is true of `collide --daemon 2>>~/notes.log`
+/// as well as of the log `--enable` opened — so past a megabyte the daemon would
+/// `ftruncate` a file it had never opened and did not own, destroying whatever
+/// else was in it. The doc comment claimed a foreground `--daemon` was safe
+/// because a terminal is exempt; a redirect to a file is not a terminal.
+///
+/// Split out and public so it can be tested against real files, which is the
+/// only way to exercise a device and inode comparison honestly.
+pub fn should_truncate_log(stderr: &fs::Metadata, log: Option<&fs::Metadata>, max: u64) -> bool {
+    // A terminal or a pipe has nothing to truncate.
+    if !stderr.is_file() {
+        return false;
+    }
+    // Only the file `open_log` created for this daemon.
+    let Some(log) = log else {
+        return false;
+    };
+    if stderr.dev() != log.dev() || stderr.ino() != log.ino() {
+        return false;
+    }
+    stderr.len() > max
+}
+
+/// Truncates the daemon's own log when it grows past the cap, and nothing else.
+///
+/// Done on the descriptor rather than on the path so the truncation lands on the
+/// file the daemon is actually writing to, but gated on that descriptor naming
+/// the same file as `config::log_file()`; see [`should_truncate_log`].
 fn cap_log() {
     let fd = std::io::stderr().as_raw_fd();
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+    // Borrowed, never owned: dropping this `File` would close the process's
+    // stderr.
+    let stderr = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) });
+    let Ok(stderr_meta) = stderr.metadata() else {
         return;
-    }
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return;
-    }
-    if u64::try_from(stat.st_size).unwrap_or(0) <= MAX_LOG_BYTES {
+    };
+    let log_meta = fs::metadata(config::log_file()).ok();
+    if !should_truncate_log(&stderr_meta, log_meta.as_ref(), MAX_LOG_BYTES) {
         return;
     }
     unsafe {
@@ -249,7 +346,7 @@ fn cap_log() {
 fn refresh(
     client: &mut Herdr,
     config: &Config,
-    active: &Mutex<HashMap<String, String>>,
+    active: &Mutex<LitTokens>,
     reported_notes: &mut Vec<String>,
 ) -> Result<()> {
     let checkouts = client.checkouts()?;
@@ -264,8 +361,15 @@ fn refresh(
     if skipped > 0 {
         notes.push(format!(
             "{skipped} workspace(s) carried a worktree object this client could not read \
-             (no repo_key or checkout_path); they are missing from the report"
+             (no workspace_id, repo_key or checkout_path); they are missing from the report"
         ));
+    }
+    // Computing a severity herdr has not been told to render is the same as
+    // computing nothing, and it looks like nothing too — a blank cell reads as
+    // clean. Re-checked every cycle rather than only at startup so editing
+    // config.toml takes the note away without a restart.
+    if let Some(note) = crate::setup::sidebar_token_note() {
+        notes.push(note);
     }
 
     for note in new_notes(reported_notes, &notes) {
@@ -314,29 +418,28 @@ pub enum BadgeOp {
 ///   setting it would occupy the row with nothing.
 /// * A workspace that dropped out of the report — closed, or no longer a repo —
 ///   is cleared rather than left to expire.
-pub fn badge_plan(
-    active: &HashMap<String, String>,
-    statuses: &[crate::model::WorkspaceStatus],
-) -> Vec<BadgeOp> {
+pub fn badge_plan(active: &LitTokens, statuses: &[crate::model::WorkspaceStatus]) -> Vec<BadgeOp> {
     let mut ops = Vec::new();
-    let mut wanted: HashMap<&str, &'static str> = HashMap::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
 
     for status in statuses {
         let text = crate::render::badge(status);
         let token = status.severity.token_name();
-        let previous = active.get(&status.workspace_id).map(String::as_str);
         let next = if text.is_empty() { None } else { Some(token) };
+        seen.insert(status.workspace_id.as_str());
 
-        if let Some(previous) = previous {
-            if Some(previous) != next {
+        // Every name believed lit that is not the one we want now. Usually zero
+        // or one; more than one only when a previous cycle's clear was not
+        // confirmed, which is exactly the case that must not be forgotten.
+        if let Some(lit) = active.get(&status.workspace_id) {
+            for token in lit.iter().filter(|lit| Some(lit.as_str()) != next) {
                 ops.push(BadgeOp::Clear {
                     workspace_id: status.workspace_id.clone(),
-                    token: previous.to_string(),
+                    token: token.clone(),
                 });
             }
         }
         if let Some(token) = next {
-            wanted.insert(status.workspace_id.as_str(), token);
             ops.push(BadgeOp::Set {
                 workspace_id: status.workspace_id.clone(),
                 token,
@@ -347,22 +450,19 @@ pub fn badge_plan(
         }
     }
 
-    let mut stale: Vec<(&String, &String)> = active
-        .iter()
-        .filter(|(workspace_id, _)| !wanted.contains_key(workspace_id.as_str()))
-        .filter(|(workspace_id, _)| {
-            // Already cleared above by the severity-flip branch.
-            !statuses.iter().any(|s| &s.workspace_id == *workspace_id)
-        })
-        .collect();
-    // A HashMap iterates in an arbitrary order; sorting keeps the plan
-    // reproducible for both tests and logs.
-    stale.sort();
-    for (workspace_id, token) in stale {
-        ops.push(BadgeOp::Clear {
-            workspace_id: workspace_id.clone(),
-            token: token.clone(),
-        });
+    // Workspaces that dropped out of the report entirely. `LitTokens` is a
+    // `BTreeMap` of `BTreeSet`s, so this order is already deterministic for both
+    // tests and logs.
+    for (workspace_id, lit) in active {
+        if seen.contains(workspace_id.as_str()) {
+            continue;
+        }
+        for token in lit {
+            ops.push(BadgeOp::Clear {
+                workspace_id: workspace_id.clone(),
+                token: token.clone(),
+            });
+        }
     }
 
     ops
@@ -375,7 +475,7 @@ fn push(
     client: &mut Herdr,
     config: &Config,
     statuses: &[crate::model::WorkspaceStatus],
-    active: &Mutex<HashMap<String, String>>,
+    active: &Mutex<LitTokens>,
 ) {
     let ttl_ms = config.ttl_ms();
     let previous = lock(active).clone();
@@ -412,21 +512,19 @@ fn push(
 
 /// What is lit after a cycle's calls have been made.
 ///
-/// Pure, because the rule it encodes is the one that was wrong. The old code
-/// rebuilt this map from the successful sets alone, so a set that failed erased
-/// the record of a token herdr was still rendering under its TTL — and the next
-/// severity flip then emitted no clear for it, lighting two collide tokens on
-/// one workspace, which is exactly what the one-token-per-workspace design
-/// exists to prevent.
+/// Pure, because the rule it encodes is the one that keeps being got wrong.
+/// Twice, now. The first version rebuilt the map from the successful sets alone,
+/// so a set that *failed* erased the record of a token herdr was still rendering
+/// under its TTL. The second kept one name per workspace, so a set that
+/// *succeeded* overwrote the name of a token whose clear had failed — same two
+/// badges on one workspace, reached from the other side.
 ///
-/// The rule now: an entry leaves the map only when herdr confirms a clear, when
-/// the workspace has gone away and taken the badge with it, or when a
-/// successful set replaces it. A call that merely failed changes nothing, so
-/// the next cycle still knows what is lit.
-pub fn next_active(
-    previous: &HashMap<String, String>,
-    results: &[(BadgeOp, PushOutcome)],
-) -> HashMap<String, String> {
+/// The rule, and now the data structure agrees with it: a name leaves a
+/// workspace's set only when herdr confirms its clear, or when the workspace has
+/// gone away and taken its badges with it. A successful set adds a name; it
+/// never removes one. A call that merely failed changes nothing at all, so the
+/// next cycle still knows what is lit and [`badge_plan`] reissues the clear.
+pub fn next_active(previous: &LitTokens, results: &[(BadgeOp, PushOutcome)]) -> LitTokens {
     let mut lit = previous.clone();
     for (op, outcome) in results {
         match op {
@@ -434,12 +532,14 @@ pub fn next_active(
                 workspace_id,
                 token,
             } => {
-                if *outcome != PushOutcome::Failed
-                    && lit
-                        .get(workspace_id)
-                        .is_some_and(|current| current == token)
-                {
-                    lit.remove(workspace_id);
+                if *outcome == PushOutcome::Failed {
+                    continue;
+                }
+                if let Some(names) = lit.get_mut(workspace_id) {
+                    names.remove(token);
+                    if names.is_empty() {
+                        lit.remove(workspace_id);
+                    }
                 }
             }
             BadgeOp::Set {
@@ -448,7 +548,9 @@ pub fn next_active(
                 ..
             } => match outcome {
                 PushOutcome::Done => {
-                    lit.insert(workspace_id.clone(), (*token).to_string());
+                    lit.entry(workspace_id.clone())
+                        .or_default()
+                        .insert((*token).to_string());
                 }
                 // Nothing is lit on a workspace that no longer exists.
                 PushOutcome::Gone => {
@@ -514,10 +616,7 @@ fn sweep(client: &mut Herdr) -> Result<()> {
     Ok(())
 }
 
-fn spawn_signal_thread(
-    active: Arc<Mutex<HashMap<String, String>>>,
-    stopping: Arc<AtomicBool>,
-) -> Result<()> {
+fn spawn_signal_thread(active: Arc<Mutex<LitTokens>>, stopping: Arc<AtomicBool>) -> Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
@@ -534,10 +633,15 @@ fn spawn_signal_thread(
 
 /// Clears everything this daemon lit, over its **own** connection so it never
 /// waits on the main loop's sleep or its in-flight round trip.
-fn shutdown(active: &Mutex<HashMap<String, String>>) {
+fn shutdown(active: &Mutex<LitTokens>) {
     let tracked: Vec<(String, String)> = lock(active)
         .iter()
-        .map(|(workspace_id, token)| (workspace_id.clone(), token.clone()))
+        .flat_map(|(workspace_id, tokens)| {
+            tokens
+                .iter()
+                .map(|token| (workspace_id.clone(), token.clone()))
+                .collect::<Vec<_>>()
+        })
         .collect();
     match Herdr::connect() {
         Ok(mut client) => {
@@ -612,12 +716,17 @@ pub fn forwarded_args(args: &[String]) -> Result<Vec<String>> {
 /// cannot be created, `--enable` refuses rather than spawning a daemon whose pid
 /// it will not be able to record. A daemon nobody can stop is worse than no
 /// daemon, and a permission problem is something the user can fix once told.
-struct SpawnLock {
+///
+/// Public so a test can hold it and watch `--enable` wait. `flock` locks belong
+/// to the open file description rather than to the process, so two acquisitions
+/// in one process contend exactly as two processes would — which is what makes
+/// that test honest rather than a simulation.
+pub struct SpawnLock {
     _file: fs::File,
 }
 
 impl SpawnLock {
-    fn acquire() -> Result<Self> {
+    pub fn acquire() -> Result<Self> {
         let path = config::lock_file();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {

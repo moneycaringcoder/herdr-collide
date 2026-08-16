@@ -313,6 +313,28 @@ handled:
   install. Always targeting the last row split collide's badges across two
   sidebar rows the user never asked to have split.
 
+### An upgrade can leave a severity with nowhere to render
+
+herdr renders a plugin token only if `config.toml` names it, so an installation
+that ran `--setup` before a token existed will show **nothing** for the severity
+that token carries. That is worse than it sounds when the new severity outranks
+an old one: a workspace that used to show an overlap badge now computes
+`Unknown`, correctly clears `$collide_overlap`, correctly sets `$collide_unknown`
+— and the cell goes blank, which reads as clean. The severity added to stop
+things disappearing silently disappears silently.
+
+Nothing on the wire reveals this: `report_metadata` accepts any token name and
+`server.reload_config` answers `applied` for a file that names none of ours. So
+the daemon reads `config.toml` itself — at startup, in `--restore`, and once per
+cycle so an edit takes the note away without a restart — and emits a note naming
+the missing tokens and the setup action.
+
+Compared against the tokens `--setup` writes, **not** `Severity::ALL_TOKENS`:
+`collide_clean` is in `ALL_TOKENS` because the disable sweep clears it
+defensively, but it is never *set* — a clean workspace clears its token instead —
+so a row naming it could never render anything. Including it would make the note
+fire on every correctly configured installation, which is the fastest way to
+teach someone to ignore it.
 
 ## Daemon lifecycle
 
@@ -353,7 +375,7 @@ Verbs:
 | verb | behaviour |
 |---|---|
 | `--enable` | take the lock, mark enabled, no-op if a live pid exists, else spawn detached |
-| `--disable` | take the lock, mark disabled **first**, request stop, **await exit, escalating to `SIGKILL`**, clear the marker, release the lock, then sweep every current workspace over a fresh connection |
+| `--disable` | take the lock, mark disabled **first**, request stop, **await exit, escalating to `SIGKILL`**, clear the marker, release the lock, then sweep every current workspace over a fresh connection — **always**, and report every problem rather than the first |
 | `--toggle` | disable if live, else enable |
 | `--restore` | silent no-op unless the enabled marker is set and no daemon is live |
 
@@ -386,18 +408,39 @@ badge that never appears with nothing in any log is the worst outcome this
 plugin has.
 
 The child's stdout and stderr go to `updater.log` in the state dir, truncated at
-spawn and capped at 1 MiB (the daemon truncates its own stderr when it grows
-past that, and does nothing at all when stderr is a terminal, so a foreground
-`--daemon` still prints where the user pointed it).
+spawn and capped at 1 MiB.
+
+The cap must check **which file** it is about to truncate, not just whether it
+is a file. `--daemon` is a verb a user can type, so `collide --daemon
+2>>~/notes.log` points stderr at a regular file that this plugin never opened;
+testing only "is stderr a regular file?" meant that past a megabyte the daemon
+would empty it. Compare the descriptor's device and inode against
+`state_dir()/updater.log` and truncate only on a match — a terminal and a pipe
+fall out of that test for free.
 
 ### What is lit, and what a failed push means
 
-The daemon tracks one token name per workspace. That record may only be dropped
-when herdr **confirms** a clear, or when the workspace is gone
-(`workspace_not_found`). Rebuilding it from the successful sets alone loses the
-record of a token herdr is still rendering under its TTL, and the next severity
-flip then emits no clear for it — two collide tokens lit on one workspace, which
-is the exact failure the one-token-per-workspace design exists to prevent.
+The daemon tracks the token names it believes herdr is rendering, **as a set per
+workspace**. A name may only leave that set when herdr *confirms* its clear, or
+when the workspace is gone (`workspace_not_found`). A successful set adds a
+name; it never removes one.
+
+One name per workspace is not enough to express the rule, and this took two
+attempts to get right — both failing the same way, from opposite sides:
+
+- Rebuilding the record from the successful **sets** alone loses the record of a
+  token herdr is still rendering under its TTL, so the next severity flip emits
+  no clear for it.
+- Keeping one name and overwriting it on a successful set loses the record of a
+  token whose **clear** failed. On a flip the plan is `[Clear(old), Set(new)]`;
+  if the clear does not take and the set does, herdr is rendering both, and
+  overwriting means nothing ever clears the old one.
+
+Either way: two collide tokens lit on one workspace, which is the exact failure
+the one-token-per-workspace design exists to prevent. With a set, an unconfirmed
+name stays on the list and the next plan reissues its clear. A workspace that
+drops out of the report has *every* name it holds cleared, not just the last one
+recorded.
 
 ## Plugin execution environment
 
