@@ -403,7 +403,7 @@ impl Fixture {
     pub fn superproject_with_submodule(&self, name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let source = self.root.join(format!("{name}-source"));
         self.init_repo(&source);
-        self.write(&source, "payload.txt", "submodule payload\n");
+        self.write(&source, "payload.txt", "alpha\nbeta\ngamma\n");
         self.commit_all(&source, "submodule base");
 
         let (code, _stdout, stderr) = self.try_git(

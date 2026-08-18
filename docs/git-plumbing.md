@@ -534,20 +534,51 @@ worktree per cycle: `rev-parse --show-toplevel` and
 `config --name-only --get-regexp '^filter\.'`. Each is in the 1–2 ms band with
 `rev-parse`, so the budget above is unchanged in any way that matters.
 
+Depth-one submodule comparison was measured separately on the development
+workstation with one dirty direct submodule shared by two superproject
+worktrees. After one warm-up, 30 complete `gather_for` cycles averaged
+**616.41 ms/cycle**. That two-worktree, one-pair measurement includes both
+outer change-set collection and snapshots, two nested snapshots, and one outer
+plus one nested merge prediction, and consumes about 12.3 % of the default 5 s
+interval in that configuration. It is not a constant cost per submodule: with
+W worktrees sharing the submodule, the nested snapshot component runs W times
+per cycle, while `merge-base`, `rev-parse`, and `merge-tree` run for each of the
+W(W−1)/2 nested pairs. The experiment did not time those components separately,
+so its aggregate percentage must not be extrapolated to larger W.
+
+Nested commands use a repository-specific object view. While snapshotting one
+nested checkout the exact write-related environment is:
+
+- `GIT_OBJECT_DIRECTORY=<predictor scratch>/submodule-<seq>/odb`
+- `GIT_ALTERNATE_OBJECT_DIRECTORIES=<nested common dir>/objects`
+- `GIT_INDEX_FILE=<predictor scratch>/submodule-index-<seq>`
+
+For the nested `merge-base`, `rev-parse`, and `merge-tree`, the object directory
+is the left nested side's scratch ODB and the alternates list is the left
+nested common-dir object store, the right nested scratch ODB, and the right
+nested common-dir object store, joined with the platform path separator. Thus
+the command can read both independent clones and both snapshots while every
+object it writes still lands under predictor scratch. `run_git` also sets
+`GIT_OPTIONAL_LOCKS=0` and clears inherited repository-targeting variables for
+every one of these commands.
+
 ## Known limitations
 
-- **Dirty submodule contents can make an otherwise clean verdict unknown.**
-  `status` reports the submodule as one changed path (`1 .M S.MU … sub`), and
-  the parser keeps the commit, modified-content and untracked-content flags.
-  The snapshot's `add -A` still records only the submodule's *committed*
-  gitlink, so modified or untracked content below it is not compared. When
-  merge-tree finds no gitlink conflict, the path reports `unknown` rather than
-  claiming a clean overlap. The `C` flag is independent: a changed recorded
-  pointer gives merge-tree real gitlinks to compare, and any conflict it finds
-  stands even on an `S C M U` record. The directory also line-counts as zero,
-  so work inside it is invisible to the runaway thresholds. Comparing
-  submodule contents means treating it as a repository in its own right, which
-  remains a larger change.
+- **Dirty direct submodules are compared to depth one.** `status` still reports
+  the submodule as one superproject-relative changed path
+  (`1 .M S.MU … sub`), but the sequential prime phase also opens each direct
+  nested checkout as a repository, resolves its common dir and HEAD, records
+  dirty/unmerged state, and snapshots dirty contents through a scratch index.
+  The immutable prediction phase then runs a nested merge. A clean nested merge
+  earns `overlap`; a nested conflict makes the superproject gitlink path
+  `conflict`, with nested conflicting paths carried only in the detail note so
+  path scopes never mix. A missing or uninitialised checkout, unborn or broken
+  nested HEAD, timeout, unrelated history, or any other failed nested command
+  leaves the verdict `unknown`. A changed recorded gitlink is still compared by
+  the outer merge and any outer conflict remains authoritative. Submodules
+  inside the direct submodule remain gitlinks and are not recursively opened.
+  Work below a submodule still line-counts as zero, so it remains invisible to
+  the runaway thresholds.
 - **A stat-dirty but content-identical filtered path can be reported as
   conflicting.** See "What that costs, and the one case it gets wrong".
 
