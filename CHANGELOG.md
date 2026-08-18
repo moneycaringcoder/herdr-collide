@@ -35,6 +35,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FileVerdict` variant through an exhaustive match with no wildcard, so a new
   variant stops compiling rather than quietly widening the output.
 
+### Tests
+
+- Fixtures for the two repository layouts that were previously only assumed to
+  work: `--separate-git-dir`, and a superproject with a submodule. Repository
+  identity across linked worktrees was an observation rather than a guarantee,
+  and these pin it: every worktree of one repository resolves to the same
+  canonicalized common directory, a submodule keeps a repository identity of its
+  own and is never paired with its superproject, and the resolved working-tree
+  roots agree with `git rev-parse --show-toplevel` in both layouts.
+- The read-only fingerprint now covers a submodule's own repository — its index
+  bytes, refs, reflogs and object paths — and not just the superproject's. A
+  submodule is a second place a write could land, and it was outside the
+  assertion that the plugin changes nothing.
+
+### Known issues
+
+- The fixtures found the case the layout work existed to look for: rule 1 of the
+  repository-root agreement joins `.git` to a worktree's top level and compares
+  the canonicalized result against the repository key, but under
+  `--separate-git-dir` that `.git` is a gitfile naming the store rather than the
+  store itself, so the exact rule never fires and the answer falls through to the
+  deterministic member fallback. The reported root is still correct for the
+  layouts tested, and it is correct by fallback rather than by the rule that was
+  written to decide it. The fix is deliberately not in this change.
+
 ## [0.1.0] - 2026-08-16
 
 First release.
