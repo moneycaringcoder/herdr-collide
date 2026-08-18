@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use collide::collide::gather_for;
+use collide::collide::{gather_for, why_for};
 use collide::config::Config;
 use collide::git::{self, Predictor};
 use collide::model::Checkout;
@@ -460,6 +460,28 @@ fn the_full_pipeline_changes_nothing_in_the_repository() {
 
     let notes = run_full_pipeline(&fixture, &worktrees);
     assert!(notes.is_empty(), "pipeline reported problems: {notes:?}");
+
+    let after = fingerprint(&fixture, &worktrees);
+    assert_unchanged(&before, &after);
+    assert_no_scratch_leftovers();
+}
+
+#[test]
+fn why_reads_conflict_hunks_without_changing_the_repository() {
+    let _serialised = scratch_guard();
+    let fixture = Fixture::new("why-read-only");
+    let pair = fixture.committed_conflict_pair();
+    let worktrees = vec![pair.0, pair.1];
+    let before = fingerprint(&fixture, &worktrees);
+
+    let report = why_for(
+        checkouts_for(&fixture, &worktrees),
+        &config(),
+        "conflict.txt",
+    )
+    .expect("why report");
+    assert!(!report.prediction_failed, "{}", report.text);
+    assert!(report.text.contains("<<<<<<<"), "{}", report.text);
 
     let after = fingerprint(&fixture, &worktrees);
     assert_unchanged(&before, &after);

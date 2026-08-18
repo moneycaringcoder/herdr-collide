@@ -359,7 +359,7 @@ fn probe(dir: &Path, args: &[&str], timeout: Duration) -> Result<Option<String>>
 /// The cost, unchanged: a path that had to be replaced no longer addresses its
 /// file on disk, so an untracked file named that way is line-counted as zero.
 /// That is a fair trade against a pane that a filename can hijack.
-fn lossy(bytes: &[u8]) -> String {
+pub(crate) fn lossy(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     // `from_utf8_lossy` borrows iff the input was already valid UTF-8.
     let invalid_utf8 = matches!(text, Cow::Owned(_));
@@ -377,6 +377,17 @@ fn lossy(bytes: &[u8]) -> String {
         })
         .collect();
     format!("{replaced}~{:08x}", fnv1a(bytes))
+}
+
+/// Whether a path is the safe display surrogate produced by [`lossy`] rather
+/// than an addressable tree path.
+fn is_lossy_display_path(path: &str) -> bool {
+    let Some((prefix, digest)) = path.rsplit_once('~') else {
+        return false;
+    };
+    prefix.contains(char::REPLACEMENT_CHARACTER)
+        && digest.len() == 8
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// FNV-1a, 32-bit. Not a hash with any security property — it only has to be
@@ -1143,6 +1154,13 @@ fn count_lines_on_disk(path: &Path) -> u64 {
 // Conflict prediction
 // ---------------------------------------------------------------------------
 
+/// Maximum conflicted blob size `--why` will read into memory.
+///
+/// Eight MiB is deliberately generous beside the 200-line, 160-column display
+/// limit, while keeping one pathological generated file from consuming the
+/// memory of the editor process this plugin runs alongside.
+pub const WHY_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Verdict for one pair of checkouts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PairPrediction {
@@ -1150,12 +1168,22 @@ pub struct PairPrediction {
     /// was not requested (a rename can conflict on a path neither change set
     /// listed under the same name).
     pub verdicts: Vec<(String, bool)>,
+    /// Paths git itself named as conflicted, before the pair-level fallback
+    /// marks requested paths conflicted for a directory-rename conflict.
+    pub conflicted_paths: Vec<String>,
+    /// Tree written by the exact merge that produced these verdicts. Its
+    /// objects live in the predictor's redirected object store.
+    pub merged_tree: String,
     /// True when a single merge base had to be forced although more than one
     /// exists, so the answer is an approximation of what a real merge would do.
     pub approximate: bool,
     /// True when one side has a merge in progress: its snapshot contains
     /// conflict markers, so the prediction is advisory only.
     pub advisory: bool,
+    /// Which side made [`Self::advisory`] true, retained so explanations can
+    /// name the worktree whose own conflict markers are in the snapshot.
+    pub left_advisory: bool,
+    pub right_advisory: bool,
     /// merge-tree's exit status for the pair as a whole. Authoritative:
     /// git documents that a merge can conflict without any individual file
     /// appearing in the conflicted-file list.
@@ -1431,6 +1459,8 @@ impl Predictor {
 
         let mut prediction = PairPrediction {
             advisory: l.unmerged || r.unmerged,
+            left_advisory: l.unmerged,
+            right_advisory: r.unmerged,
             ..Default::default()
         };
 
@@ -1485,7 +1515,9 @@ impl Predictor {
         }
 
         let parsed = parse_merge_tree_z(&named.stdout);
+        prediction.merged_tree = parsed.tree;
         prediction.conflict_types = parsed.conflict_types;
+        prediction.conflicted_paths = parsed.conflicted.clone();
         prediction.pair_conflict = named.code == Some(1);
         let conflicted: BTreeSet<&String> = parsed.conflicted.iter().collect();
 
@@ -1509,6 +1541,97 @@ impl Predictor {
             }
         }
         Ok(prediction)
+    }
+
+    /// Reads one path from the tree written by [`Self::predict_pair`].
+    ///
+    /// This deliberately addresses the retained tree instead of running the
+    /// merge again: a second merge could disagree with the verdict being
+    /// explained. The same redirected object store used by `merge-tree` keeps
+    /// both the user's ODB read-only and the temporary merged blobs visible.
+    ///
+    /// Object kind and size are checked before content is requested. Unlike
+    /// every other command in this module, blob content is arbitrary user data;
+    /// letting `run_git` drain it first would make the display cap irrelevant
+    /// to peak memory.
+    pub fn merged_blob(&self, checkout: &Path, tree: &str, path: &str) -> Result<Vec<u8>> {
+        let side = self.side(checkout)?;
+        if tree.is_empty() {
+            return Err("prediction produced no merged tree".into());
+        }
+        if is_lossy_display_path(path) {
+            return Err(format!(
+                "git reported `{path}` with bytes that are not representable as a tree path"
+            )
+            .into());
+        }
+        let object = format!("{tree}:{path}");
+        let env = self.odb_env(&side.common_dir);
+
+        let kind = run_git(
+            checkout,
+            &["cat-file", "-t", object.as_str()],
+            &env,
+            self.timeout,
+        )?;
+        if !kind.ok() {
+            return Err(format!(
+                "cat-file could not inspect `{}` in the predicted tree: {}",
+                lossy(path.as_bytes()),
+                kind.stderr_text()
+            )
+            .into());
+        }
+        let kind = kind.stdout_trimmed();
+        if kind != "blob" {
+            return Err(format!(
+                "`{}` is a {kind}, not a blob, in the predicted tree",
+                lossy(path.as_bytes())
+            )
+            .into());
+        }
+
+        let size = run_git(
+            checkout,
+            &["cat-file", "-s", object.as_str()],
+            &env,
+            self.timeout,
+        )?;
+        if !size.ok() {
+            return Err(format!(
+                "cat-file could not size `{}` in the predicted tree: {}",
+                lossy(path.as_bytes()),
+                size.stderr_text()
+            )
+            .into());
+        }
+        let size = size
+            .stdout_trimmed()
+            .parse::<u64>()
+            .map_err(|err| format!("cat-file returned an invalid blob size: {err}"))?;
+        if size > WHY_BLOB_MAX_BYTES {
+            return Err(format!(
+                "predicted blob is {size} bytes; --why will not read blobs above \
+                 {WHY_BLOB_MAX_BYTES} bytes"
+            )
+            .into());
+        }
+
+        let out = run_git(
+            checkout,
+            &["cat-file", "blob", object.as_str()],
+            &env,
+            self.timeout,
+        )?;
+        if !out.ok() {
+            return Err(format!(
+                "cat-file could not read `{}` from predicted tree: {}",
+                lossy(path.as_bytes()),
+                out.stderr_text()
+            )
+            .into());
+        }
+        Ok(out.stdout)
     }
 
     /// Builds the trailing merge-tree arguments and reports whether a single

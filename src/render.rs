@@ -44,6 +44,11 @@ pub const DEFAULT_COLUMNS: usize = 80;
 /// emits a line wider than the width it was given.
 pub const MIN_COLUMNS: usize = 20;
 
+/// Maximum amount of a conflicted blob `--why` will put on a terminal.
+pub const CONTENT_MAX_LINES: usize = 200;
+/// Maximum display width of each line emitted by `--why`.
+pub const CONTENT_MAX_COLUMNS: usize = 160;
+
 const CONFLICT_MARK: &str = "\u{2718}"; // ✘
 const OVERLAP_MARK: &str = "\u{29c9}"; // ⧉
 const RUNAWAY_MARK: &str = "\u{26a0}"; // ⚠
@@ -838,6 +843,113 @@ pub fn truncate_right(text: &str, max: usize) -> String {
     out
 }
 
+/// Makes arbitrary blob content safe and bounded for terminal output.
+///
+/// Newlines and tabs are structure and remain intact. Every other C0/C1
+/// control scalar is replaced, invalid UTF-8 becomes the replacement
+/// character, and both dimensions are capped with an explicit notice.
+pub fn sanitize_content(bytes: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(bytes);
+    let mut safe = String::with_capacity(decoded.len());
+    for ch in decoded.chars() {
+        let code = ch as u32;
+        if ch == '\n' || ch == '\t' || !(code <= 0x1f || (0x7f..=0x9f).contains(&code)) {
+            safe.push(ch);
+        } else {
+            safe.push('\u{fffd}');
+        }
+    }
+
+    let mut out = String::new();
+    let mut lines = safe.split_inclusive('\n');
+    let mut width_cuts = 0usize;
+    for _ in 0..CONTENT_MAX_LINES {
+        let Some(segment) = lines.next() else {
+            break;
+        };
+        let (line, newline) = match segment.strip_suffix('\n') {
+            Some(line) => (line, true),
+            None => (segment, false),
+        };
+        let (line, cut) = cap_content_line(line, CONTENT_MAX_COLUMNS);
+        width_cuts += usize::from(cut);
+        out.push_str(&line);
+        if newline {
+            out.push('\n');
+        }
+    }
+    let omitted = lines.count();
+
+    if omitted > 0 || width_cuts > 0 {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("[collide: output truncated");
+        if omitted > 0 {
+            out.push_str(&format!(": {omitted} more line(s)"));
+        }
+        if width_cuts > 0 {
+            let separator = if omitted > 0 { "; " } else { ": " };
+            out.push_str(&format!(
+                "{separator}{width_cuts} line(s) exceeded {CONTENT_MAX_COLUMNS} columns"
+            ));
+        }
+        out.push_str("]\n");
+    }
+    out
+}
+
+fn cap_content_line(line: &str, max: usize) -> (String, bool) {
+    let line_units = units(line);
+    let mut width = 0usize;
+    for unit in &line_units {
+        width += content_unit_columns(unit, width);
+    }
+    if width <= max {
+        return (line.to_string(), false);
+    }
+    if max == 0 {
+        return (String::new(), true);
+    }
+    if max == 1 {
+        return (ELLIPSIS.to_string(), true);
+    }
+
+    let budget = max - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for unit in line_units {
+        let columns = content_unit_columns(&unit, used);
+        if used + columns > budget {
+            break;
+        }
+        out.push_str(unit.text);
+        used += columns;
+    }
+    out.push(ELLIPSIS);
+    (out, true)
+}
+
+/// Display width of one sanitizer unit at a given starting column.
+///
+/// `units` deliberately absorbs trailing zero-width scalars, and tabs are
+/// control scalars. Counting tabs in the whole unit keeps adjacent runs honest
+/// without changing the general-purpose width rules used by the pane.
+fn content_unit_columns(unit: &Unit<'_>, start: usize) -> usize {
+    let mut end = start + unit.columns;
+    for _ in unit.text.bytes().filter(|byte| *byte == b'\t') {
+        end += 8 - (end % 8);
+    }
+    end - start
+}
+
+#[cfg(test)]
+fn content_line_columns(line: &str) -> usize {
+    units(line)
+        .iter()
+        .fold(0, |width, unit| width + content_unit_columns(unit, width))
+}
+
 fn push_line(out: &mut String, line: &str, width: usize) {
     let trimmed = line.trim_end();
     out.push_str(&truncate_right(trimmed, width));
@@ -1029,4 +1141,60 @@ fn env_terminal_size() -> (usize, usize) {
         .filter(|r| *r > 0)
         .unwrap_or(24);
     (columns, rows)
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::{
+        cap_content_line, content_line_columns, display_width, sanitize_content,
+        CONTENT_MAX_COLUMNS, CONTENT_MAX_LINES,
+    };
+
+    #[test]
+    fn content_sanitizer_neutralises_controls_but_preserves_structure() {
+        let input = "one\tcell\nescape:\u{1b}[2J nul:\0 del:\u{7f} c1:\u{85} end\n";
+        let rendered = sanitize_content(input.as_bytes());
+        assert_eq!(
+            rendered,
+            "one\tcell\nescape:\u{fffd}[2J nul:\u{fffd} del:\u{fffd} c1:\u{fffd} end\n"
+        );
+    }
+
+    #[test]
+    fn content_sanitizer_survives_invalid_utf8() {
+        assert_eq!(sanitize_content(b"left\xffright\n"), "left\u{fffd}right\n");
+    }
+
+    #[test]
+    fn content_sanitizer_caps_lines_and_announces_the_cut() {
+        let input = "line\n".repeat(CONTENT_MAX_LINES + 2);
+        let rendered = sanitize_content(input.as_bytes());
+        assert_eq!(rendered.matches("line\n").count(), CONTENT_MAX_LINES);
+        assert!(rendered.contains("output truncated: 2 more line(s)"));
+    }
+
+    #[test]
+    fn content_sanitizer_caps_width_and_announces_the_cut() {
+        let input = "x".repeat(CONTENT_MAX_COLUMNS + 20);
+        let rendered = sanitize_content(input.as_bytes());
+        let first = rendered.lines().next().expect("content line");
+        assert_eq!(display_width(first), CONTENT_MAX_COLUMNS);
+        assert!(first.ends_with('\u{2026}'));
+        assert!(rendered.contains(&format!("1 line(s) exceeded {CONTENT_MAX_COLUMNS} columns")));
+    }
+
+    #[test]
+    fn adjacent_tabs_are_measured_at_each_tab_stop() {
+        let (rendered, cut) = cap_content_line("\t\tcode", 16);
+        assert!(cut, "two tabs plus text occupy 20 columns");
+        assert!(content_line_columns(&rendered) <= 16, "{rendered:?}");
+    }
+
+    #[test]
+    fn content_sanitizer_caps_a_line_made_only_of_tabs() {
+        let rendered = sanitize_content("\t".repeat(40).as_bytes());
+        let first = rendered.lines().next().expect("content line");
+        assert!(content_line_columns(first) <= CONTENT_MAX_COLUMNS);
+        assert!(rendered.contains(&format!("1 line(s) exceeded {CONTENT_MAX_COLUMNS} columns")));
+    }
 }

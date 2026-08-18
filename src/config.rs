@@ -254,7 +254,7 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
 ///
 /// `daemon::forwarded_args` recognises the same two spellings, so an argument
 /// survives being handed to the detached child.
-fn value_arg(args: &[String], name: &str) -> Result<Option<String>> {
+pub fn value_arg(args: &[String], name: &str) -> Result<Option<String>> {
     let flag = format!("{name}=");
     let mut found = None;
     let mut rest = args.iter();
