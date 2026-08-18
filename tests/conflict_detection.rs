@@ -454,6 +454,68 @@ fn distinct_trees(checkouts: &[Checkout]) -> WorkTrees {
     trees
 }
 
+fn pairing_order(report: &Report) -> Vec<(String, String)> {
+    report
+        .pairings
+        .iter()
+        .map(|pairing| {
+            (
+                pairing.left_workspace_id.clone(),
+                pairing.right_workspace_id.clone(),
+            )
+        })
+        .collect()
+}
+
+fn triaged_report() -> (Report, Vec<(String, ChangeSet)>) {
+    let checkouts = vec![
+        checkout("overlap-a", Path::new("/tmp/overlap-a"), "/repo/.git"),
+        checkout("overlap-b", Path::new("/tmp/overlap-b"), "/repo/.git"),
+        checkout("unknown-a", Path::new("/tmp/unknown-a"), "/repo/.git"),
+        checkout("unknown-b", Path::new("/tmp/unknown-b"), "/repo/.git"),
+        checkout("conflict-a", Path::new("/tmp/conflict-a"), "/repo/.git"),
+        checkout("conflict-b", Path::new("/tmp/conflict-b"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("overlap-a".to_string(), change_set(&["overlap-only.txt"])),
+        ("overlap-b".to_string(), change_set(&["overlap-only.txt"])),
+        ("unknown-a".to_string(), change_set(&["unknown-only.txt"])),
+        ("unknown-b".to_string(), change_set(&["unknown-only.txt"])),
+        ("conflict-a".to_string(), change_set(&["conflict-only.txt"])),
+        ("conflict-b".to_string(), change_set(&["conflict-only.txt"])),
+    ];
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    apply_predictions(
+        &mut report,
+        &[
+            PairVerdicts {
+                left_workspace_id: "overlap-a".to_string(),
+                right_workspace_id: "overlap-b".to_string(),
+                verdicts: vec![("overlap-only.txt".to_string(), false)],
+                failed: false,
+                approximate: false,
+            },
+            PairVerdicts {
+                left_workspace_id: "unknown-a".to_string(),
+                right_workspace_id: "unknown-b".to_string(),
+                verdicts: Vec::new(),
+                failed: true,
+                approximate: false,
+            },
+            PairVerdicts {
+                left_workspace_id: "conflict-a".to_string(),
+                right_workspace_id: "conflict-b".to_string(),
+                verdicts: vec![("conflict-only.txt".to_string(), true)],
+                failed: false,
+                approximate: false,
+            },
+        ],
+        &changes,
+        &config(),
+    );
+    (report, changes)
+}
+
 /// Exactly what `gather_for` builds: every checkout's top level resolved from
 /// disk.
 fn resolved_trees(checkouts: &[Checkout]) -> WorkTrees {
@@ -675,6 +737,163 @@ fn a_failed_prediction_leaves_the_verdict_unknown() {
     );
 
     assert_eq!(report.pairings[0].shared[0].verdict, FileVerdict::Unknown);
+}
+
+#[test]
+fn report_pairings_are_ranked_worst_first_after_predictions() {
+    let (report, _) = triaged_report();
+    let order = pairing_order(&report);
+
+    // A missing prediction must not be buried under a known-clean overlap.
+    assert_eq!(
+        order,
+        vec![
+            ("conflict-a".to_string(), "conflict-b".to_string()),
+            ("unknown-a".to_string(), "unknown-b".to_string()),
+            ("overlap-a".to_string(), "overlap-b".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn equal_pairing_ranks_are_deterministic_and_tied_by_workspace_id() {
+    let checkouts = vec![
+        checkout("z-left", Path::new("/tmp/z-left"), "/repo/.git"),
+        checkout("z-right", Path::new("/tmp/z-right"), "/repo/.git"),
+        checkout("a-left", Path::new("/tmp/a-left"), "/repo/.git"),
+        checkout("a-right", Path::new("/tmp/a-right"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("z-left".to_string(), change_set(&["z.txt"])),
+        ("z-right".to_string(), change_set(&["z.txt"])),
+        ("a-left".to_string(), change_set(&["a.txt"])),
+        ("a-right".to_string(), change_set(&["a.txt"])),
+    ];
+    let no_prediction = Config {
+        predict_conflicts: false,
+        ..Config::default()
+    };
+
+    let first = analyse(
+        &checkouts,
+        &changes,
+        &distinct_trees(&checkouts),
+        &no_prediction,
+    );
+    // Workspace enumeration can change between cycles, so permute whole
+    // two-side blocks to prove equal ranks do not inherit insertion order.
+    let permuted_checkouts = vec![
+        checkouts[2].clone(),
+        checkouts[3].clone(),
+        checkouts[0].clone(),
+        checkouts[1].clone(),
+    ];
+    let permuted_changes = vec![
+        changes[2].clone(),
+        changes[3].clone(),
+        changes[0].clone(),
+        changes[1].clone(),
+    ];
+    let second = analyse(
+        &permuted_checkouts,
+        &permuted_changes,
+        &distinct_trees(&permuted_checkouts),
+        &no_prediction,
+    );
+    let first_order = pairing_order(&first);
+
+    assert_eq!(first_order, pairing_order(&second));
+    assert_eq!(
+        first_order,
+        vec![
+            ("a-left".to_string(), "a-right".to_string()),
+            ("z-left".to_string(), "z-right".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn json_pairings_follow_the_model_ranking() {
+    // `triaged_report` constructs overlap, unknown, then conflict: deliberately the
+    // reverse of the expected ranked order so this assertion detects missing sorting.
+    let (report, changes) = triaged_report();
+    let json = json_report(&Cycle {
+        report,
+        changes,
+        notes: Vec::new(),
+    });
+    let json_order: Vec<(String, String)> = json["pairings"]
+        .as_array()
+        .expect("pairings array")
+        .iter()
+        .map(|pairing| {
+            (
+                pairing["left"].as_str().expect("left id").to_string(),
+                pairing["right"].as_str().expect("right id").to_string(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        json_order,
+        vec![
+            ("conflict-a".to_string(), "conflict-b".to_string()),
+            ("unknown-a".to_string(), "unknown-b".to_string()),
+            ("overlap-a".to_string(), "overlap-b".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn analyse_ranks_pairings_when_prediction_is_disabled() {
+    // The one-, two-, and three-path pairings are deliberately constructed in
+    // reverse ranked order so the assertion detects missing sorting.
+    let checkouts = vec![
+        checkout("three-a", Path::new("/tmp/three-a"), "/repo/.git"),
+        checkout("three-b", Path::new("/tmp/three-b"), "/repo/.git"),
+        checkout("two-a", Path::new("/tmp/two-a"), "/repo/.git"),
+        checkout("two-b", Path::new("/tmp/two-b"), "/repo/.git"),
+        checkout("one-a", Path::new("/tmp/one-a"), "/repo/.git"),
+        checkout("one-b", Path::new("/tmp/one-b"), "/repo/.git"),
+    ];
+    let changes = vec![
+        (
+            "one-a".to_string(),
+            change_set(&["one.rs", "two.rs", "three.rs"]),
+        ),
+        (
+            "one-b".to_string(),
+            change_set(&["one.rs", "two.rs", "three.rs"]),
+        ),
+        ("two-a".to_string(), change_set(&["four.rs", "five.rs"])),
+        ("two-b".to_string(), change_set(&["four.rs", "five.rs"])),
+        ("three-a".to_string(), change_set(&["six.rs"])),
+        ("three-b".to_string(), change_set(&["six.rs"])),
+    ];
+    let no_prediction = Config {
+        predict_conflicts: false,
+        ..Config::default()
+    };
+
+    let report = analyse(
+        &checkouts,
+        &changes,
+        &distinct_trees(&checkouts),
+        &no_prediction,
+    );
+
+    assert_eq!(
+        pairing_order(&report),
+        vec![
+            ("one-a".to_string(), "one-b".to_string()),
+            ("two-a".to_string(), "two-b".to_string()),
+            ("three-a".to_string(), "three-b".to_string()),
+        ]
+    );
+    assert!(report.pairings.iter().all(|pairing| pairing
+        .shared
+        .iter()
+        .all(|file| file.verdict == FileVerdict::Overlap)));
 }
 
 #[test]
