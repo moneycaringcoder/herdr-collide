@@ -63,6 +63,7 @@ fn json_schema_keys_are_exact() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), true)],
+            conflict_types_by_path: Default::default(),
             failed: false,
             approximate: false,
         }],

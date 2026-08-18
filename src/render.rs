@@ -423,16 +423,30 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
             } else {
                 FILE_PREFIX_COLUMNS
             };
-            let path_budget = width.saturating_sub(prefix_columns).max(4);
             for file in files {
                 if file.verdict == FileVerdict::Unknown {
                     saw_unknown = true;
                 }
                 let (mark, word) = verdict_marks(file.verdict);
+                let annotation = if narrow {
+                    None
+                } else {
+                    file.conflict_type
+                        .as_deref()
+                        .and_then(git::conflict_type_annotation)
+                };
+                let annotation_columns = annotation
+                    .map(|label| display_width(label) + 4)
+                    .unwrap_or(0);
+                let path_budget = width
+                    .saturating_sub(prefix_columns + annotation_columns)
+                    .max(4);
                 // Paths truncate from the LEFT: the tail is the informative half.
                 let path = truncate_left(&file.path, path_budget);
                 let line = if narrow {
                     format!("    {mark}  {path}")
+                } else if let Some(annotation) = annotation {
+                    format!("    {mark} {word:<8}  {path}  ({annotation})")
                 } else {
                     format!("    {mark} {word:<8}  {path}")
                 };

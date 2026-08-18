@@ -41,6 +41,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   probe chain does, so a stale `origin/main` gives an answer about where `main` *was* —
   which is why the pane names the ref rather than refreshing it. A fetch would also
   write to the object store and refs, which this plugin may not do.
+- A conflict git attributes to a rename now says so. `merge-tree` reports a
+  machine-stable conflict type per message record, and the parser discarded which
+  paths each type applied to, so the only evidence available was a flat per-pair set
+  of tokens. The association is kept now, and a conflicting file that git named in a
+  `rename/rename`, `rename/delete` or directory-rename record is marked `(rename)` in
+  the detail pane. Narrow panes drop the annotation before the path, as they already
+  drop the verdict word.
+
+### Fixed
+
+- A rename conflict git named exactly is no longer reported as approximate. An
+  unlisted conflicting path used to be admitted on pair-level rename evidence and the
+  whole pairing marked approximate, because nothing said which conflict a rename
+  explained. With per-path attribution that is now known, so only an admission that
+  rename evidence alone cannot attribute stays a guess. A forced merge base still
+  marks the pairing approximate, as before.
 - `ignore_globs`, a second and additive path-ignore list beside `ignore_suffixes`, for
   the generated directory, vendored tree or build output path that no extension covers.
   `*` matches within one path component, `**` may cross `/` without absorbing the
