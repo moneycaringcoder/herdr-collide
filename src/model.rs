@@ -220,6 +220,12 @@ pub struct TargetPrediction {
     /// `None` means the local ref probe found no honest integration target.
     pub target_ref: Option<String>,
     pub verdict: TargetVerdict,
+    /// True when a single merge base had to be forced although more than one
+    /// exists, so the verdict approximates what a real merge would do.
+    pub approximate: bool,
+    /// True when the checkout has a merge in progress and its snapshot still
+    /// contains conflict markers, so the verdict is advisory only.
+    pub advisory: bool,
     /// Present for every unknown verdict and absent for established verdicts.
     pub reason: Option<String>,
 }

@@ -592,6 +592,8 @@ fn detail_names_the_integration_ref_and_target_verdict() {
         workspace_id: "w1".to_string(),
         target_ref: Some("refs/remotes/origin/main".to_string()),
         verdict: TargetVerdict::Conflict,
+        approximate: false,
+        advisory: false,
         reason: None,
     });
 

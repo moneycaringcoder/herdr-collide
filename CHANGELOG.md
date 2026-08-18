@@ -26,8 +26,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   siblings. Two worktrees can be mutually clean and both conflict with `main`, and that
   case was invisible: every prediction was pairwise. The detail pane names the ref and
   reports `clean`, `conflict` or `unknown` per worktree, and `--json` carries
-  `target_ref`, `target_verdict` and `target_reason`. Adding keys is compatible, so the
-  schema version does not move.
+  `target_ref`, `target_verdict`, `target_reason`, `target_approximate` and
+  `target_advisory`. Adding keys is compatible, so the schema version does not move.
+- A target verdict qualifies itself the way a pairwise one does. If the histories offer
+  more than one merge base, one is forced and the pane says the verdict approximates
+  what a real merge would do; if the worktree has a merge in progress, its snapshot
+  contains conflict markers and the verdict is advisory. Both were computed and then
+  discarded in the first pass, so a criss-cross history read as a firm answer.
 - The target verdict deliberately does not touch the badge. The badge has one slot and
   four severities already competing for it, and a fifth source of `✘` that fires on
   every stale branch would mute the signal that matters. The pane and `--json` carry it

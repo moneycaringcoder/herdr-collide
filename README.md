@@ -287,7 +287,7 @@ badge down.
 - **`base_ref`** — the local ref each checkout's change set and integration-target prediction are
   measured against. Default `origin/HEAD`; where that does not resolve, `collide` tries, in order,
   `origin/main`, `origin/master`, local `main`, `master`, and `trunk`, then the symbolic `HEAD` of
-  each non-`origin` remote in configured remote order, and finally local
+  each non-`origin` remote in alphabetical order, and finally local
   `init.defaultBranch`. If none resolves, the checkout is visibly degraded and its target verdict is
   `unknown`; `collide` does not fabricate a `HEAD` fallback. `--base-ref <REF>` overrides the probe
   for a single run, and a configured ref that does not resolve is likewise reported as unknown.

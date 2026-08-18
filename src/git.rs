@@ -1143,6 +1143,19 @@ fn count_lines_on_disk(path: &Path) -> u64 {
 // Conflict prediction
 // ---------------------------------------------------------------------------
 
+/// Outcome of predicting one checkout against its integration target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetMergeOutcome {
+    /// The histories are unrelated, so no merge verdict exists.
+    NoCommonAncestor,
+    /// Git produced a verdict, together with any qualifications on that claim.
+    Predicted {
+        conflicts: bool,
+        approximate: bool,
+        advisory: bool,
+    },
+}
+
 /// Verdict for one pair of checkouts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PairPrediction {
@@ -1554,7 +1567,7 @@ impl Predictor {
     /// Predicts whether one already-primed checkout conflicts with the cached
     /// local integration ref. The checkout's snapshot tree is reused verbatim;
     /// this path never reads status or creates another snapshot.
-    pub fn predict_target(&self, checkout: &Path, target_ref: &str) -> Result<bool> {
+    pub fn predict_target(&self, checkout: &Path, target_ref: &str) -> Result<TargetMergeOutcome> {
         let side = self.side(checkout)?;
         let key = (side.common_dir.clone(), target_ref.to_string());
         let target = self.targets.get(&key).ok_or_else(|| {
@@ -1570,9 +1583,9 @@ impl Predictor {
         // add/add conflict.
         let bases = self.merge_bases(checkout, side, target)?;
         if bases.is_empty() {
-            return Err(format!("no common ancestor with `{target_ref}`").into());
+            return Ok(TargetMergeOutcome::NoCommonAncestor);
         }
-        let (args_owned, _) =
+        let (args_owned, approximate) =
             self.merge_tree_args(checkout, side, target, Some(bases.as_slice()))?;
         let base_args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
         let env = self.odb_env(&side.common_dir);
@@ -1593,7 +1606,11 @@ impl Predictor {
             )
             .into());
         }
-        Ok(named.code == Some(1))
+        Ok(TargetMergeOutcome::Predicted {
+            conflicts: named.code == Some(1),
+            approximate,
+            advisory: side.unmerged,
+        })
     }
 
     fn merge_bases(&self, cwd: &Path, l: &Side, r: &Side) -> Result<Vec<String>> {

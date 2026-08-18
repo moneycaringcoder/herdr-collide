@@ -720,13 +720,38 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
             .iter()
             .map(|c| (c.workspace_id.as_str(), c))
             .collect();
+        let changes_by_id: BTreeMap<&str, &ChangeSet> =
+            changes.iter().map(|(id, set)| (id.as_str(), set)).collect();
+        let paired: BTreeSet<&str> = report
+            .pairings
+            .iter()
+            .flat_map(|pairing| {
+                [
+                    pairing.left_workspace_id.as_str(),
+                    pairing.right_workspace_id.as_str(),
+                ]
+            })
+            .collect();
 
         let mut predictor = git::Predictor::new(config.git_timeout)?;
         let mut primed: BTreeSet<&str> = BTreeSet::new();
         let mut prime_errors: BTreeMap<&str, String> = BTreeMap::new();
         for checkout in &verified {
-            // Snapshot each worktree once. The same cached tree feeds every
-            // pairwise prediction and the integration-target prediction.
+            let change = changes_by_id
+                .get(checkout.workspace_id.as_str())
+                .expect("every verified checkout has a change set");
+            let target_ref = integration_refs
+                .get(&checkout.repo_key)
+                .expect("integration-ref decision exists");
+            // A commitless checkout cannot participate in either prediction.
+            // With no target and no pairing, no later result can consume a
+            // snapshot, so paying to create one would only touch scratch state.
+            if !pairable(change)
+                || (target_ref == git::NO_INTEGRATION_REF
+                    && !paired.contains(checkout.workspace_id.as_str()))
+            {
+                continue;
+            }
             match predictor.prime(&checkout.checkout_path) {
                 Ok(()) => {
                     primed.insert(checkout.workspace_id.as_str());
@@ -794,6 +819,8 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
                         workspace_id: checkout.workspace_id.clone(),
                         target_ref: None,
                         verdict: TargetVerdict::Unknown,
+                        approximate: false,
+                        advisory: false,
                         reason: Some("no integration ref found".to_string()),
                     };
                 }
@@ -801,8 +828,17 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
                     workspace_id: checkout.workspace_id.clone(),
                     target_ref: Some(target_ref.clone()),
                     verdict: TargetVerdict::Unknown,
+                    approximate: false,
+                    advisory: false,
                     reason: Some(reason),
                 };
+                if !pairable(
+                    changes_by_id
+                        .get(checkout.workspace_id.as_str())
+                        .expect("every verified checkout has a change set"),
+                ) {
+                    return unknown("checkout has no commit to predict".to_string());
+                }
                 if let Some(err) = prime_errors.get(checkout.workspace_id.as_str()) {
                     return unknown(format!(
                         "prediction against `{target_ref}` failed: checkout could not be primed: {err}"
@@ -812,7 +848,14 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
                     return unknown(err.clone());
                 }
                 match predictor.predict_target(&checkout.checkout_path, target_ref) {
-                    Ok(conflicts) => TargetPrediction {
+                    Ok(git::TargetMergeOutcome::NoCommonAncestor) => {
+                        unknown(format!("no common ancestor with `{target_ref}`"))
+                    }
+                    Ok(git::TargetMergeOutcome::Predicted {
+                        conflicts,
+                        approximate,
+                        advisory,
+                    }) => TargetPrediction {
                         workspace_id: checkout.workspace_id.clone(),
                         target_ref: Some(target_ref.clone()),
                         verdict: if conflicts {
@@ -820,16 +863,13 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
                         } else {
                             TargetVerdict::Clean
                         },
+                        approximate,
+                        advisory,
                         reason: None,
                     },
-                    Err(err) => {
-                        let detail = err.to_string();
-                        if detail.starts_with("no common ancestor with ") {
-                            unknown(detail)
-                        } else {
-                            unknown(format!("prediction against `{target_ref}` failed: {detail}"))
-                        }
-                    }
+                    Err(err) => unknown(format!(
+                        "prediction against `{target_ref}` failed: {err}"
+                    )),
                 }
             })
             .collect();
@@ -1032,6 +1072,7 @@ pub fn text_report(cycle: &Cycle) -> String {
 ///       "degraded": bool, "degraded_reason": string|null,
 ///       "target_ref": string|null,
 ///       "target_verdict": "clean|conflict|unknown"|null,
+///       "target_approximate": bool|null, "target_advisory": bool|null,
 ///       "target_reason": string|null } ],
 ///   "pairings":  [ { "left", "right", "conflict_count", "unknown_count",
 ///                    "approximate": bool,
@@ -1081,6 +1122,8 @@ pub fn json_report(cycle: &Cycle) -> serde_json::Value {
                 "degraded_reason": set.degraded_reason,
                 "target_ref": target.and_then(|target| target.target_ref.as_deref()),
                 "target_verdict": target.map(|target| target_verdict_name(target.verdict)),
+                "target_approximate": target.map(|target| target.approximate),
+                "target_advisory": target.map(|target| target.advisory),
                 "target_reason": target.and_then(|target| target.reason.as_deref()),
             })
         })
