@@ -146,6 +146,7 @@ pub fn analyse(
             }
         }
     }
+    sort_pairings(&mut pairings);
 
     let statuses = statuses(checkouts, &filtered, &pairings, config);
     Report {
@@ -154,6 +155,19 @@ pub fn analyse(
         statuses,
         changes: changes.to_vec(),
     }
+}
+
+fn sort_pairings(pairings: &mut [Pairing]) {
+    // The model ties on workspace ids because `--json` emits ids and scripts do
+    // not have display labels. The pane deliberately re-ties equal severities
+    // on displayed labels because humans read those. Both keys are total, so
+    // neither order can flicker between cycles.
+    pairings.sort_by(|a, b| {
+        a.severity_rank_key()
+            .cmp(&b.severity_rank_key())
+            .then_with(|| a.left_workspace_id.cmp(&b.left_workspace_id))
+            .then_with(|| a.right_workspace_id.cmp(&b.right_workspace_id))
+    });
 }
 
 /// One prediction result, keyed by the pair it belongs to.
@@ -324,6 +338,7 @@ pub fn apply_predictions(
     // unless the prediction actually found a conflicting path. Dropping the
     // empty ones here keeps the probe invisible when it comes back clean.
     report.pairings.retain(|pairing| !pairing.shared.is_empty());
+    sort_pairings(&mut report.pairings);
 
     report.statuses = statuses(&report.checkouts, &filtered, &report.pairings, config);
 }
