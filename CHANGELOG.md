@@ -38,6 +38,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cycle rather than recording a toast that never appeared, and a reply the client cannot
   trust is rejected rather than believed. A prediction that rests on a forced merge base
   says so in the notification, as it already does everywhere else.
+- `collide --why <PATH>` shows the conflicting hunks behind an `✘ conflict` verdict. The
+  verdict is a summary of a real merge that already ran in a temporary index, so the
+  command reads the merged blob out of that prediction's own object store rather than
+  merging again — a second merge would cost twice and could disagree with the verdict
+  being asked about. It refuses honestly rather than printing an empty diff: an overlap
+  says the two sides merge cleanly, a path no pair shares says so, and a prediction that
+  could not run says that and exits non-zero.
+- `--why` states what limits a verdict before showing it. A forced merge base says the
+  hunks approximate what a real merge would do, and a merge in progress on either side
+  says the snapshot already contains that worktree's own conflict markers — without which
+  `--why` would attribute a half-finished merge to the other agent.
+- File content shown by `--why` is sanitised before it reaches a terminal. Line and tab
+  structure survives, every other control character is replaced, and the output is capped
+  in lines and in display columns with the truncation announced. A filename could already
+  have cleared a redraw-in-place pane, and a file's contents can carry the same payload.
+  A blob above 8 MiB is refused as unknown rather than read into memory.
 - Each checkout is now predicted against the integration ref as well as against its
   siblings. Two worktrees can be mutually clean and both conflict with `main`, and that
   case was invisible: every prediction was pairwise. The detail pane names the ref and
