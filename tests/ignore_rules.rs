@@ -212,6 +212,7 @@ fn a_glob_ignored_path_cannot_return_as_an_unlisted_conflict() {
             ("src/a.rs".to_string(), false),
             ("generated/client.rs".to_string(), true),
         ],
+        submodules: Default::default(),
         failed: false,
         approximate: false,
     }];
