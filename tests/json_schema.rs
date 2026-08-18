@@ -112,9 +112,18 @@ fn json_schema_keys_are_exact() {
         "unknown_count",
     ];
     let shared_keys = &["path", "verdict"];
-    for pairing in json["pairings"].as_array().expect("pairings array") {
+    // Both of these levels are reached only by iterating, so an empty array
+    // would pass the key checks while asserting nothing. `analyse` drops a
+    // pairing through six separate `continue` arms and the default ignore
+    // filter, so a future default or a fixture tweak could empty them
+    // silently. Pin the population, not just the shape.
+    let pairings = json["pairings"].as_array().expect("pairings array");
+    assert!(!pairings.is_empty(), "the fixture must produce a pairing");
+    for pairing in pairings {
         assert_keys(pairing, pairing_keys);
-        for shared in pairing["shared"].as_array().expect("shared array") {
+        let shared = pairing["shared"].as_array().expect("shared array");
+        assert!(!shared.is_empty(), "the fixture must produce a shared file");
+        for shared in shared {
             assert_keys(shared, shared_keys);
         }
     }

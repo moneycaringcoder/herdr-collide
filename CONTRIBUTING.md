@@ -85,8 +85,11 @@ avoided. If your change encodes a decision like that, leave the reason behind.
 changelog entry.** Removing or renaming a key, changing a value's type, or
 adding a value to the `severity` or `verdict` enum is breaking. Adding a key or
 an element to an array is compatible and does not bump the version; array order
-is not part of the contract. Keep the README inventory and the schema tests in
-sync so consumers can tell when an exhaustive match needs to change.
+is not part of the contract. There are three inventories of those keys, and all
+three have to move together: the README section, the literals in
+`tests/json_schema.rs`, and the schema block on `collide::json_report`. The
+first two fail loudly when they drift; the doc block does not, which is exactly
+why it is the one worth naming.
 
 ## What to expect from review
 
