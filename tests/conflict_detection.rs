@@ -19,7 +19,7 @@ use collide::collide::{
 };
 use collide::config::Config;
 use collide::git::{self, predict_conflict, Predictor};
-use collide::model::{Checkout, FileVerdict, Report, Severity, WorkTrees};
+use collide::model::{ChangeSet, Checkout, FileVerdict, Report, Severity, WorkTrees};
 
 use fixtures::{
     change_set, change_set_degraded, change_set_renamed, change_set_with_lines, checkout, Fixture,
@@ -93,6 +93,80 @@ fn uncommitted_edits_to_the_same_line_are_a_conflict() {
     // temp-index snapshot.
     let result = verdicts(&a, &b, &["conflict.txt"]);
     assert_eq!(result, vec![("conflict.txt".to_string(), true)]);
+}
+
+#[test]
+fn dirty_contents_in_the_same_submodule_are_unknown_end_to_end() {
+    let fixture = Fixture::new("dirty-submodule-pair");
+    let (_superproject, first, second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    let second_submodule = second.join("embedded");
+    fixture.write(&first_submodule, "payload.txt", "first worktree payload\n");
+    fixture.write(
+        &second_submodule,
+        "payload.txt",
+        "second worktree payload\n",
+    );
+
+    let checkouts = vec![
+        checkout("one", &first, "unused"),
+        checkout("two", &second, "unused"),
+    ];
+    let cycle = collide::collide::gather_for(checkouts, &config()).expect("cycle");
+    assert!(cycle.notes.is_empty(), "{:?}", cycle.notes);
+    assert_eq!(cycle.report.pairings.len(), 1);
+    assert_eq!(cycle.report.pairings[0].shared.len(), 1);
+    assert_eq!(cycle.report.pairings[0].shared[0].path, "embedded");
+    assert_eq!(
+        cycle.report.pairings[0].shared[0].verdict,
+        FileVerdict::Unknown
+    );
+    for id in ["one", "two"] {
+        let status = status_of(&cycle.report, id);
+        assert_eq!(status.severity, Severity::Unknown);
+        assert_eq!(status.unknown_count, 1);
+        assert_eq!(status.overlap_count, 0);
+        // One unknown shared file, so the badge carries its count. A bare `?`
+        // is the other case: a checkout git could not read at all, which is
+        // unknown with nothing to point at.
+        assert_eq!(collide::render::badge(status), "? 1");
+    }
+}
+
+#[test]
+fn divergent_committed_gitlinks_are_reported_as_a_real_conflict() {
+    let fixture = Fixture::new("conflicting-gitlinks");
+    let (_superproject, first, second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    let second_submodule = second.join("embedded");
+
+    fixture.write(&first_submodule, "payload.txt", "first committed pointer\n");
+    fixture.commit_all(&first_submodule, "first submodule commit");
+    fixture.commit_all(&first, "record first submodule pointer");
+    fixture.write(
+        &second_submodule,
+        "payload.txt",
+        "second committed pointer\n",
+    );
+    fixture.commit_all(&second_submodule, "second submodule commit");
+    fixture.commit_all(&second, "record second submodule pointer");
+
+    let checkouts = vec![
+        checkout("one", &first, "unused"),
+        checkout("two", &second, "unused"),
+    ];
+    let cycle = collide::collide::gather_for(checkouts, &config()).expect("cycle");
+    assert!(cycle.notes.is_empty(), "{:?}", cycle.notes);
+    assert_eq!(
+        cycle.report.pairings[0].shared[0].verdict,
+        FileVerdict::Conflict
+    );
+    for id in ["one", "two"] {
+        let status = status_of(&cycle.report, id);
+        assert_eq!(status.severity, Severity::Conflict);
+        assert_eq!(status.conflict_count, 1);
+        assert_eq!(status.unknown_count, 0);
+    }
 }
 
 /// Regression: `merge-tree --write-tree --quiet` used to gate the expensive
@@ -353,6 +427,12 @@ fn config() -> Config {
         predict_conflicts: true,
         ..Config::default()
     }
+}
+
+fn uncomparable_submodule(path: &str) -> ChangeSet {
+    let mut set = change_set(&[path]);
+    set.paths[0].submodule_contents_uncomparable = true;
+    set
 }
 
 /// One working tree per checkout, taken from the checkout path verbatim.
@@ -1056,6 +1136,97 @@ fn a_pair_whose_prediction_succeeded_and_found_nothing_is_a_real_overlap() {
     assert_eq!(report.pairings[0].shared[0].verdict, FileVerdict::Overlap);
     assert_eq!(status_of(&report, "one").severity, Severity::Overlap);
     assert_eq!(status_of(&report, "one").unknown_count, 0);
+}
+
+#[test]
+fn a_clean_prediction_cannot_turn_changed_submodule_contents_into_overlap() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("one".to_string(), uncomparable_submodule("embedded")),
+        ("two".to_string(), uncomparable_submodule("embedded")),
+    ];
+
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    let clean = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![("embedded".to_string(), false)],
+        failed: false,
+        approximate: false,
+    }];
+    apply_predictions(&mut report, &clean, &changes, &config());
+
+    assert_eq!(report.pairings[0].shared[0].verdict, FileVerdict::Unknown);
+    for id in ["one", "two"] {
+        let status = status_of(&report, id);
+        assert_eq!(status.severity, Severity::Unknown);
+        assert_eq!(status.unknown_count, 1);
+        assert_eq!(status.overlap_count, 0);
+    }
+}
+
+#[test]
+fn changed_submodule_contents_are_unknown_when_prediction_is_disabled() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("one".to_string(), uncomparable_submodule("embedded")),
+        ("two".to_string(), uncomparable_submodule("embedded")),
+    ];
+    let no_prediction = Config {
+        predict_conflicts: false,
+        ..config()
+    };
+
+    let report = analyse(
+        &checkouts,
+        &changes,
+        &distinct_trees(&checkouts),
+        &no_prediction,
+    );
+    assert_eq!(report.pairings[0].shared[0].verdict, FileVerdict::Unknown);
+    for id in ["one", "two"] {
+        let status = status_of(&report, id);
+        assert_eq!(status.severity, Severity::Unknown);
+        assert_eq!(status.unknown_count, 1);
+        assert_eq!(status.overlap_count, 0);
+    }
+}
+
+#[test]
+fn a_git_flagged_submodule_conflict_still_reports_conflict() {
+    let checkouts = vec![
+        checkout("one", Path::new("/tmp/one"), "/repo/.git"),
+        checkout("two", Path::new("/tmp/two"), "/repo/.git"),
+    ];
+    let changes = vec![
+        ("one".to_string(), uncomparable_submodule("embedded")),
+        ("two".to_string(), uncomparable_submodule("embedded")),
+    ];
+    let mut report = analyse(&checkouts, &changes, &distinct_trees(&checkouts), &config());
+    let conflict = vec![PairVerdicts {
+        left_workspace_id: "one".to_string(),
+        right_workspace_id: "two".to_string(),
+        verdicts: vec![("embedded".to_string(), true)],
+        failed: false,
+        approximate: false,
+    }];
+
+    apply_predictions(&mut report, &conflict, &changes, &config());
+
+    assert_eq!(report.pairings[0].shared[0].verdict, FileVerdict::Conflict);
+    for id in ["one", "two"] {
+        let status = status_of(&report, id);
+        assert_eq!(status.severity, Severity::Conflict);
+        assert_eq!(status.conflict_count, 1);
+        assert_eq!(status.unknown_count, 0);
+        assert_eq!(status.overlap_count, 0);
+    }
 }
 
 /// A checkout whose git pass failed carries no paths, which used to make it
