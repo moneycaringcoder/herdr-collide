@@ -81,6 +81,13 @@ decisions that look arbitrary until explained — why the disable path waits for
 the daemon to exit, why severity rides the token *name*, why `--quiet` is
 avoided. If your change encodes a decision like that, leave the reason behind.
 
+**A breaking `--json` shape change bumps `JSON_SCHEMA_VERSION` and adds a
+changelog entry.** Removing or renaming a key, changing a value's type, or
+adding a value to the `severity` or `verdict` enum is breaking. Adding a key or
+an element to an array is compatible and does not bump the version; array order
+is not part of the contract. Keep the README inventory and the schema tests in
+sync so consumers can tell when an exhaustive match needs to change.
+
 ## What to expect from review
 
 - Small fixes — a typo, a clear bug with a test, a documentation correction —
