@@ -49,7 +49,8 @@ pub const JSON_SCHEMA_VERSION: u32 = 2;
 /// [`FileVerdict::Unknown`]: the caller is expected to run
 /// [`git::Predictor::predict_pair`] and feed the answers back through
 /// [`apply_predictions`]. With prediction off, a shared file is reported as a
-/// plain [`FileVerdict::Overlap`] and never escalates to a conflict.
+/// plain [`FileVerdict::Overlap`] unless the snapshot cannot represent changed
+/// submodule contents, which stays [`FileVerdict::Unknown`].
 ///
 /// `trees` says where each checkout's working tree starts, so that two
 /// workspaces sharing one tree are not compared with themselves. It is resolved
@@ -116,7 +117,13 @@ pub fn analyse(
                     .intersection(&rc.paths)
                     .map(|path| SharedFile {
                         path: path.clone(),
-                        verdict: unresolved,
+                        verdict: if lc.uncomparable_submodules.contains(path)
+                            || rc.uncomparable_submodules.contains(path)
+                        {
+                            FileVerdict::Unknown
+                        } else {
+                            unresolved
+                        },
                     })
                     .collect();
                 // An empty intersection normally means the pair cannot
@@ -184,6 +191,10 @@ pub fn apply_predictions(
 
     let pair_changes: BTreeMap<&str, &ChangeSet> =
         changes.iter().map(|(id, set)| (id.as_str(), set)).collect();
+    let filtered: BTreeMap<&str, FilteredChange> = changes
+        .iter()
+        .map(|(id, set)| (id.as_str(), FilteredChange::new(set, config)))
+        .collect();
 
     for pairing in &mut report.pairings {
         let key = (
@@ -203,8 +214,14 @@ pub fn apply_predictions(
             .map(|(path, hit)| (path.as_str(), *hit))
             .collect();
         for shared in &mut pairing.shared {
+            let uncomparable_submodule = [key.0, key.1].iter().any(|id| {
+                filtered
+                    .get(id)
+                    .is_some_and(|change| change.uncomparable_submodules.contains(&shared.path))
+            });
             shared.verdict = match verdicts.get(shared.path.as_str()) {
                 Some(true) => FileVerdict::Conflict,
+                _ if uncomparable_submodule => FileVerdict::Unknown,
                 // A path git did not flag merges cleanly, even though both
                 // sides touched it. That discrimination is the whole point of
                 // this plugin: a shared file is not a collision.
@@ -286,10 +303,6 @@ pub fn apply_predictions(
     // empty ones here keeps the probe invisible when it comes back clean.
     report.pairings.retain(|pairing| !pairing.shared.is_empty());
 
-    let filtered: BTreeMap<&str, FilteredChange> = changes
-        .iter()
-        .map(|(id, set)| (id.as_str(), FilteredChange::new(set, config)))
-        .collect();
     report.statuses = statuses(&report.checkouts, &filtered, &report.pairings, config);
 }
 
@@ -300,6 +313,7 @@ pub fn apply_predictions(
 #[derive(Debug, Clone)]
 struct FilteredChange {
     paths: BTreeSet<String>,
+    uncomparable_submodules: BTreeSet<String>,
     lines_changed: u64,
     /// Distinct changed files, with the origin half of a rename counted once.
     changed_files: usize,
@@ -318,6 +332,11 @@ impl FilteredChange {
             .filter(|p| !is_ignored(&p.path, config))
             .collect();
         let paths: BTreeSet<String> = kept.iter().map(|p| p.path.clone()).collect();
+        let uncomparable_submodules = kept
+            .iter()
+            .filter(|p| p.submodule_contents_uncomparable)
+            .map(|p| p.path.clone())
+            .collect();
         // Volume is filtered along with the paths. A `package-lock.json` the
         // plugin has decided to ignore must not still trip the runaway
         // threshold, and the origin half of a rename is one file, not two.
@@ -327,6 +346,7 @@ impl FilteredChange {
         let changed_files = kept.iter().filter(|p| !p.is_rename_origin).count();
         Self {
             paths,
+            uncomparable_submodules,
             lines_changed,
             changed_files,
             has_rename: set.has_rename,
