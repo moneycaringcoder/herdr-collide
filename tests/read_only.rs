@@ -70,13 +70,13 @@ struct Fingerprint {
     /// the contents happen to round-trip identically, so it is asserted
     /// separately rather than trusted as the only signal.
     index_mtimes: BTreeMap<PathBuf, SystemTime>,
-    /// Every file in the common git dir (excluding the object store) and in
+    /// Every file in each common git dir (excluding its object store) and in
     /// every working tree, untracked and ignored files included.
     files: BTreeMap<PathBuf, FileStamp>,
-    /// Every file in the real object store, by path.
+    /// Every file in every real object store, by path.
     odb: BTreeSet<PathBuf>,
-    /// Refs and reflogs as git itself reports them.
-    refs: String,
+    /// Refs and worktree registrations as git reports them, keyed by common dir.
+    refs: BTreeMap<PathBuf, String>,
     reflogs: BTreeMap<PathBuf, FileStamp>,
     /// Any `*.lock` present. Excluded from `files` because a lock is transient
     /// by nature; tracked here so leftovers are still caught.
@@ -129,35 +129,43 @@ fn collect_paths(root: &Path, out: &mut BTreeSet<PathBuf>) {
 }
 
 fn fingerprint(fixture: &Fixture, worktrees: &[PathBuf]) -> Fingerprint {
-    let common_dir = PathBuf::from(fixture.git(
-        &fixture.repo,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    ));
-    let objects = common_dir.join("objects");
+    let checkouts: Vec<&Path> = std::iter::once(fixture.repo.as_path())
+        .chain(worktrees.iter().map(PathBuf::as_path))
+        .collect();
+    let mut repositories: BTreeMap<PathBuf, &Path> = BTreeMap::new();
+    for checkout in &checkouts {
+        let raw = PathBuf::from(fixture.git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        let common_dir = std::fs::canonicalize(&raw).unwrap_or(raw);
+        repositories.entry(common_dir).or_insert(checkout);
+    }
 
     let mut files = BTreeMap::new();
     let mut locks = BTreeSet::new();
-    // The object store is compared as a name set instead of file-by-file, so it
-    // is excluded from the byte walk.
-    walk(
-        &common_dir,
-        std::slice::from_ref(&objects),
-        &mut files,
-        &mut locks,
-    );
-    for wt in worktrees {
-        // `.git` inside a linked worktree is a gitlink file, and inside the main
-        // worktree it is the git dir itself; either way it is repository state,
-        // already covered by the common-dir walk.
+    let mut odb = BTreeSet::new();
+    for common_dir in repositories.keys() {
+        let objects = common_dir.join("objects");
+        // Object stores are compared as name sets instead of file-by-file, so
+        // each one is excluded from the byte walk.
+        walk(
+            common_dir,
+            std::slice::from_ref(&objects),
+            &mut files,
+            &mut locks,
+        );
+        collect_paths(&objects, &mut odb);
+    }
+    for wt in &checkouts {
+        // `.git` is repository state rather than worktree content. Each
+        // repository owning one is already covered by its common-dir walk.
         walk(wt, &[wt.join(".git")], &mut files, &mut locks);
     }
 
-    let mut odb = BTreeSet::new();
-    collect_paths(&objects, &mut odb);
-
     let mut index_bytes = BTreeMap::new();
     let mut index_mtimes = BTreeMap::new();
-    for wt in std::iter::once(&fixture.repo).chain(worktrees.iter()) {
+    for wt in &checkouts {
         let git_dir =
             PathBuf::from(fixture.git(wt, &["rev-parse", "--path-format=absolute", "--git-dir"]));
         let index = git_dir.join("index");
@@ -169,25 +177,31 @@ fn fingerprint(fixture: &Fixture, worktrees: &[PathBuf]) -> Fingerprint {
         }
     }
 
-    let mut refs = fixture.git(
-        &fixture.repo,
-        &[
-            "for-each-ref",
-            "--format=%(refname) %(objectname) %(objecttype)",
-        ],
-    );
-    refs.push('\n');
-    refs.push_str(&fixture.git(&fixture.repo, &["worktree", "list", "--porcelain"]));
+    let mut refs = BTreeMap::new();
+    for (common_dir, checkout) in &repositories {
+        let mut observed = fixture.git(
+            checkout,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname) %(objecttype)",
+            ],
+        );
+        observed.push('\n');
+        observed.push_str(&fixture.git(checkout, &["worktree", "list", "--porcelain"]));
+        refs.insert(common_dir.clone(), observed);
+    }
 
     let mut reflogs = BTreeMap::new();
     let mut reflog_locks = BTreeSet::new();
-    walk(
-        &common_dir.join("logs"),
-        &[],
-        &mut reflogs,
-        &mut reflog_locks,
-    );
-    for wt in worktrees {
+    for common_dir in repositories.keys() {
+        walk(
+            &common_dir.join("logs"),
+            &[],
+            &mut reflogs,
+            &mut reflog_locks,
+        );
+    }
+    for wt in &checkouts {
         let git_dir =
             PathBuf::from(fixture.git(wt, &["rev-parse", "--path-format=absolute", "--git-dir"]));
         walk(&git_dir.join("logs"), &[], &mut reflogs, &mut reflog_locks);
@@ -251,7 +265,7 @@ fn assert_unchanged(before: &Fingerprint, after: &Fingerprint) {
     }
     if before.refs != after.refs {
         problems.push(format!(
-            "refs changed:\n--- before\n{}\n--- after\n{}",
+            "refs changed:\n--- before\n{:?}\n--- after\n{:?}",
             before.refs, after.refs
         ));
     }
@@ -448,6 +462,66 @@ fn the_full_pipeline_changes_nothing_in_the_repository() {
     assert!(notes.is_empty(), "pipeline reported problems: {notes:?}");
 
     let after = fingerprint(&fixture, &worktrees);
+    assert_unchanged(&before, &after);
+    assert_no_scratch_leftovers();
+}
+
+#[test]
+fn the_full_pipeline_leaves_the_submodule_repository_unchanged() {
+    let _serialised = scratch_guard();
+
+    let fixture = Fixture::new("submodule-read-only");
+    let (superproject, first, second, submodule) = fixture.superproject_with_submodule("embedded");
+    let pipeline_worktrees = vec![superproject, first, second];
+    // The submodule is protected by the fingerprint but is not handed to
+    // `checkouts_for`, which would falsely assign the superproject's repo key.
+    let mut protected_checkouts = pipeline_worktrees.clone();
+    protected_checkouts.push(submodule.clone());
+
+    let submodule_git_dir = PathBuf::from(fixture.git(
+        &submodule,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    ));
+    let raw_common_dir = PathBuf::from(fixture.git(
+        &submodule,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ));
+    let submodule_common_dir = std::fs::canonicalize(&raw_common_dir).unwrap_or(raw_common_dir);
+    let before = fingerprint(&fixture, &protected_checkouts);
+    let submodule_index = submodule_git_dir.join("index");
+    assert!(
+        before.index_bytes.contains_key(&submodule_index)
+            && before.index_mtimes.contains_key(&submodule_index),
+        "submodule index bytes and mtime were not fingerprinted: {}",
+        submodule_index.display()
+    );
+    assert!(
+        before.refs.contains_key(&submodule_common_dir),
+        "submodule refs were not fingerprinted under {}",
+        submodule_common_dir.display()
+    );
+    assert!(
+        before.reflogs.keys().any(|path| {
+            path.starts_with(submodule_common_dir.join("logs"))
+                || path.starts_with(submodule_git_dir.join("logs"))
+        }),
+        "submodule reflogs were not fingerprinted under {} or {}",
+        submodule_common_dir.join("logs").display(),
+        submodule_git_dir.join("logs").display()
+    );
+    assert!(
+        before
+            .odb
+            .iter()
+            .any(|path| path.starts_with(submodule_common_dir.join("objects"))),
+        "submodule object paths were not fingerprinted under {}",
+        submodule_common_dir.join("objects").display()
+    );
+
+    let notes = run_full_pipeline(&fixture, &pipeline_worktrees);
+    assert!(notes.is_empty(), "pipeline reported problems: {notes:?}");
+
+    let after = fingerprint(&fixture, &protected_checkouts);
     assert_unchanged(&before, &after);
     assert_no_scratch_leftovers();
 }
