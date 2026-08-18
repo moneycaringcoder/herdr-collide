@@ -39,6 +39,8 @@ pub struct Config {
     /// Paths matching these suffixes never count as changes. Lockfiles and
     /// build output overlap constantly and mean nothing.
     pub ignore_suffixes: Vec<String>,
+    /// Repository-relative paths matching these globs never count as changes.
+    pub ignore_globs: Vec<String>,
     /// Predict real conflicts rather than only reporting shared paths.
     pub predict_conflicts: bool,
     /// Show desktop notifications when a workspace becomes conflicting.
@@ -69,6 +71,7 @@ impl Default for Config {
                 "poetry.lock".into(),
                 "go.sum".into(),
             ],
+            ignore_globs: Vec::new(),
             predict_conflicts: true,
             notifications_enabled: false,
             base_ref: DEFAULT_BASE_REF.to_string(),
@@ -141,6 +144,7 @@ struct FileConfig {
     runaway_files: Option<usize>,
     runaway_lines: Option<u64>,
     ignore_suffixes: Option<Vec<String>>,
+    ignore_globs: Option<Vec<String>>,
     predict_conflicts: Option<bool>,
     notifications_enabled: Option<bool>,
     base_ref: Option<String>,
@@ -154,6 +158,7 @@ const KNOWN_KEYS: [&str; 8] = [
     "runaway_files",
     "runaway_lines",
     "ignore_suffixes",
+    "ignore_globs",
     "predict_conflicts",
     "notifications_enabled",
     "base_ref",
@@ -228,6 +233,9 @@ fn load_file() -> Config {
     }
     if let Some(suffixes) = file.ignore_suffixes {
         config.ignore_suffixes = suffixes;
+    }
+    if let Some(globs) = file.ignore_globs {
+        config.ignore_globs = globs;
     }
     if let Some(predict) = file.predict_conflicts {
         config.predict_conflicts = predict;

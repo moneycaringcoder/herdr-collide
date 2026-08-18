@@ -940,6 +940,41 @@ fn a_config_file_overrides_only_the_fields_it_names() {
 }
 
 #[test]
+fn ignore_globs_default_empty_and_file_value_replaces_it() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("cfgglobs");
+
+    assert!(Config::default().ignore_globs.is_empty());
+    std::fs::write(
+        dirs.config_file(),
+        r#"{"ignore_globs": ["vendor/**", "build/"]}"#,
+    )
+    .expect("write config");
+
+    let config = config::load_with_args(&[]).expect("load");
+    assert_eq!(
+        config.ignore_globs,
+        vec!["vendor/**".to_string(), "build/".to_string()]
+    );
+}
+
+#[test]
+fn ignore_globs_load_beside_an_unknown_key() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("cfgglobs-unknown");
+
+    std::fs::write(
+        dirs.config_file(),
+        r#"{"ignore_globb": ["wrong/**"], "ignore_globs": ["generated/**"], "runaway_files": 9}"#,
+    )
+    .expect("write config");
+
+    let config = config::load_with_args(&[]).expect("load");
+    assert_eq!(config.ignore_globs, vec!["generated/**".to_string()]);
+    assert_eq!(config.runaway_files, 9);
+}
+
+#[test]
 fn a_malformed_config_file_warns_and_falls_back_to_defaults() {
     let _guard = env_lock();
     let dirs = TempDirs::new("cfgbad");
