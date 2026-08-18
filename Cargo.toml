@@ -1,6 +1,6 @@
 [package]
 name = "collide"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Warns when agents in different git worktrees of one repo are about to collide."
 license = "MIT"
