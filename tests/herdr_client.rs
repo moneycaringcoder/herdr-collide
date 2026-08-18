@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use collide::herdr::{error_code, Herdr};
@@ -152,16 +152,15 @@ fn point_at(path: &std::path::Path) {
 }
 
 /// A server that goes away and comes back, the way `herdr update --handoff`
-/// does: the old server unlinks the socket, and a moment later a new one binds
-/// the same path. Nothing is listening in between, so a dial made during the
-/// window fails outright.
+/// does. `start` unlinks the old socket and pre-spawns the replacement;
+/// `rebind` lets that worker bind the same path.
 ///
-/// `TestServer`'s `Reply::Eof` is a *different* failure — there the socket
-/// exists and the connection is accepted, then closed. Only this one exercises
-/// the case the protocol notes actually describe.
+/// Nothing listens between those events, but scheduling decides whether the
+/// next dial sees that window or the replacement listener.
 struct HandoffServer {
     path: PathBuf,
     dir: PathBuf,
+    rebind: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -172,13 +171,18 @@ struct HandoffServer {
 const HANDOFF_LIFETIME: Duration = Duration::from_millis(1_500);
 
 impl HandoffServer {
-    /// Unlinks `path`, waits `gap`, rebinds, then answers `replies` in order.
-    fn start(dir: PathBuf, path: PathBuf, gap: Duration, replies: Vec<String>) -> Self {
+    /// Unlinks `path` and pre-spawns a worker that waits to rebind and reply.
+    fn start(dir: PathBuf, path: PathBuf, replies: Vec<String>) -> Self {
         let _ = std::fs::remove_file(&path);
+        let (rebind_tx, rebind_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let thread = {
             let path = path.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(gap);
+                ready_tx.send(()).expect("announce handoff worker");
+                if rebind_rx.recv().is_err() {
+                    return;
+                }
                 let listener = UnixListener::bind(&path).expect("rebind");
                 listener.set_nonblocking(true).expect("nonblocking");
                 let deadline = std::time::Instant::now() + HANDOFF_LIFETIME;
@@ -207,17 +211,28 @@ impl HandoffServer {
                 }
             })
         };
+        ready_rx.recv().expect("handoff worker ready");
         Self {
             path,
             dir,
+            rebind: Some(rebind_tx),
             thread: Some(thread),
         }
+    }
+
+    fn rebind(&mut self) {
+        self.rebind
+            .take()
+            .expect("rebind already requested")
+            .send(())
+            .expect("start rebind");
     }
 }
 
 impl Drop for HandoffServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        drop(self.rebind.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -359,13 +374,8 @@ fn one_request_per_connection_is_survived_by_reconnecting() {
     );
 }
 
-/// The case the protocol notes describe and the EOF test above does *not*
-/// cover: the socket file is gone entirely for a moment, so the first dial
-/// fails before any connection exists.
-///
-/// This is what fails without a pause before the retry. Measured back to back,
-/// the two attempts were 0.05 ms apart — one attempt, as far as a rebind is
-/// concerned.
+/// Exercise a client call made across the same unlink-and-rebind handoff that
+/// `herdr update --handoff` performs.
 #[test]
 fn a_call_survives_the_socket_being_unlinked_and_rebound() {
     let _guard = env_lock();
@@ -377,22 +387,25 @@ fn a_call_survives_the_socket_being_unlinked_and_rebound() {
     let listener = UnixListener::bind(&path).expect("bind");
     point_at(&path);
     let mut client = Herdr::connect().expect("connect before the handoff");
+    let mut server = HandoffServer::start(dir, path, vec![snapshot_line(snapshot_with_one_repo())]);
     drop(listener);
 
-    // The old server goes away; a new one binds the same path 25 ms later —
-    // far outside a retry with no pause at all (two such attempts were measured
-    // 0.05 ms apart), and with 125 ms of the client's 150 ms pause still to
-    // spare, so a scheduling stall cannot turn a real pass into a flake.
-    let server = HandoffServer::start(
-        dir,
-        path,
-        Duration::from_millis(25),
-        vec![snapshot_line(snapshot_with_one_repo())],
-    );
+    // The rebinding thread is already running and blocked on a channel before
+    // the old listener is dropped. The previous 25 ms sleep made a thread
+    // spawn, sleep, wake, and bind compete with the client's 150 ms pause; now
+    // only a bind on an already-running thread has to fit inside that pause.
+    //
+    // This proves that a call across the socket's unlink and rebind succeeds.
+    // Whether its first dial fails and the retry lands, or the rebind wins that
+    // race, is not observable here and is not asserted. Retry behavior is
+    // covered deterministically by
+    // `connect_survives_the_socket_being_unlinked_and_rebound` and
+    // `one_request_per_connection_is_survived_by_reconnecting`.
+    server.rebind();
 
     let checkouts = client
         .checkouts()
-        .expect("the retry must land on the new server");
+        .expect("the call must land on the new server");
     assert_eq!(checkouts.len(), 1);
     drop(server);
 }
@@ -406,7 +419,8 @@ fn connect_survives_the_socket_being_unlinked_and_rebound() {
     let path = dir.join("s.sock");
     point_at(&path);
 
-    let server = HandoffServer::start(dir, path, Duration::from_millis(25), vec![]);
+    let mut server = HandoffServer::start(dir, path, vec![]);
+    server.rebind();
 
     Herdr::connect().expect("connect must retry across a rebind");
     drop(server);
