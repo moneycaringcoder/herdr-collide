@@ -99,6 +99,11 @@ fn json_schema_keys_are_exact() {
         "lines_removed",
         "repo_key",
         "repo_root",
+        "target_advisory",
+        "target_approximate",
+        "target_reason",
+        "target_ref",
+        "target_verdict",
         "workspace_id",
     ];
     for checkout in json["checkouts"].as_array().expect("checkouts array") {

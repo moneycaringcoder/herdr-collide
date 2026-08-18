@@ -1229,6 +1229,18 @@ fn count_lines_on_disk(path: &Path) -> u64 {
 /// limit, while keeping one pathological generated file from consuming the
 /// memory of the editor process this plugin runs alongside.
 pub const WHY_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Outcome of predicting one checkout against its integration target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetMergeOutcome {
+    /// The histories are unrelated, so no merge verdict exists.
+    NoCommonAncestor,
+    /// Git produced a verdict, together with any qualifications on that claim.
+    Predicted {
+        conflicts: bool,
+        approximate: bool,
+        advisory: bool,
+    },
+}
 
 /// Verdict for one pair of checkouts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1395,6 +1407,7 @@ pub struct Predictor {
     scratch: PathBuf,
     odb: PathBuf,
     sides: HashMap<PathBuf, Side>,
+    targets: HashMap<(PathBuf, String), Side>,
     nested_sides: HashMap<(PathBuf, String), CachedNestedSide>,
 }
 
@@ -1417,6 +1430,7 @@ impl Predictor {
             scratch,
             odb,
             sides: HashMap::new(),
+            targets: HashMap::new(),
             nested_sides: HashMap::new(),
         })
     }
@@ -1450,6 +1464,44 @@ impl Predictor {
         }
         let side = self.build_side(checkout)?;
         self.sides.insert(key, side);
+        Ok(())
+    }
+
+    /// Resolves one local integration ref and caches its commit once per
+    /// repository. Call this during the sequential prime phase; predictions
+    /// only read the cached side and can then fan out through `&self`.
+    pub fn prime_target(&mut self, checkout: &Path, target_ref: &str) -> Result<()> {
+        let common_dir = self.side(checkout)?.common_dir.clone();
+        let key = (common_dir.clone(), target_ref.to_string());
+        if self.targets.contains_key(&key) {
+            return Ok(());
+        }
+
+        let peeled = format!("{target_ref}^{{commit}}");
+        let resolved = git(
+            checkout,
+            &["rev-parse", "--verify", "-q", &peeled],
+            self.timeout,
+        )?;
+        if resolved.timed_out || resolved.code.is_none() {
+            return Err(format!("resolving integration ref `{target_ref}` timed out").into());
+        }
+        if !resolved.ok() || resolved.stdout_trimmed().is_empty() {
+            return Err(
+                format!("integration ref `{target_ref}` does not resolve to a commit").into(),
+            );
+        }
+
+        self.targets.insert(
+            key,
+            Side {
+                common_dir,
+                head: resolved.stdout_trimmed(),
+                tree: None,
+                dirty: false,
+                unmerged: false,
+            },
+        );
         Ok(())
     }
 
@@ -1892,9 +1944,17 @@ impl Predictor {
 
         // There is deliberately no prefilter here. There used to be one — skip
         // the pair when `paths` is empty, unless either side has a rename — and
-        // it was unreachable for the case it existed to catch. Deciding which
-        // outer pairs are worth predicting belongs to `collide::analyse`.
-        let (args_owned, approximate) = self.merge_tree_args(left, l, r, env)?;
+        // it was unreachable for the case it existed to catch. `Side::has_rename`
+        // was built from `status`, so it only ever saw *uncommitted* renames; a
+        // worktree that had committed a directory rename and was otherwise clean
+        // short-circuited to a conflict-free verdict while `merge-tree` on the
+        // same pair exited 1 with `CONFLICT (directory rename suggested)`.
+        //
+        // Deciding which pairs are worth predicting belongs to `collide::analyse`,
+        // which has both change sets. A second, differently-informed filter one
+        // layer down can only disagree with it, and a clean pair costs 1.77 ms
+        // to answer properly (docs/git-plumbing.md, "merge-tree cost").
+        let (args_owned, approximate) = self.merge_tree_args(left, l, r, None, env)?;
         prediction.approximate = approximate;
         let base_args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
 
@@ -2057,6 +2117,94 @@ impl Predictor {
         Ok(out.stdout)
     }
 
+    /// Predicts whether one already-primed checkout conflicts with the cached
+    /// local integration ref. The checkout's snapshot tree is reused verbatim;
+    /// this path never reads status or creates another snapshot.
+    pub fn predict_target(&self, checkout: &Path, target_ref: &str) -> Result<TargetMergeOutcome> {
+        let side = self.side(checkout)?;
+        let key = (side.common_dir.clone(), target_ref.to_string());
+        let target = self.targets.get(&key).ok_or_else(|| {
+            format!(
+                "integration ref `{target_ref}` was not primed for {}",
+                checkout.display()
+            )
+        })?;
+
+        // Establishing the target is a separate claim from running merge-tree:
+        // unrelated histories have no meaningful "clean" or "conflict"
+        // verdict, even though tree-mode plumbing can make them look like an
+        // add/add conflict.
+        let env = self.odb_env(&side.common_dir);
+        let bases = self.merge_bases(checkout, side, target, &env)?;
+        if bases.is_empty() {
+            return Ok(TargetMergeOutcome::NoCommonAncestor);
+        }
+        let (args_owned, approximate) =
+            self.merge_tree_args(checkout, side, target, Some(bases.as_slice()), &env)?;
+        let base_args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+        let mut args = vec!["merge-tree", "--write-tree", "-z", "--name-only"];
+        args.extend(base_args.iter().copied());
+        let named = run_git(checkout, &args, &env, self.timeout)?;
+        if named.code != Some(1) && named.code != Some(0) {
+            return Err(format!(
+                "merge-tree --name-only failed against `{target_ref}`: {}",
+                named.stderr_text()
+            )
+            .into());
+        }
+        if named.stdout.is_empty() {
+            return Err(format!(
+                "merge-tree reported failure with no output against `{target_ref}`: {}",
+                named.stderr_text()
+            )
+            .into());
+        }
+        Ok(TargetMergeOutcome::Predicted {
+            conflicts: named.code == Some(1),
+            approximate,
+            advisory: side.unmerged,
+        })
+    }
+
+    fn merge_bases(
+        &self,
+        cwd: &Path,
+        l: &Side,
+        r: &Side,
+        env: &[(&str, OsString)],
+    ) -> Result<Vec<String>> {
+        let bases = run_git(
+            cwd,
+            &["merge-base", "--all", &l.head, &r.head],
+            env,
+            self.timeout,
+        )?;
+        if bases.timed_out || bases.code.is_none() {
+            return Err(format!(
+                "merge-base could not answer in {}: {}",
+                cwd.display(),
+                bases.stderr_text()
+            )
+            .into());
+        }
+        let list = bases
+            .stdout_trimmed()
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if bases.ok() || bases.code == Some(1) {
+            Ok(list)
+        } else {
+            Err(format!(
+                "merge-base failed in {}: {}",
+                cwd.display(),
+                bases.stderr_text()
+            )
+            .into())
+        }
+    }
+
     /// Builds the trailing merge-tree arguments and reports whether a single
     /// merge base had to be forced.
     ///
@@ -2075,6 +2223,7 @@ impl Predictor {
         cwd: &Path,
         l: &Side,
         r: &Side,
+        bases: Option<&[String]>,
         env: &[(&str, OsString)],
     ) -> Result<(Vec<String>, bool)> {
         if !l.dirty && !r.dirty {
@@ -2086,27 +2235,15 @@ impl Predictor {
 
         // A dirty side is a bare tree, and a tree carries no history, so the
         // base has to be supplied explicitly.
-        let bases = run_git(
-            cwd,
-            &["merge-base", "--all", &l.head, &r.head],
-            env,
-            self.timeout,
-        )?;
-        if bases.timed_out || bases.code.is_none() {
-            return Err(format!(
-                "merge-base could not answer in {}: {}",
-                cwd.display(),
-                bases.stderr_text()
-            )
-            .into());
-        }
-        let list: Vec<String> = bases
-            .stdout_trimmed()
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !bases.ok() || list.is_empty() {
+        let owned_bases;
+        let list = match bases {
+            Some(bases) => bases,
+            None => {
+                owned_bases = self.merge_bases(cwd, l, r, env)?;
+                owned_bases.as_slice()
+            }
+        };
+        if list.is_empty() {
             return Err(format!(
                 "no common ancestor between {} and {}, so this pair cannot be predicted",
                 l.head, r.head

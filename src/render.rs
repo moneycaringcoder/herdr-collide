@@ -29,7 +29,8 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::git;
 use crate::model::{
-    ChangeSet, Checkout, FileVerdict, Pairing, RepoKey, Report, Severity, WorkspaceStatus,
+    ChangeSet, Checkout, FileVerdict, Pairing, RepoKey, Report, Severity, TargetVerdict,
+    WorkspaceStatus,
 };
 use crate::Result;
 
@@ -248,6 +249,47 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
             }
             for note in degraded_notes(report.change_set(&checkout.workspace_id), checkout) {
                 push_wrapped(&mut out, "      ", "      ", &note, width);
+            }
+            if let Some(target) = report.target_prediction(&checkout.workspace_id) {
+                let named = target
+                    .target_ref
+                    .as_deref()
+                    .map(|target_ref| format!("target {target_ref}"))
+                    .unwrap_or_else(|| "target integration ref".to_string());
+                if target.advisory {
+                    push_wrapped(
+                        &mut out,
+                        "      ",
+                        "      ",
+                        &format!(
+                            "advisory: a merge is in progress in {}, so this target verdict was \
+                             computed from a tree that still contains conflict markers.",
+                            label_of(checkout)
+                        ),
+                        width,
+                    );
+                }
+                if target.approximate {
+                    push_wrapped(
+                        &mut out,
+                        "      ",
+                        "      ",
+                        "approximate: this history and its integration target offer no single \
+                         merge base, so one was forced and the target verdict approximates what \
+                         a real merge would do.",
+                        width,
+                    );
+                }
+                let verdict = match target.verdict {
+                    TargetVerdict::Clean => "clean",
+                    TargetVerdict::Conflict => "conflict",
+                    TargetVerdict::Unknown => "unknown",
+                };
+                let line = match &target.reason {
+                    Some(reason) => format!("{named}: {verdict} \u{2014} {reason}"),
+                    None => format!("{named}: {verdict}"),
+                };
+                push_wrapped(&mut out, "      ", "      ", &line, width);
             }
         }
 
