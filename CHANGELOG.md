@@ -31,14 +31,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Every failure still falls back to `? unknown` with the note explaining why: a submodule
   that is absent or uninitialised on either side, an unborn or unreadable nested HEAD, a
   nested merge already in progress, no common ancestor, or any timeout. The fallback is the
-  point: a nested comparison that could not run must not report a clean merge.
+  point: a nested comparison that could not run must not report a clean merge. A nested
+  merge that had to force one of several merge bases says so too, in its own wording,
+  because the existing caveat describes the outer histories rather than the nested ones.
 - A shared file's path stays superproject-relative. Nested conflicting paths are named in the
   pane note instead, because a path in that field is superproject-relative everywhere else
   and mixing the two scopes would corrupt every consumer of it.
 - The read-only guarantee now covers the second repository a submodule introduces: the
   nested index, refs, reflogs and complete object path set are fingerprinted before and after
-  a run that exercises nested prediction, for both worktrees. Measured cost with one dirty
-  submodule is 616 ms per cycle, about 12% of the default five-second interval.
+  a run that exercises nested prediction, for both worktrees. One dirty submodule shared by
+  two worktrees — one pair — measured 616 ms per cycle. The nested snapshot is per worktree
+  and the nested merge is per pair, so that figure does not scale by submodule count alone.
+- The `--json` schema is now a documented promise rather than an implementation
+  detail. `README.md` records the `schema` key, its current value, the full key
+  inventory, both enum domains, and the rule for when the number moves: adding a
+  key or an array element is compatible, while removing or renaming a key,
+  changing a value's type, or adding a `severity` or `verdict` value is not.
+  Array order is explicitly outside the contract.
+- A schema test that fails when the shape moves without the version. The existing
+  tests would notice a renamed or removed key by way of the value they assert; an
+  *added* key passed silently, and the enum domains were unpinned entirely. The
+  new test compares the exact key set at every level and maps every `Severity` and
+  `FileVerdict` variant through an exhaustive match with no wildcard, so a new
+  variant stops compiling rather than quietly widening the output.
 
 ### Fixed
 
