@@ -89,10 +89,9 @@ pub enum ChangeKind {
 pub struct ChangedPath {
     pub path: String,
     pub kind: ChangeKind,
-    /// Lines this path contributes to the change set. Carried per path so that
-    /// `ignore_suffixes` can drop a path's volume along with the path itself —
-    /// a `package-lock.json` that the plugin has decided to ignore must not
-    /// still trip the runaway threshold.
+    /// Lines this path contributes to the change set. Carried per path so an
+    /// ignored path takes its volume with it — a generated output that the
+    /// plugin has decided to ignore must not still trip the runaway threshold.
     pub lines_added: u64,
     pub lines_removed: u64,
     /// True for the *original* path of a rename. Both halves belong to the
@@ -319,7 +318,7 @@ pub struct WorkspaceStatus {
     /// reports. Counts alone cannot express it: a runaway is usually a
     /// workspace sharing nothing at all with its siblings.
     pub lines_changed: u64,
-    /// Distinct changed files after `ignore_suffixes`, with the origin half of
+    /// Distinct changed files after configured ignores, with the origin half of
     /// a rename counted once. A runaway tripped on the file threshold alone
     /// carries no lines, so the badge falls back to this rather than rendering
     /// a bare mark with no magnitude.
