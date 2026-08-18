@@ -46,6 +46,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   records, and only after confirming by device and inode that the file being trimmed is the
   one the plugin owns. It contains paths and branch names, which is why it is opt-in and why
   deleting it takes one command.
+- Each checkout is now predicted against the integration ref as well as against its
+  siblings. Two worktrees can be mutually clean and both conflict with `main`, and that
+  case was invisible: every prediction was pairwise. The detail pane names the ref and
+  reports `clean`, `conflict` or `unknown` per worktree, and `--json` carries
+  `target_ref`, `target_verdict`, `target_reason`, `target_approximate` and
+  `target_advisory`. Adding keys is compatible, so the schema version does not move.
+- A target verdict qualifies itself the way a pairwise one does. If the histories offer
+  more than one merge base, one is forced and the pane says the verdict approximates
+  what a real merge would do; if the worktree has a merge in progress, its snapshot
+  contains conflict markers and the verdict is advisory. Both were computed and then
+  discarded in the first pass, so a criss-cross history read as a firm answer.
+- The target verdict deliberately does not touch the badge. The badge has one slot and
+  four severities already competing for it, and a fifth source of `✘` that fires on
+  every stale branch would mute the signal that matters. The pane and `--json` carry it
+  until there is real-session evidence for doing more.
+- Nothing is fetched. The ref is read from the local ref store, exactly as the existing
+  probe chain does, so a stale `origin/main` gives an answer about where `main` *was* —
+  which is why the pane names the ref rather than refreshing it. A fetch would also
+  write to the object store and refs, which this plugin may not do.
 - A submodule's contents are now compared, so two agents editing the same file inside one
   submodule get a real verdict instead of `? unknown`. Each direct submodule is treated as
   the repository it is: its own common directory, its own index copied into scratch, its own

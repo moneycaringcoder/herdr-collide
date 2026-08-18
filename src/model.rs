@@ -240,6 +240,34 @@ impl Pairing {
     }
 }
 
+/// Whether one checkout's current state would merge into its integration ref.
+///
+/// This is deliberately separate from [`Severity`]: target conflicts are
+/// observational in this rollout and do not compete for the single badge slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetVerdict {
+    Clean,
+    Conflict,
+    Unknown,
+}
+
+/// One checkout's prediction against the ref its change set was measured from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetPrediction {
+    pub workspace_id: String,
+    /// `None` means the local ref probe found no honest integration target.
+    pub target_ref: Option<String>,
+    pub verdict: TargetVerdict,
+    /// True when a single merge base had to be forced although more than one
+    /// exists, so the verdict approximates what a real merge would do.
+    pub approximate: bool,
+    /// True when the checkout has a merge in progress and its snapshot still
+    /// contains conflict markers, so the verdict is advisory only.
+    pub advisory: bool,
+    /// Present for every unknown verdict and absent for established verdicts.
+    pub reason: Option<String>,
+}
+
 /// Worst-case state for a single workspace, which is what the badge shows.
 ///
 /// The order is the precedence order. Only one severity is ever live, so every
@@ -338,6 +366,11 @@ pub struct Report {
     pub checkouts: Vec<Checkout>,
     pub pairings: Vec<Pairing>,
     pub statuses: Vec<WorkspaceStatus>,
+    /// Per-checkout merge predictions against each repository's integration
+    /// ref. These do not feed `statuses`: changing the one-slot badge before
+    /// the target signal has been observed in real sessions would risk muting
+    /// the existing pairwise warning.
+    pub targets: Vec<TargetPrediction>,
     /// Change set per workspace id, kept so the detail view can explain *why* a
     /// checkout is degraded instead of inferring it from a missing branch.
     pub changes: Vec<(String, ChangeSet)>,
@@ -349,5 +382,11 @@ impl Report {
             .iter()
             .find(|(id, _)| id == workspace_id)
             .map(|(_, set)| set)
+    }
+
+    pub fn target_prediction(&self, workspace_id: &str) -> Option<&TargetPrediction> {
+        self.targets
+            .iter()
+            .find(|target| target.workspace_id == workspace_id)
     }
 }

@@ -257,7 +257,8 @@ Schema 2 has these keys:
 - top level: `schema`, `checkouts`, `pairings`, `statuses`, `notes`
 - each `checkouts` element: `workspace_id`, `label`, `repo_key`, `repo_root`, `checkout_path`,
   `branch`, `agent`, `is_linked_worktree`, `changed_files`, `lines_added`, `lines_removed`,
-  `has_rename`, `degraded`, `degraded_reason`
+  `has_rename`, `degraded`, `degraded_reason`, `target_ref`, `target_verdict`,
+  `target_reason`, `target_approximate`, `target_advisory`
 - each `pairings` element: `left`, `right`, `conflict_count`, `unknown_count`, `approximate`, `shared`
 - each `pairings[].shared` element: `path`, `verdict`
 - each `statuses` element: `workspace_id`, `severity`, `token`, `badge`, `overlap_count`,
@@ -340,11 +341,15 @@ badge down.
   `--history` folds start and closing transitions, summarizes repeat paths and worktree pairs, and
   reports a real last sighting or that the latest episode remains open. `--history-clear` deletes
   the file.
-- **`base_ref`** — the ref each checkout's change set is measured against, as the `<base>` in
-  `git diff <base>...HEAD`. Default `origin/HEAD`; where that does not resolve, `collide` falls back to
-  the first of `origin/main`, `origin/master`, `main`, `master`, `trunk` that exists, and finally to
-  `HEAD` — which still reports the checkout's dirty state, and only loses the committed-since-base
-  half. `--base-ref <REF>` overrides it for a single run.
+- **`base_ref`** — the local ref each checkout's change set and integration-target prediction are
+  measured against. Default `origin/HEAD`; where that does not resolve, `collide` tries, in order,
+  `origin/main`, `origin/master`, local `main`, `master`, and `trunk`, then the symbolic `HEAD` of
+  each non-`origin` remote in alphabetical order, and finally local
+  `init.defaultBranch`. If none resolves, the checkout is visibly degraded and its target verdict is
+  `unknown`; `collide` does not fabricate a `HEAD` fallback. `--base-ref <REF>` overrides the probe
+  for a single run, and a configured ref that does not resolve is likewise reported as unknown.
+  Refs are read only from the local ref store: `collide` never fetches, so a verdict against a stale
+  `origin/main` explicitly describes where that ref was, not where the remote branch is now.
 - **`git_timeout_seconds`** — cap on any single git invocation, so one slow repository cannot stall
   the refresh loop.
 
