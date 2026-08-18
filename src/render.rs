@@ -400,20 +400,28 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
     if saw_shared {
         out.push('\n');
         push_line(&mut out, "legend", width);
-        push_line(
+        // Explanations are the point of the legend, so wrap them rather than
+        // let `push_line` truncate their meaning in a narrow pane.
+        push_wrapped(
             &mut out,
-            &format!("  {CONFLICT_MARK}  conflict predicted on merge"),
+            &format!("  {CONFLICT_MARK}  "),
+            "     ",
+            "conflict predicted on merge",
             width,
         );
-        push_line(
+        push_wrapped(
             &mut out,
-            &format!("  {OVERLAP_MARK}  same file, merges clean"),
+            &format!("  {OVERLAP_MARK}  "),
+            "     ",
+            "same file, merges clean",
             width,
         );
         if saw_unknown {
-            push_line(
+            push_wrapped(
                 &mut out,
-                &format!("  {UNKNOWN_MARK}  conflict prediction unavailable"),
+                &format!("  {UNKNOWN_MARK}  "),
+                "     ",
+                "conflict prediction unavailable",
                 width,
             );
         }
@@ -421,9 +429,11 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
         // needs explaining wherever it can appear. `⚠ 4.1k` counts lines and
         // `⚠ 60f` counts files, and nothing else on screen says which.
         if saw_runaway {
-            push_line(
+            push_wrapped(
                 &mut out,
-                &format!("  {RUNAWAY_MARK}  runaway change set (f = files)"),
+                &format!("  {RUNAWAY_MARK}  "),
+                "     ",
+                "runaway change set (lines, or f = files)",
                 width,
             );
         }
