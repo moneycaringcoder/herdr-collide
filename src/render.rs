@@ -261,10 +261,12 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
         // with twenty worktrees — a hundred and ninety pairings — an
         // alphabetical order put the one conflicting pair off the bottom of the
         // screen behind six screens of clean overlaps.
+        // Re-tie equal severities on labels because this pane is read by humans;
+        // the model's id tie-break instead serves scriptable output. Both keys
+        // are total, so neither view can flicker between cycles.
         pairings.sort_by_key(|p| {
             (
-                std::cmp::Reverse(p.conflicts()),
-                std::cmp::Reverse(p.unknowns()),
+                p.severity_rank_key(),
                 display_label(&p.left_workspace_id, &checkout_by_id),
                 display_label(&p.right_workspace_id, &checkout_by_id),
             )
