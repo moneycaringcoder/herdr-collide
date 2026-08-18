@@ -204,6 +204,35 @@ impl Pairing {
             .filter(|f| f.verdict == FileVerdict::Unknown)
             .count()
     }
+
+    /// Returns the three-rung severity key used to rank pairings worst first:
+    /// conflict count, then unknown count, then overlap count.
+    ///
+    /// Unknowns precede overlaps because an unknown is a missing answer, while
+    /// an overlap is known to merge cleanly. Burying the missing answer under
+    /// the harmless one would repeat the mistake the `Unknown` severity exists
+    /// to prevent.
+    pub fn severity_rank_key(
+        &self,
+    ) -> (
+        std::cmp::Reverse<usize>,
+        std::cmp::Reverse<usize>,
+        std::cmp::Reverse<usize>,
+    ) {
+        let (mut conflicts, mut unknowns, mut overlaps) = (0, 0, 0);
+        for file in &self.shared {
+            match file.verdict {
+                FileVerdict::Conflict => conflicts += 1,
+                FileVerdict::Unknown => unknowns += 1,
+                FileVerdict::Overlap => overlaps += 1,
+            }
+        }
+        (
+            std::cmp::Reverse(conflicts),
+            std::cmp::Reverse(unknowns),
+            std::cmp::Reverse(overlaps),
+        )
+    }
 }
 
 /// Worst-case state for a single workspace, which is what the badge shows.

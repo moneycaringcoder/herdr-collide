@@ -1201,6 +1201,38 @@ fn an_undecided_pairing_outranks_a_clean_one() {
 }
 
 #[test]
+fn equally_ranked_pairings_use_display_labels_as_the_tie_breaker() {
+    let report = Report {
+        checkouts: vec![
+            checkout("a-left", "zulu", Some("main"), None),
+            checkout("a-right", "yankee", Some("main"), None),
+            checkout("z-left", "alpha", Some("main"), None),
+            checkout("z-right", "bravo", Some("main"), None),
+        ],
+        pairings: vec![
+            pairing(
+                "a-left",
+                "a-right",
+                vec![shared("z.rs", FileVerdict::Overlap)],
+            ),
+            pairing(
+                "z-left",
+                "z-right",
+                vec![shared("a.rs", FileVerdict::Overlap)],
+            ),
+        ],
+        statuses: Vec::new(),
+        changes: Vec::new(),
+    };
+
+    let text = detail_at(&report, 80);
+    assert!(
+        line_index(&text, "alpha <-> bravo") < line_index(&text, "zulu <-> yankee"),
+        "pane ties follow display labels, not workspace ids:\n{text}"
+    );
+}
+
+#[test]
 fn the_notes_sit_under_the_title_where_a_short_pane_cannot_cut_them() {
     // `draw` truncates from the bottom. A note saying a checkout could not be
     // read is the only signal that the clean-looking report below it is
