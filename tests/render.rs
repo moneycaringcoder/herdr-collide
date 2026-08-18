@@ -784,12 +784,13 @@ fn changed_submodule_contents_get_an_explanation_above_verdicts() {
     );
     assert!(
         flat.contains(
-            "snapshot records the submodule's committed pointer rather than its contents"
+            "gitlink snapshot alone cannot represent those contents, and no successful depth-one \
+             nested comparison is available"
         ),
         "{text}"
     );
     assert!(
-        flat.contains("a clean merge for this path was never checked"),
+        flat.contains("a clean merge for this path was not verified"),
         "{text}"
     );
 

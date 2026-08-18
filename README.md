@@ -399,13 +399,15 @@ Worth knowing before you trust it:
   for the snapshot instead. The consequence is that a filtered file is compared as its raw bytes: for
   git-lfs that changes nothing useful, and for a filter that rewrites text it makes that file's line
   count reflect the unfiltered content.
-- **A dirty submodule is seen but its contents are not compared.** It shows up as one changed path,
-  but the snapshot records the submodule's committed pointer rather than its contents. When
-  merge-tree finds no gitlink conflict, modified or untracked content inside it makes the verdict
-  `? unknown` rather than a clean overlap, because no clean merge of those contents was checked. A
-  change to the recorded pointer is still compared normally and can still report a conflict, even
-  when the submodule contents are also dirty. Work inside the submodule is also invisible to the
-  runaway thresholds.
+- **Dirty direct submodules are compared one repository deep.** When the same submodule path has
+  modified or untracked content in two open superproject worktrees, collide snapshots each nested
+  checkout through a scratch index and runs a nested merge. A clean nested merge earns
+  `~ overlap`; a nested conflict makes the superproject-relative submodule path `! conflict` and
+  names the conflicting nested paths in the detail notes. If either nested checkout is not
+  initialised, has no readable HEAD, times out, or otherwise cannot be compared, the path stays
+  `? unknown` rather than being guessed clean. This does not recurse into submodules of the
+  submodule. A change to the recorded gitlink is still compared normally. Work below a submodule
+  remains invisible to the runaway thresholds.
 - **A checkout can be readable only in part.** An unborn branch, a branch deleted underneath a
   worktree, a base ref that does not resolve, or two histories with no common ancestor all limit what
   can be compared. Rather than quietly reporting such a checkout as clean, the detail pane marks it
