@@ -170,6 +170,12 @@ pub enum FileVerdict {
 pub struct SharedFile {
     pub path: String,
     pub verdict: FileVerdict,
+    /// Machine-stable merge-tree token when git attributed this conflict to a
+    /// reason the pane knows how to explain, currently a rename.
+    ///
+    /// Kept out of the JSON report until that schema change can move with its
+    /// exact-key contract.
+    pub conflict_type: Option<String>,
 }
 
 /// One ordered pair of checkouts within a repo, and what they share.
