@@ -259,6 +259,11 @@ fn an_uncommitted_rename_edit_conflict_names_the_destination_path() {
         &config(),
     )
     .expect("cycle");
+    assert!(
+        cycle.notes.is_empty(),
+        "unexpected notes: {:?}",
+        cycle.notes
+    );
 
     let pairing = &cycle.report.pairings[0];
     let moved = pairing

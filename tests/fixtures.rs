@@ -579,10 +579,14 @@ impl Fixture {
     pub fn uncommitted_rename_edit_pair(&self) -> (PathBuf, PathBuf) {
         let a = self.worktree("wrename-edit-a", "wrename-edit-a");
         self.git(&a, &["mv", "shared.txt", "moved-shared.txt"]);
+        // Keep both replacements a different byte length from `line 1\n`.
+        // Under concurrent load the mtime need not advance between `git mv`
+        // and the write, so a same-size rewrite can look clean to the copied
+        // index stat cache used by the prediction snapshot.
         let from_a: String = (1..=12)
             .map(|n| {
                 if n == 1 {
-                    "FROM-A\n".to_string()
+                    "FROM-A-CHANGED\n".to_string()
                 } else {
                     format!("line {n}\n")
                 }
@@ -594,7 +598,7 @@ impl Fixture {
         let from_b: String = (1..=12)
             .map(|n| {
                 if n == 1 {
-                    "FROM-B\n".to_string()
+                    "FROM-B-CHANGED\n".to_string()
                 } else {
                     format!("line {n}\n")
                 }
