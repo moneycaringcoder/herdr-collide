@@ -20,6 +20,7 @@ use collide::collide::{
 use collide::config::Config;
 use collide::git::{self, predict_conflict, Predictor};
 use collide::model::{ChangeSet, Checkout, FileVerdict, Report, Severity, WorkTrees};
+use collide::render::detail_with_notes;
 
 use fixtures::{
     change_set, change_set_degraded, change_set_renamed, change_set_with_lines, checkout, Fixture,
@@ -162,6 +163,133 @@ fn different_line_edits_inside_a_submodule_are_an_overlap() {
     for id in ["one", "two"] {
         assert_eq!(status_of(&cycle.report, id).severity, Severity::Overlap);
     }
+}
+
+#[test]
+fn a_forced_nested_merge_base_is_disclosed() {
+    let fixture = Fixture::new("nested-criss-cross");
+    let (_superproject, first, second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    let second_submodule = second.join("embedded");
+    let base = fixture.git(&first_submodule, &["rev-parse", "HEAD"]);
+
+    fixture.git(&first_submodule, &["checkout", "-q", "-b", "nested-a"]);
+    fixture.write(&first_submodule, "a.txt", "branch a\n");
+    fixture.commit_all(&first_submodule, "nested a");
+    let a = fixture.git(&first_submodule, &["rev-parse", "HEAD"]);
+
+    fixture.git(
+        &first_submodule,
+        &["checkout", "-q", "-b", "nested-b", &base],
+    );
+    fixture.write(&first_submodule, "b.txt", "branch b\n");
+    fixture.commit_all(&first_submodule, "nested b");
+    let b = fixture.git(&first_submodule, &["rev-parse", "HEAD"]);
+
+    // These two merge commits each contain both side commits but neither
+    // contains the other merge. Git therefore reports A and B as independent
+    // best bases, without an incidental content conflict affecting the setup.
+    let a_tree = fixture.git(&first_submodule, &["rev-parse", &format!("{a}^{{tree}}")]);
+    let b_tree = fixture.git(&first_submodule, &["rev-parse", &format!("{b}^{{tree}}")]);
+    let first_tip = fixture.git(
+        &first_submodule,
+        &[
+            "commit-tree",
+            &a_tree,
+            "-p",
+            &a,
+            "-p",
+            &b,
+            "-m",
+            "first tip",
+        ],
+    );
+    let second_tip = fixture.git(
+        &first_submodule,
+        &[
+            "commit-tree",
+            &b_tree,
+            "-p",
+            &b,
+            "-p",
+            &a,
+            "-m",
+            "second tip",
+        ],
+    );
+    fixture.git(
+        &first_submodule,
+        &["update-ref", "refs/heads/nested-tip-one", &first_tip],
+    );
+    fixture.git(
+        &first_submodule,
+        &["update-ref", "refs/heads/nested-tip-two", &second_tip],
+    );
+    fixture.git(&first_submodule, &["checkout", "-q", "nested-tip-one"]);
+    fixture.git(
+        &second_submodule,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "fetch",
+            "-q",
+            first_submodule.to_str().expect("utf-8 fixture path"),
+            "refs/heads/nested-tip-two:refs/heads/nested-tip-two",
+        ],
+    );
+    fixture.git(&second_submodule, &["checkout", "-q", "nested-tip-two"]);
+
+    let bases = fixture.git(
+        &first_submodule,
+        &["merge-base", "--all", &first_tip, &second_tip],
+    );
+    assert_eq!(
+        bases.lines().count(),
+        2,
+        "fixture must retain two best nested merge bases"
+    );
+
+    // A dirty side turns its snapshot into a bare tree, forcing the predictor
+    // to choose one of the two bases rather than letting merge-tree recurse.
+    fixture.write(&first_submodule, "scratch.txt", "left\n");
+    fixture.write(&second_submodule, "scratch.txt", "right\n");
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("one", &first, "unused"),
+            checkout("two", &second, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+    assert!(
+        !cycle.report.pairings[0].approximate,
+        "a nested forced base must not mislabel the outer histories"
+    );
+    let disclosure = cycle
+        .notes
+        .iter()
+        .find(|note| note.contains("submodule `embedded` has multiple nested merge bases"))
+        .expect("nested forced merge base disclosure");
+    assert!(
+        disclosure.contains(
+            "one was forced and its verdict approximates what a real nested merge would do"
+        ),
+        "{disclosure}"
+    );
+
+    let pane = detail_with_notes(&cycle.report, &cycle.notes, 240);
+    assert!(pane.contains(disclosure), "{pane}");
+    let json = json_report(&cycle);
+    assert_eq!(json["pairings"][0]["approximate"], false);
+    assert!(
+        json["notes"]
+            .as_array()
+            .expect("JSON notes")
+            .iter()
+            .any(|note| note.as_str() == Some(disclosure)),
+        "{json}"
+    );
 }
 
 #[test]

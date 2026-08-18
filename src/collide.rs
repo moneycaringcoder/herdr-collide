@@ -862,6 +862,16 @@ fn predict_all(
                             Ok(prediction) => {
                                 let mut nested_notes = Vec::new();
                                 for nested in &prediction.submodules {
+                                    if nested.approximate {
+                                        nested_notes.push(format!(
+                                            "{} vs {}: submodule `{}` has multiple nested merge \
+                                             bases, so one was forced and its verdict approximates \
+                                             what a real nested merge would do",
+                                            pairing.left_workspace_id,
+                                            pairing.right_workspace_id,
+                                            nested.path
+                                        ));
+                                    }
                                     match nested.conflict {
                                         Some(true) => {
                                             let detail = if nested.conflicting_paths.is_empty() {

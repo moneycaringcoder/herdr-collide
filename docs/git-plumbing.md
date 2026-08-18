@@ -537,9 +537,14 @@ worktree per cycle: `rev-parse --show-toplevel` and
 Depth-one submodule comparison was measured separately on the development
 workstation with one dirty direct submodule shared by two superproject
 worktrees. After one warm-up, 30 complete `gather_for` cycles averaged
-**616.41 ms/cycle**. That includes both outer change-set collection and
-snapshots, two nested snapshots, and the outer plus nested merge prediction.
-One such submodule therefore consumes about 12.3 % of the default 5 s interval.
+**616.41 ms/cycle**. That two-worktree, one-pair measurement includes both
+outer change-set collection and snapshots, two nested snapshots, and one outer
+plus one nested merge prediction, and consumes about 12.3 % of the default 5 s
+interval in that configuration. It is not a constant cost per submodule: with
+W worktrees sharing the submodule, the nested snapshot component runs W times
+per cycle, while `merge-base`, `rev-parse`, and `merge-tree` run for each of the
+W(W−1)/2 nested pairs. The experiment did not time those components separately,
+so its aggregate percentage must not be extrapolated to larger W.
 
 Nested commands use a repository-specific object view. While snapshotting one
 nested checkout the exact write-related environment is:

@@ -311,6 +311,10 @@ fn git_ok(dir: &Path, args: &[&str], timeout: Duration) -> Result<GitOut> {
     Ok(out)
 }
 
+fn probe(dir: &Path, args: &[&str], timeout: Duration) -> Result<Option<String>> {
+    probe_with_env(dir, args, &[], timeout)
+}
+
 /// Runs a probe whose only meaningful answers are "yes" (exit 0, with output)
 /// and "no" (exit 1).
 ///
@@ -321,24 +325,6 @@ fn git_ok(dir: &Path, args: &[&str], timeout: Duration) -> Result<GitOut> {
 /// all. Only the first of those is an answer; the rest have to be errors, or a
 /// stalled git silently removes a workspace from every pairing while telling
 /// the user its branch has no commits.
-fn probe(dir: &Path, args: &[&str], timeout: Duration) -> Result<Option<String>> {
-    let out = git(dir, args, timeout)?;
-    if out.timed_out {
-        return Err(format!("git {} timed out in {}", args.join(" "), dir.display()).into());
-    }
-    match out.code {
-        Some(0) => Ok(Some(out.stdout_trimmed())),
-        Some(1) => Ok(None),
-        _ => Err(format!(
-            "git {} could not answer in {}: {}",
-            args.join(" "),
-            dir.display(),
-            out.stderr_text()
-        )
-        .into()),
-    }
-}
-
 fn probe_with_env(
     dir: &Path,
     args: &[&str],
@@ -460,6 +446,12 @@ impl HeadState {
 }
 
 /// Classifies HEAD, or fails if git could not tell us.
+pub fn head_state(checkout: &Path, timeout: Duration) -> Result<HeadState> {
+    head_state_with_env(checkout, &[], timeout)
+}
+
+/// Classifies HEAD using an explicit git environment, or fails if git could not
+/// tell us.
 ///
 /// Two earlier discriminators were wrong and both are worth recording, because
 /// the plumbing notes asserted each of them as verified fact:
@@ -482,15 +474,20 @@ impl HeadState {
 /// genuinely broken case — the ref is there and still yields no commit — which
 /// is what [`HeadState::BrokenHead`] now means.
 ///
-/// Every probe is routed through [`probe`], so a git that could not answer
-/// raises an error instead of being read as "no commit here".
-pub fn head_state(checkout: &Path, timeout: Duration) -> Result<HeadState> {
+/// Every probe is routed through [`probe_with_env`], so a git that could not
+/// answer raises an error instead of being read as "no commit here".
+fn head_state_with_env(
+    checkout: &Path,
+    envs: &[(&str, OsString)],
+    timeout: Duration,
+) -> Result<HeadState> {
     // The full ref name, not `--short`: the ref-store lookup below needs it, and
     // stripping `refs/heads/` gives the same short name a pane wants.
-    let symref = probe(checkout, &["symbolic-ref", "-q", "HEAD"], timeout)?;
-    let oid = probe(
+    let symref = probe_with_env(checkout, &["symbolic-ref", "-q", "HEAD"], envs, timeout)?;
+    let oid = probe_with_env(
         checkout,
         &["rev-parse", "--verify", "-q", "HEAD^{commit}"],
+        envs,
         timeout,
     )?;
 
@@ -505,55 +502,6 @@ pub fn head_state(checkout: &Path, timeout: Duration) -> Result<HeadState> {
         (Some(full), None) => {
             // `show-ref --verify` answers straight from the ref store: 0 the ref
             // is there, 1 it is not, 128 it is there but its object is not.
-            let exists = git(
-                checkout,
-                &["show-ref", "--verify", "--quiet", &full],
-                timeout,
-            )?;
-            if exists.timed_out || exists.code.is_none() {
-                return Err(format!(
-                    "git show-ref could not answer for {} in {}: {}",
-                    full,
-                    checkout.display(),
-                    exists.stderr_text()
-                )
-                .into());
-            }
-            let name = short(&full);
-            if exists.code == Some(1) {
-                Ok(HeadState::Unborn { name })
-            } else {
-                Ok(HeadState::BrokenHead { name })
-            }
-        }
-        // HEAD is not a symref and does not resolve: detached at something that
-        // is not there.
-        (None, None) => Ok(HeadState::BrokenHead {
-            name: "HEAD".to_string(),
-        }),
-    }
-}
-
-fn head_state_with_env(
-    checkout: &Path,
-    envs: &[(&str, OsString)],
-    timeout: Duration,
-) -> Result<HeadState> {
-    let symref = probe_with_env(checkout, &["symbolic-ref", "-q", "HEAD"], envs, timeout)?;
-    let oid = probe_with_env(
-        checkout,
-        &["rev-parse", "--verify", "-q", "HEAD^{commit}"],
-        envs,
-        timeout,
-    )?;
-    let short = |full: &str| full.strip_prefix("refs/heads/").unwrap_or(full).to_string();
-    match (symref, oid) {
-        (Some(full), Some(oid)) => Ok(HeadState::Branch {
-            name: short(&full),
-            oid,
-        }),
-        (None, Some(oid)) => Ok(HeadState::Detached { oid }),
-        (Some(full), None) => {
             let exists = run_git(
                 checkout,
                 &["show-ref", "--verify", "--quiet", &full],
@@ -576,6 +524,8 @@ fn head_state_with_env(
                 Ok(HeadState::BrokenHead { name })
             }
         }
+        // HEAD is not a symref and does not resolve: detached at something that
+        // is not there.
         (None, None) => Ok(HeadState::BrokenHead {
             name: "HEAD".to_string(),
         }),
@@ -1303,6 +1253,9 @@ pub struct SubmodulePrediction {
     pub conflicting_paths: Vec<String>,
     /// Why an unavailable comparison stayed unknown.
     pub reason: Option<String>,
+    /// True when the nested merge had multiple merge bases and one had to be
+    /// forced, so its verdict is an approximation of a real nested merge.
+    pub approximate: bool,
 }
 
 fn nested_repository_dirs(checkout: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -1802,6 +1755,10 @@ impl Predictor {
 
         let outer_env = self.odb_env(&l.common_dir);
         let mut prediction = self.predict_sides(left, right, l, r, paths, &outer_env)?;
+        if self.nested_sides.is_empty() {
+            return Ok(prediction);
+        }
+
         let left_key = canonical(left);
         let right_key = canonical(right);
         for path in paths {
@@ -1828,6 +1785,7 @@ impl Predictor {
             conflict: None,
             conflicting_paths: Vec::new(),
             reason: Some(reason),
+            approximate: false,
         };
         let (Some(left), Some(right)) = (left, right) else {
             return unavailable("one side was not primed as a direct submodule".to_string());
@@ -1878,6 +1836,7 @@ impl Predictor {
                     .filter_map(|(nested_path, hit)| hit.then_some(nested_path))
                     .collect(),
                 reason: None,
+                approximate: prediction.approximate,
             },
             Err(err) => unavailable(err.to_string()),
         }
