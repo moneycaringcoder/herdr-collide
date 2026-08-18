@@ -22,6 +22,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is scheduled and manual only, it is not a required check, and a red canary is
   a signal to read herdr's recent changes rather than a reason to hold a pull
   request.
+- Optional conflict history, off by default (`conflict_history`), and two verbs to read and
+  delete it: `collide --history` lists the paths that collide repeatedly, between which
+  worktrees and how often, and `collide --history-clear` removes the record. Two agents
+  colliding on the same file week after week is rarely a git problem and usually a design
+  one, and this plugin is the only thing positioned to notice it.
+- History records episodes rather than cycles: one record when a collision appears and one
+  when it stops, because a five-second refresh would otherwise write some seventeen thousand
+  lines a day for a single unresolved conflict. Only a real conflict opens an episode. An
+  overlap is a known-clean merge and closes one; an *unknown* is an absent answer and does
+  neither, so a predictor that fails for one cycle cannot split a single continuing collision
+  into two. A daemon restart continues an open episode rather than starting another.
+- An episode is identified by repository, path and the two workspace ids, never by branch name
+  or workspace label. Both of those are stored as well, because a person reading the history
+  needs them, but they are display text that changes when a workspace is renamed and identity
+  must not move with them.
+- Each record holds the repository key, the conflicting path, both workspace ids and labels,
+  both branch names, when the collision was first seen, and — on the closing record — when it
+  was last confirmed. `collide --history` counts episodes per path and pair, reports the last
+  sighting, and says when an episode is still open.
+- The record lives only in the plugin's own state directory, is created mode 0600, refuses to
+  follow a symlink on read or write, and is capped at 1 MiB — trimmed to the newest complete
+  records, and only after confirming by device and inode that the file being trimmed is the
+  one the plugin owns. It contains paths and branch names, which is why it is opt-in and why
+  deleting it takes one command.
 - Optional desktop notifications when a workspace *becomes* conflicting, off by default
   (`notifications_enabled`). A conflict that has existed for ten minutes is not news; the
   edge is. Only a transition into `conflict` from a non-`conflict` severity notifies:

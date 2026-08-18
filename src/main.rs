@@ -2,7 +2,7 @@
 //!
 //! Verb dispatch only; every verb is implemented in the library crate.
 
-use collide::{collide as analysis, config, daemon, render, setup, Result};
+use collide::{collide as analysis, config, daemon, history, render, setup, Result};
 
 const USAGE: &str = "\
 collide — cross-worktree collision warnings for herdr
@@ -14,6 +14,10 @@ Analysis:
   --json              Print the same report as JSON and exit
   --why <PATH>        Explain one shared path with the merge's real conflict hunks
   --watch             Live detail view, refreshing on an interval
+
+History:
+  --history           List recurring conflict episodes, most frequent first
+  --history-clear     Delete all recorded conflict episodes
 
 Badge updater:
   --enable            Start the background badge updater
@@ -48,11 +52,13 @@ const VALUED: [&str; 3] = ["--interval", "--base-ref", "--why"];
 
 /// Every verb this binary accepts. The list is explicit on purpose — see
 /// [`verb_of`].
-const VERBS: [&str; 14] = [
+const VERBS: [&str; 16] = [
     "--once",
     "--json",
     "--watch",
     "--why",
+    "--history",
+    "--history-clear",
     "--enable",
     "--disable",
     "--toggle",
@@ -146,6 +152,8 @@ fn run(args: &[String]) -> Result<()> {
             }
             analysis::run_why(&config::load_with_args(args)?, &path)
         }
+        "--history" => history::run_history(),
+        "--history-clear" => history::run_clear(),
         "--enable" => daemon::enable(args),
         "--disable" => daemon::disable(),
         "--toggle" => daemon::toggle(args),

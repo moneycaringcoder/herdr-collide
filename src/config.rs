@@ -43,6 +43,11 @@ pub struct Config {
     pub ignore_globs: Vec<String>,
     /// Predict real conflicts rather than only reporting shared paths.
     pub predict_conflicts: bool,
+    /// Persist predicted-conflict start and closing transitions. This is opt-in
+    /// because each record contains the repository key, shared path, both
+    /// workspace ids, labels and branch names, the first-seen timestamp, and
+    /// an optional last-seen timestamp when the episode closes.
+    pub conflict_history: bool,
     /// Show desktop notifications when a workspace becomes conflicting.
     /// Intrusive output is opt-in even though badge reporting is always on.
     pub notifications_enabled: bool,
@@ -73,6 +78,7 @@ impl Default for Config {
             ],
             ignore_globs: Vec::new(),
             predict_conflicts: true,
+            conflict_history: false,
             notifications_enabled: false,
             base_ref: DEFAULT_BASE_REF.to_string(),
             git_timeout: Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS),
@@ -146,6 +152,7 @@ struct FileConfig {
     ignore_suffixes: Option<Vec<String>>,
     ignore_globs: Option<Vec<String>>,
     predict_conflicts: Option<bool>,
+    conflict_history: Option<bool>,
     notifications_enabled: Option<bool>,
     base_ref: Option<String>,
     git_timeout_seconds: Option<u64>,
@@ -153,13 +160,14 @@ struct FileConfig {
 
 /// Every key `FileConfig` understands. Kept beside the struct because the
 /// unknown-key warning is only useful while the two agree.
-const KNOWN_KEYS: [&str; 9] = [
+const KNOWN_KEYS: [&str; 10] = [
     "interval_seconds",
     "runaway_files",
     "runaway_lines",
     "ignore_suffixes",
     "ignore_globs",
     "predict_conflicts",
+    "conflict_history",
     "notifications_enabled",
     "base_ref",
     "git_timeout_seconds",
@@ -239,6 +247,9 @@ fn load_file() -> Config {
     }
     if let Some(predict) = file.predict_conflicts {
         config.predict_conflicts = predict;
+    }
+    if let Some(enabled) = file.conflict_history {
+        config.conflict_history = enabled;
     }
     if let Some(enabled) = file.notifications_enabled {
         config.notifications_enabled = enabled;
@@ -372,6 +383,12 @@ pub fn lock_file() -> PathBuf {
 /// re-execs itself, so a badge that never appears leaves nothing to read.
 pub fn log_file() -> PathBuf {
     state_dir().join("updater.log")
+}
+
+/// Append-only conflict episodes. Unlike the user-facing config file, this is
+/// runtime state and must never be placed in a checkout or repository metadata.
+pub fn history_file() -> PathBuf {
+    state_dir().join("conflict-history.jsonl")
 }
 
 /// herdr injects empty strings for absent context, so empty means unset.

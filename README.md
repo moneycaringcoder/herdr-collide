@@ -235,6 +235,8 @@ collide --once      # one-shot report
 collide --json      # the same report as JSON
 collide --why path/to/file  # show the real conflicting hunks for one shared path
 collide --watch     # the live detail view
+collide --history   # recurring conflict episodes, most frequent first
+collide --history-clear
 collide --enable | --disable | --toggle
 collide --setup | --setup-rollback
 collide --interval 10 --watch
@@ -308,6 +310,7 @@ badge down.
   ],
   "ignore_globs": [],
   "predict_conflicts": true,
+  "conflict_history": false,
   "notifications_enabled": false,
   "base_ref": "origin/HEAD",
   "git_timeout_seconds": 10
@@ -339,6 +342,18 @@ badge down.
   `--why` command always predicts because it cannot explain a path honestly without doing so.
 - **`predict_conflicts`** — set to `false` to report shared paths only. Cheaper, and it stops
   distinguishing a real conflict from a plain overlap.
+- **`conflict_history`** — opt in to an append-only record of real predicted-conflict episodes.
+  Default `false`: until enabled, no history file is created. Each transition record stores the
+  repository key, shared path, both worktrees' stable ids, display labels and branch names, the
+  first-seen timestamp, and a last-seen timestamp on the closing transition. Records live only in
+  `$HERDR_PLUGIN_STATE_DIR/conflict-history.jsonl` (normally
+  `~/.local/state/herdr/plugins/moneycaringcoder.collide/conflict-history.jsonl`), never in a
+  repository, and are kept private to the user. The newest complete records are retained when the
+  file crosses 1 MiB. An unavailable (`Unknown`) prediction neither starts nor ends an episode;
+  only a known-clean overlap, the path leaving the shared set, or the pair disappearing closes one.
+  `--history` folds start and closing transitions, summarizes repeat paths and worktree pairs, and
+  reports a real last sighting or that the latest episode remains open. `--history-clear` deletes
+  the file.
 - **`notifications_enabled`** — opt in to desktop notifications when a workspace becomes
   conflicting after a non-conflicting baseline. Default `false`. The first cycle establishes a
   baseline, unchanged conflicts do not repeat, and a workspace cannot show notifications more than
