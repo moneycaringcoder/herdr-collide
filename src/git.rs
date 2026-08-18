@@ -875,9 +875,8 @@ fn filter_overrides(checkout: &Path, timeout: Duration) -> Vec<String> {
 /// silently empty one.
 pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<ChangeSet> {
     let mut kinds: BTreeMap<String, ChangeKind> = BTreeMap::new();
-    // Line volume, attributed per path so that a path dropped by
-    // `ignore_suffixes` takes its lines with it rather than leaving them to
-    // trip the runaway threshold on their own.
+    // Line volume is attributed per path so an ignored path takes its lines
+    // with it rather than leaving them to trip the runaway threshold alone.
     let mut volume: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     // The *original* half of a rename. It belongs in the change set — a
     // sibling editing the old name really does collide — but one rename is one
