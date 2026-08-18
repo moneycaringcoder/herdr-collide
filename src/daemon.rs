@@ -245,6 +245,20 @@ pub fn run(config: &Config) -> Result<()> {
         eprintln!("collide: {note}");
         reported_notes.push(note);
     }
+    // History has its own per-(pair, path) edge detector. Rebuild its live
+    // edges from unmatched starts so restarting the daemon cannot manufacture
+    // another episode for a conflict that never ended.
+    let mut conflict_history = if config.conflict_history {
+        match crate::history::load_records() {
+            Ok(records) => crate::history::EpisodeTracker::from_records(&records),
+            Err(err) => {
+                eprintln!("collide: cannot restore conflict history: {err}");
+                crate::history::EpisodeTracker::default()
+            }
+        }
+    } else {
+        crate::history::EpisodeTracker::default()
+    };
 
     loop {
         if stopping.load(Ordering::SeqCst) {
@@ -264,7 +278,13 @@ pub fn run(config: &Config) -> Result<()> {
             }
         }
         if let Some(connected) = client.as_mut() {
-            if let Err(err) = refresh(connected, config, &active, &mut reported_notes) {
+            if let Err(err) = refresh(
+                connected,
+                config,
+                &active,
+                &mut reported_notes,
+                &mut conflict_history,
+            ) {
                 eprintln!("collide: refresh failed: {err}");
                 // Only a transport failure is worth redialling for; an error
                 // envelope means the server is fine and answered us.
@@ -348,6 +368,7 @@ fn refresh(
     config: &Config,
     active: &Mutex<LitTokens>,
     reported_notes: &mut Vec<String>,
+    conflict_history: &mut crate::history::EpisodeTracker,
 ) -> Result<()> {
     let checkouts = client.checkouts()?;
     let skipped = client.skipped_worktrees();
@@ -370,6 +391,13 @@ fn refresh(
     // config.toml takes the note away without a restart.
     if let Some(note) = crate::setup::sidebar_token_note() {
         notes.push(note);
+    }
+
+    if let Err(err) = crate::history::record_cycle(config, conflict_history, &cycle.report) {
+        // History is an optional observation, not permission to take the badge
+        // updater down. Leaving the tracker uncommitted makes the edge retry;
+        // making the error a note keeps a persistent cause to one log line.
+        notes.push(format!("cannot record conflict history: {err}"));
     }
 
     for note in new_notes(reported_notes, &notes) {

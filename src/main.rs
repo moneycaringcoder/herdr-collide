@@ -2,7 +2,7 @@
 //!
 //! Verb dispatch only; every verb is implemented in the library crate.
 
-use collide::{collide as analysis, config, daemon, render, setup, Result};
+use collide::{collide as analysis, config, daemon, history, render, setup, Result};
 
 const USAGE: &str = "\
 collide — cross-worktree collision warnings for herdr
@@ -13,6 +13,10 @@ Analysis:
   --once              Print a one-shot collision report and exit
   --json              Print the same report as JSON and exit
   --watch             Live detail view, refreshing on an interval
+
+History:
+  --history           List recurring conflict episodes, most frequent first
+  --history-clear     Delete all recorded conflict episodes
 
 Badge updater:
   --enable            Start the background badge updater
@@ -47,10 +51,12 @@ const VALUED: [&str; 2] = ["--interval", "--base-ref"];
 
 /// Every verb this binary accepts. The list is explicit on purpose — see
 /// [`verb_of`].
-const VERBS: [&str; 13] = [
+const VERBS: [&str; 15] = [
     "--once",
     "--json",
     "--watch",
+    "--history",
+    "--history-clear",
     "--enable",
     "--disable",
     "--toggle",
@@ -122,6 +128,8 @@ fn run(args: &[String]) -> Result<()> {
         "--once" => analysis::run_once(&config::load_with_args(args)?),
         "--json" => analysis::run_json(&config::load_with_args(args)?),
         "--watch" => render::run_watch(&config::load_with_args(args)?),
+        "--history" => history::run_history(),
+        "--history-clear" => history::run_clear(),
         "--enable" => daemon::enable(args),
         "--disable" => daemon::disable(),
         "--toggle" => daemon::toggle(args),

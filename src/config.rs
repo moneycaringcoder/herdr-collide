@@ -41,6 +41,11 @@ pub struct Config {
     pub ignore_suffixes: Vec<String>,
     /// Predict real conflicts rather than only reporting shared paths.
     pub predict_conflicts: bool,
+    /// Persist predicted-conflict start and closing transitions. This is opt-in
+    /// because each record contains the repository key, shared path, both
+    /// workspace ids, labels and branch names, the first-seen timestamp, and
+    /// an optional last-seen timestamp when the episode closes.
+    pub conflict_history: bool,
     /// Ref every checkout's change set is measured against, as the `<base>` in
     /// `diff <base>...HEAD`. `git::change_set` degrades rather than failing when
     /// it does not resolve, which is the common case for a repo with no
@@ -67,6 +72,7 @@ impl Default for Config {
                 "go.sum".into(),
             ],
             predict_conflicts: true,
+            conflict_history: false,
             base_ref: DEFAULT_BASE_REF.to_string(),
             git_timeout: Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS),
         }
@@ -138,18 +144,20 @@ struct FileConfig {
     runaway_lines: Option<u64>,
     ignore_suffixes: Option<Vec<String>>,
     predict_conflicts: Option<bool>,
+    conflict_history: Option<bool>,
     base_ref: Option<String>,
     git_timeout_seconds: Option<u64>,
 }
 
 /// Every key `FileConfig` understands. Kept beside the struct because the
 /// unknown-key warning is only useful while the two agree.
-const KNOWN_KEYS: [&str; 7] = [
+const KNOWN_KEYS: [&str; 8] = [
     "interval_seconds",
     "runaway_files",
     "runaway_lines",
     "ignore_suffixes",
     "predict_conflicts",
+    "conflict_history",
     "base_ref",
     "git_timeout_seconds",
 ];
@@ -225,6 +233,9 @@ fn load_file() -> Config {
     }
     if let Some(predict) = file.predict_conflicts {
         config.predict_conflicts = predict;
+    }
+    if let Some(enabled) = file.conflict_history {
+        config.conflict_history = enabled;
     }
     if let Some(base_ref) = file.base_ref.filter(|r| !r.trim().is_empty()) {
         config.base_ref = base_ref;
@@ -355,6 +366,12 @@ pub fn lock_file() -> PathBuf {
 /// re-execs itself, so a badge that never appears leaves nothing to read.
 pub fn log_file() -> PathBuf {
     state_dir().join("updater.log")
+}
+
+/// Append-only conflict episodes. Unlike the user-facing config file, this is
+/// runtime state and must never be placed in a checkout or repository metadata.
+pub fn history_file() -> PathBuf {
+    state_dir().join("conflict-history.jsonl")
 }
 
 /// herdr injects empty strings for absent context, so empty means unset.
