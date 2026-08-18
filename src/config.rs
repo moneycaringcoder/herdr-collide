@@ -153,7 +153,7 @@ struct FileConfig {
 
 /// Every key `FileConfig` understands. Kept beside the struct because the
 /// unknown-key warning is only useful while the two agree.
-const KNOWN_KEYS: [&str; 8] = [
+const KNOWN_KEYS: [&str; 9] = [
     "interval_seconds",
     "runaway_files",
     "runaway_lines",
