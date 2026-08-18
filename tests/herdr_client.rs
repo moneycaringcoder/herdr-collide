@@ -189,6 +189,7 @@ fn notification_report(severity: Severity) -> Report {
             shared: vec![SharedFile {
                 path: "src/lib.rs".to_string(),
                 verdict: FileVerdict::Conflict,
+                conflict_type: None,
             }],
             approximate: false,
         }],
