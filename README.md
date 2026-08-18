@@ -49,6 +49,7 @@ In the sidebar, each workspace picks up a short badge next to its branch name:
 ```
   api       feature/api     ✘ 2
   ui        feature/ui      ✘ 2
+  web       feature/web     ⧉ 1
   docs      docs/readme     ? 1
   spike     spike/parser    ⚠ 4.2k
   vendored  vendor/import   ? 1
@@ -100,7 +101,7 @@ legend
   ✘  conflict predicted on merge
   ⧉  same file, merges clean
   ?  conflict prediction unavailable
-  ⚠  runaway change set (f = files)
+  ⚠  runaway change set (lines, or f = files)
 ```
 
 That block is a capture from a real run against a six-worktree fixture, not a mock-up — which is why

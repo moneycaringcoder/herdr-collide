@@ -1263,20 +1263,63 @@ fn the_unknown_legend_keys_off_the_severity_as_well_as_the_verdicts() {
 }
 
 #[test]
-fn the_runaway_mark_is_explained_wherever_it_can_appear() {
-    // `⚠ 4.1k` counts lines and `⚠ 60f` counts files, and nothing else on
-    // screen says which.
-    // It also stays out of the legend when no workspace is a runaway.
-    assert!(!detail(&report()).contains("runaway change set"));
+fn a_lines_based_runaway_badge_and_legend_name_lines_as_the_default_unit() {
+    assert_eq!(badge(&runaway("w", 4_100)), "\u{26a0} 4.1k");
+
+    let mut with_runaway = report();
+    with_runaway.statuses[2] = runaway("w3", 4_100);
+    let text = detail(&with_runaway);
+    assert_eq!(
+        line_with(&text, "runaway change set"),
+        "  \u{26a0}  runaway change set (lines, or f = files)"
+    );
+}
+
+#[test]
+fn a_file_count_runaway_badge_and_legend_explain_the_f_suffix() {
+    assert_eq!(badge(&file_runaway("w", 60)), "\u{26a0} 60f");
 
     let mut with_runaway = report();
     with_runaway.statuses[2] = file_runaway("w3", 60);
     let text = detail(&with_runaway);
+    assert_eq!(
+        line_with(&text, "runaway change set"),
+        "  \u{26a0}  runaway change set (lines, or f = files)"
+    );
     assert!(
         line_with(&text, "salvage [").contains("\u{26a0} 60f"),
         "{text}"
     );
-    assert!(text.contains("runaway change set"), "{text}");
+}
+
+#[test]
+fn a_narrow_pane_preserves_the_complete_runaway_explanation() {
+    let mut with_runaway = report();
+    with_runaway.statuses[2] = runaway("w3", 4_100);
+
+    for width in [20, 24, 40] {
+        let text = detail_at(&with_runaway, width);
+        assert!(
+            flatten(&text).contains("runaway change set (lines, or f = files)"),
+            "the explanation was cut at width {width}:\n{text}"
+        );
+        assert!(
+            widest(&text) <= width,
+            "width {width} produced a {}-column line:\n{text}",
+            widest(&text)
+        );
+    }
+}
+
+#[test]
+fn the_runaway_legend_appears_only_when_a_workspace_is_runaway() {
+    let explanation = "runaway change set (lines, or f = files)";
+    assert!(!detail(&report()).contains(explanation));
+
+    let mut with_runaway = report();
+    with_runaway.statuses[2] = file_runaway("w3", 60);
+    let text = detail(&with_runaway);
+    assert!(text.contains(explanation), "{text}");
 }
 
 // ---------------------------------------------------------------------------
