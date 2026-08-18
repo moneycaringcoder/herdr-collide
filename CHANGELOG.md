@@ -25,6 +25,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A dirty submodule is no longer reported as a harmless overlap. `status`
+  reports it as one changed path, but the snapshot records the submodule's
+  committed gitlink rather than its contents, so `merge-tree` compared two
+  identical gitlinks and found nothing — and the pair was reported `⧉ overlap`,
+  whose legend reads *"same file, merges clean"*. It now reports `? unknown`,
+  and the detail pane says the contents were never compared. Contents are still
+  not compared; that remains a separate, larger change.
+- A submodule whose *recorded commit* changed keeps its real verdict. Those two
+  gitlinks are genuinely comparable, so answering "I do not know" there would
+  discard a fact the plugin already has. Only modified or untracked content
+  inside the submodule is uncomparable, and a path git flags as conflicting is
+  still a conflict whatever its contents are doing.
 - The runaway badge carries two different units and the legend named only one of
   them. `⚠ 4.2k` is a changed-line count and `⚠ 60f` is a file count, but the
   legend read `runaway change set (f = files)`, which explains the suffix and
