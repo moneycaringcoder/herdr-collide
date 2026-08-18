@@ -39,6 +39,8 @@ pub struct Config {
     /// Paths matching these suffixes never count as changes. Lockfiles and
     /// build output overlap constantly and mean nothing.
     pub ignore_suffixes: Vec<String>,
+    /// Repository-relative paths matching these globs never count as changes.
+    pub ignore_globs: Vec<String>,
     /// Predict real conflicts rather than only reporting shared paths.
     pub predict_conflicts: bool,
     /// Ref every checkout's change set is measured against, as the `<base>` in
@@ -66,6 +68,7 @@ impl Default for Config {
                 "poetry.lock".into(),
                 "go.sum".into(),
             ],
+            ignore_globs: Vec::new(),
             predict_conflicts: true,
             base_ref: DEFAULT_BASE_REF.to_string(),
             git_timeout: Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS),
@@ -137,6 +140,7 @@ struct FileConfig {
     runaway_files: Option<usize>,
     runaway_lines: Option<u64>,
     ignore_suffixes: Option<Vec<String>>,
+    ignore_globs: Option<Vec<String>>,
     predict_conflicts: Option<bool>,
     base_ref: Option<String>,
     git_timeout_seconds: Option<u64>,
@@ -144,11 +148,12 @@ struct FileConfig {
 
 /// Every key `FileConfig` understands. Kept beside the struct because the
 /// unknown-key warning is only useful while the two agree.
-const KNOWN_KEYS: [&str; 7] = [
+const KNOWN_KEYS: [&str; 8] = [
     "interval_seconds",
     "runaway_files",
     "runaway_lines",
     "ignore_suffixes",
+    "ignore_globs",
     "predict_conflicts",
     "base_ref",
     "git_timeout_seconds",
@@ -222,6 +227,9 @@ fn load_file() -> Config {
     }
     if let Some(suffixes) = file.ignore_suffixes {
         config.ignore_suffixes = suffixes;
+    }
+    if let Some(globs) = file.ignore_globs {
+        config.ignore_globs = globs;
     }
     if let Some(predict) = file.predict_conflicts {
         config.predict_conflicts = predict;

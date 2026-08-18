@@ -297,6 +297,7 @@ badge down.
     "poetry.lock",
     "go.sum"
   ],
+  "ignore_globs": [],
   "predict_conflicts": true,
   "base_ref": "origin/HEAD",
   "git_timeout_seconds": 10
@@ -311,6 +312,18 @@ badge down.
 - **`ignore_suffixes`** — paths ending in any of these never count as a change. Lockfiles overlap
   constantly and mean nothing, so they are excluded by default. Setting the key replaces the whole
   list rather than adding to it.
+- **`ignore_globs`** — repository-relative path globs, matched as whole paths from the repository
+  root. `*` matches within one path component and `**` may cross `/`, but `**` does not absorb a
+  literal slash beside it: `**/node_modules/` matches `app/node_modules/x` but not
+  `node_modules/x`, and `**/*.gen.rs` does not match the root file `a.gen.rs`. Use `**.gen.rs` to
+  match that suffix at every depth, including `a.gen.rs`, `src/a.gen.rs`, and
+  `src/deep/a.gen.rs`. A trailing `/` selects a matched directory and everything below it. A
+  literal trailing-slash rule also matches a file with that exact repository-relative name so
+  changed submodule pointers are covered: `vendor/` matches a regular file or submodule pointer
+  at `vendor`, while `vendor/**` and `vendor/*` do not. There is no `?`, character class, brace
+  expansion, or negation; those characters are literal. For example, `vendor/**` matches
+  `vendor/a/b` but not `my-vendor/a`. The default is an empty list. Setting the key replaces the
+  whole list rather than adding to it.
 - **`predict_conflicts`** — set to `false` to report shared paths only. Cheaper, and it stops
   distinguishing a real conflict from a plain overlap.
 - **`base_ref`** — the local ref each checkout's change set and integration-target prediction are

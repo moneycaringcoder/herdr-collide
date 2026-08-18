@@ -41,6 +41,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   probe chain does, so a stale `origin/main` gives an answer about where `main` *was* —
   which is why the pane names the ref rather than refreshing it. A fetch would also
   write to the object store and refs, which this plugin may not do.
+- `ignore_globs`, a second and additive path-ignore list beside `ignore_suffixes`, for
+  the generated directory, vendored tree or build output path that no extension covers.
+  `*` matches within one path component, `**` may cross `/` without absorbing the
+  separator beside it, and a trailing `/` selects a directory tree. Patterns are
+  anchored at the repository root, so `vendor/**` does not match `my-vendor/a`, and
+  `**.gen.rs` is the spelling that reaches every depth. The default is empty, so
+  nothing changes for an existing installation, and setting the key replaces the whole
+  list as `ignore_suffixes` already does.
+- A matching path is dropped from all four places a path can count: the pairing
+  intersection, the runaway file count, the runaway line count, and the admission of a
+  conflicting path the predictor named but no change set listed. Filtering only the
+  first is how an ignored lockfile previously came back as a runaway badge, so each of
+  the four has its own test.
 - The `--json` schema is now a documented promise rather than an implementation
   detail. `README.md` records the `schema` key, its current value, the full key
   inventory, both enum domains, and the rule for when the number moves: adding a
