@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::config::Config;
 use crate::git;
 use crate::model::{
-    ChangeSet, Checkout, FileVerdict, Pairing, Report, Severity, SharedFile, WorkTrees,
-    WorkspaceStatus,
+    ChangeSet, Checkout, FileVerdict, Pairing, Report, Severity, SharedFile, TargetPrediction,
+    TargetVerdict, WorkTrees, WorkspaceStatus,
 };
 use crate::Result;
 
@@ -136,6 +136,7 @@ pub fn analyse(
         checkouts: checkouts.to_vec(),
         pairings,
         statuses,
+        targets: Vec::new(),
         changes: changes.to_vec(),
     }
 }
@@ -674,10 +675,22 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
 
     agree_on_repo_root(&mut verified, &trees);
 
+    // The integration ref is a repository property. Resolve its name once from
+    // one checkout and reuse that exact answer for every change set and target
+    // prediction in the repository.
+    let mut integration_refs = BTreeMap::new();
+    for checkout in &verified {
+        integration_refs
+            .entry(checkout.repo_key.clone())
+            .or_insert_with(|| base_ref_for(&checkout.checkout_path, config));
+    }
+
     let mut changes: Vec<(String, ChangeSet)> = Vec::new();
     for checkout in &verified {
-        let base = base_ref_for(&checkout.checkout_path, config);
-        match git::change_set(&checkout.checkout_path, &base, config.git_timeout) {
+        let base = integration_refs
+            .get(&checkout.repo_key)
+            .expect("every verified checkout has an integration-ref decision");
+        match git::change_set(&checkout.checkout_path, base, config.git_timeout) {
             Ok(set) => changes.push((checkout.workspace_id.clone(), set)),
             Err(err) => {
                 notes.push(format!("{}: {err}", checkout.checkout_path.display()));
@@ -702,7 +715,7 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
 
     let mut report = analyse(&verified, &changes, &trees, config);
 
-    if config.predict_conflicts && !report.pairings.is_empty() {
+    if config.predict_conflicts && !verified.is_empty() {
         let by_id: BTreeMap<&str, &Checkout> = verified
             .iter()
             .map(|c| (c.workspace_id.as_str(), c))
@@ -710,24 +723,44 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
 
         let mut predictor = git::Predictor::new(config.git_timeout)?;
         let mut primed: BTreeSet<&str> = BTreeSet::new();
-        for pairing in &report.pairings {
-            for id in [
-                pairing.left_workspace_id.as_str(),
-                pairing.right_workspace_id.as_str(),
-            ] {
-                if primed.contains(id) {
-                    continue;
+        let mut prime_errors: BTreeMap<&str, String> = BTreeMap::new();
+        for checkout in &verified {
+            // Snapshot each worktree once. The same cached tree feeds every
+            // pairwise prediction and the integration-target prediction.
+            match predictor.prime(&checkout.checkout_path) {
+                Ok(()) => {
+                    primed.insert(checkout.workspace_id.as_str());
                 }
-                let Some(checkout) = by_id.get(id) else {
-                    continue;
-                };
-                // Snapshot each worktree once and reuse its tree OID for every
-                // pair it takes part in.
-                match predictor.prime(&checkout.checkout_path) {
-                    Ok(()) => {
-                        primed.insert(id);
-                    }
-                    Err(err) => notes.push(format!("{}: {err}", checkout.checkout_path.display())),
+                Err(err) => {
+                    let message = err.to_string();
+                    notes.push(format!("{}: {message}", checkout.checkout_path.display()));
+                    prime_errors.insert(checkout.workspace_id.as_str(), message);
+                }
+            }
+        }
+
+        // Resolve each local ref to a commit before the immutable prediction
+        // phase. No command here fetches or consults a remote; a stale
+        // origin/main intentionally remains a prediction about that stale ref.
+        let mut target_prime_errors: BTreeMap<&crate::model::RepoKey, String> = BTreeMap::new();
+        let mut target_primed: BTreeSet<&crate::model::RepoKey> = BTreeSet::new();
+        for checkout in &verified {
+            let target_ref = integration_refs
+                .get(&checkout.repo_key)
+                .expect("integration-ref decision exists");
+            if target_ref == git::NO_INTEGRATION_REF
+                || target_primed.contains(&checkout.repo_key)
+                || target_prime_errors.contains_key(&checkout.repo_key)
+                || !primed.contains(checkout.workspace_id.as_str())
+            {
+                continue;
+            }
+            match predictor.prime_target(&checkout.checkout_path, target_ref) {
+                Ok(()) => {
+                    target_primed.insert(&checkout.repo_key);
+                }
+                Err(err) => {
+                    target_prime_errors.insert(&checkout.repo_key, err.to_string());
                 }
             }
         }
@@ -749,6 +782,62 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
 
         let predictions = predict_all(&predictor, &jobs, &mut notes);
         apply_predictions(&mut report, &predictions, &changes, config);
+
+        report.targets = verified
+            .iter()
+            .map(|checkout| {
+                let target_ref = integration_refs
+                    .get(&checkout.repo_key)
+                    .expect("integration-ref decision exists");
+                if target_ref == git::NO_INTEGRATION_REF {
+                    return TargetPrediction {
+                        workspace_id: checkout.workspace_id.clone(),
+                        target_ref: None,
+                        verdict: TargetVerdict::Unknown,
+                        reason: Some("no integration ref found".to_string()),
+                    };
+                }
+                let unknown = |reason: String| TargetPrediction {
+                    workspace_id: checkout.workspace_id.clone(),
+                    target_ref: Some(target_ref.clone()),
+                    verdict: TargetVerdict::Unknown,
+                    reason: Some(reason),
+                };
+                if let Some(err) = prime_errors.get(checkout.workspace_id.as_str()) {
+                    return unknown(format!(
+                        "prediction against `{target_ref}` failed: checkout could not be primed: {err}"
+                    ));
+                }
+                if let Some(err) = target_prime_errors.get(&checkout.repo_key) {
+                    return unknown(err.clone());
+                }
+                match predictor.predict_target(&checkout.checkout_path, target_ref) {
+                    Ok(conflicts) => TargetPrediction {
+                        workspace_id: checkout.workspace_id.clone(),
+                        target_ref: Some(target_ref.clone()),
+                        verdict: if conflicts {
+                            TargetVerdict::Conflict
+                        } else {
+                            TargetVerdict::Clean
+                        },
+                        reason: None,
+                    },
+                    Err(err) => {
+                        let detail = err.to_string();
+                        if detail.starts_with("no common ancestor with ") {
+                            unknown(detail)
+                        } else {
+                            unknown(format!("prediction against `{target_ref}` failed: {detail}"))
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Deliberately do not recompute statuses here. The badge has one slot,
+        // and promoting every stale-branch target conflict before this signal
+        // has been observed in real sessions could mute the pairwise collision
+        // warning users already rely on.
     }
 
     Ok(Cycle {
@@ -940,7 +1029,10 @@ pub fn text_report(cycle: &Cycle) -> String {
 ///       "branch": string|null, "agent": string|null, "is_linked_worktree": bool,
 ///       "changed_files": int, "lines_added": int, "lines_removed": int,
 ///       "has_rename": bool,
-///       "degraded": bool, "degraded_reason": string|null } ],
+///       "degraded": bool, "degraded_reason": string|null,
+///       "target_ref": string|null,
+///       "target_verdict": "clean|conflict|unknown"|null,
+///       "target_reason": string|null } ],
 ///   "pairings":  [ { "left", "right", "conflict_count", "unknown_count",
 ///                    "approximate": bool,
 ///                    "shared": [ { "path", "verdict": "conflict|overlap|unknown" } ] } ],
@@ -969,6 +1061,7 @@ pub fn json_report(cycle: &Cycle) -> serde_json::Value {
                 .get(checkout.workspace_id.as_str())
                 .copied()
                 .unwrap_or(&empty);
+            let target = cycle.report.target_prediction(&checkout.workspace_id);
             serde_json::json!({
                 "workspace_id": checkout.workspace_id,
                 "label": checkout.workspace_label,
@@ -986,6 +1079,9 @@ pub fn json_report(cycle: &Cycle) -> serde_json::Value {
                 "has_rename": set.has_rename,
                 "degraded": set.degraded,
                 "degraded_reason": set.degraded_reason,
+                "target_ref": target.and_then(|target| target.target_ref.as_deref()),
+                "target_verdict": target.map(|target| target_verdict_name(target.verdict)),
+                "target_reason": target.and_then(|target| target.reason.as_deref()),
             })
         })
         .collect();
@@ -1053,5 +1149,13 @@ pub fn verdict_name(verdict: FileVerdict) -> &'static str {
         FileVerdict::Overlap => "overlap",
         FileVerdict::Conflict => "conflict",
         FileVerdict::Unknown => "unknown",
+    }
+}
+
+pub fn target_verdict_name(verdict: TargetVerdict) -> &'static str {
+    match verdict {
+        TargetVerdict::Clean => "clean",
+        TargetVerdict::Conflict => "conflict",
+        TargetVerdict::Unknown => "unknown",
     }
 }

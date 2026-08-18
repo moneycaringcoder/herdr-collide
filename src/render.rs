@@ -29,7 +29,8 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::git;
 use crate::model::{
-    ChangeSet, Checkout, FileVerdict, Pairing, RepoKey, Report, Severity, WorkspaceStatus,
+    ChangeSet, Checkout, FileVerdict, Pairing, RepoKey, Report, Severity, TargetVerdict,
+    WorkspaceStatus,
 };
 use crate::Result;
 
@@ -238,6 +239,23 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
         for checkout in &group {
             let status = status_by_id.get(checkout.workspace_id.as_str()).copied();
             push_line(&mut out, &worktree_line(checkout, status, width), width);
+            if let Some(target) = report.target_prediction(&checkout.workspace_id) {
+                let named = target
+                    .target_ref
+                    .as_deref()
+                    .map(|target_ref| format!("target {target_ref}"))
+                    .unwrap_or_else(|| "target integration ref".to_string());
+                let verdict = match target.verdict {
+                    TargetVerdict::Clean => "clean",
+                    TargetVerdict::Conflict => "conflict",
+                    TargetVerdict::Unknown => "unknown",
+                };
+                let line = match &target.reason {
+                    Some(reason) => format!("{named}: {verdict} \u{2014} {reason}"),
+                    None => format!("{named}: {verdict}"),
+                };
+                push_wrapped(&mut out, "      ", "      ", &line, width);
+            }
             if status.map(|s| s.runaway).unwrap_or(false) {
                 saw_runaway = true;
             }

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use collide::model::{
     ChangeKind, ChangeSet, ChangedPath, Checkout, FileVerdict, Pairing, RepoKey, Report, Severity,
-    SharedFile, WorkspaceStatus,
+    SharedFile, TargetPrediction, TargetVerdict, WorkspaceStatus,
 };
 use collide::render::{
     abbreviate, abbreviate_files, badge, detail, detail_at, detail_with_notes, BADGE_COLUMNS,
@@ -283,6 +283,7 @@ fn report() -> Report {
             status("w2", Severity::Conflict, 2, 3),
             status("w3", Severity::Clean, 0, 0),
         ],
+        targets: Vec::new(),
         changes: Vec::new(),
     }
 }
@@ -585,6 +586,23 @@ fn each_worktree_shows_its_branch_and_agent() {
 }
 
 #[test]
+fn detail_names_the_integration_ref_and_target_verdict() {
+    let mut report = report();
+    report.targets.push(TargetPrediction {
+        workspace_id: "w1".to_string(),
+        target_ref: Some("refs/remotes/origin/main".to_string()),
+        verdict: TargetVerdict::Conflict,
+        reason: None,
+    });
+
+    let text = detail(&report);
+    assert!(
+        text.contains("target refs/remotes/origin/main: conflict"),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_degraded_checkout_says_why() {
     let mut report = report();
     report.changes.push((
@@ -857,6 +875,7 @@ fn a_variation_selector_is_measured_as_the_emoji_it_selects() {
             vec![shared(&path, FileVerdict::Conflict)],
         )],
         statuses: Vec::new(),
+        targets: Vec::new(),
         changes: Vec::new(),
     };
 
@@ -1094,6 +1113,7 @@ fn the_pairing_that_matters_sorts_to_the_top() {
         checkouts,
         pairings,
         statuses: Vec::new(),
+        targets: Vec::new(),
         changes: Vec::new(),
     };
     let text = detail_at(&report, 80);
@@ -1122,6 +1142,7 @@ fn an_undecided_pairing_outranks_a_clean_one() {
             pairing("w1", "w3", vec![shared("b.rs", FileVerdict::Unknown)]),
         ],
         statuses: Vec::new(),
+        targets: Vec::new(),
         changes: Vec::new(),
     };
     let text = detail_at(&report, 80);

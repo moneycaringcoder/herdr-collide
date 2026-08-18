@@ -19,7 +19,9 @@ use collide::collide::{
 };
 use collide::config::Config;
 use collide::git::{self, predict_conflict, Predictor};
-use collide::model::{Checkout, FileVerdict, Report, Severity, WorkTrees};
+use collide::model::{
+    Checkout, FileVerdict, Report, Severity, TargetPrediction, TargetVerdict, WorkTrees,
+};
 
 use fixtures::{
     change_set, change_set_degraded, change_set_renamed, change_set_with_lines, checkout, Fixture,
@@ -647,6 +649,9 @@ fn json_report_is_stable_and_documented() {
     assert_eq!(one["has_rename"], false);
     assert_eq!(one["degraded"], false);
     assert!(one["degraded_reason"].is_null());
+    assert!(one["target_ref"].is_null());
+    assert!(one["target_verdict"].is_null());
+    assert!(one["target_reason"].is_null());
 
     let pairing = &json["pairings"][0];
     assert_eq!(pairing["left"], "one");
@@ -721,6 +726,10 @@ fn status_of<'a>(report: &'a Report, id: &str) -> &'a collide::model::WorkspaceS
         .iter()
         .find(|s| s.workspace_id == id)
         .expect("status")
+}
+
+fn target_of<'a>(report: &'a Report, id: &str) -> &'a TargetPrediction {
+    report.target_prediction(id).expect("target prediction")
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +970,199 @@ fn a_configured_base_ref_that_does_not_resolve_degrades_rather_than_falling_back
         .as_deref()
         .unwrap()
         .contains(git::DEGRADED_MISSING_BASE_REF));
+    let target = target_of(&cycle.report, "wt");
+    assert_eq!(target.verdict, TargetVerdict::Unknown);
+    assert_eq!(
+        target.reason.as_deref(),
+        Some("integration ref `refs/heads/no-such-ref` does not resolve to a commit")
+    );
+    assert_eq!(target.target_ref.as_deref(), Some("refs/heads/no-such-ref"));
+}
+
+#[test]
+fn mutually_clean_worktrees_can_both_conflict_with_the_integration_target() {
+    let fixture = Fixture::new("target-conflict-pair-clean");
+    let a = fixture.worktree("target-a", "target-a");
+    let b = fixture.worktree("target-b", "target-b");
+
+    fixture.write(&a, "conflict.txt", "A-SIDE\nbeta\ngamma\n");
+    fixture.commit_all(&a, "a edits line one");
+    fixture.write(&b, "conflict.txt", "alpha\nbeta\nB-SIDE\n");
+    fixture.commit_all(&b, "b edits line three");
+    fixture.write(
+        &fixture.repo,
+        "conflict.txt",
+        "TARGET-ONE\nbeta\nTARGET-THREE\n",
+    );
+    fixture.commit_all(&fixture.repo, "target edits both lines");
+
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let cycle = collide::collide::gather_for(
+        vec![checkout("a", &a, &key.0), checkout("b", &b, &key.0)],
+        &config(),
+    )
+    .expect("gather");
+
+    let pair = cycle.report.pairings.first().expect("pairwise overlap");
+    assert_eq!(pair.shared[0].verdict, FileVerdict::Overlap);
+    assert_eq!(pair.conflicts(), 0, "the two worktrees merge cleanly");
+    for id in ["a", "b"] {
+        let target = target_of(&cycle.report, id);
+        assert_eq!(target.verdict, TargetVerdict::Conflict, "{id}");
+        assert_eq!(target.target_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(target.reason, None);
+    }
+    assert_eq!(
+        status_of(&cycle.report, "a").severity,
+        Severity::Overlap,
+        "target conflicts deliberately do not compete for the badge"
+    );
+
+    let pane = collide::render::detail(&cycle.report);
+    assert_eq!(
+        pane.matches("target refs/heads/main: conflict").count(),
+        2,
+        "{pane}"
+    );
+    let json = json_report(&cycle);
+    assert!(
+        json["checkouts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|checkout| checkout["target_verdict"] == "conflict"),
+        "{json}"
+    );
+    assert_eq!(json["pairings"][0]["shared"][0]["verdict"], "overlap");
+}
+
+#[test]
+fn pairwise_conflict_can_still_merge_cleanly_into_the_integration_target() {
+    let fixture = Fixture::new("pair-conflict-target-clean");
+    let a = fixture.worktree("pair-a", "pair-a");
+    let b = fixture.worktree("pair-b", "pair-b");
+
+    fixture.write(&a, "conflict.txt", "A-SIDE\nbeta\ngamma\n");
+    fixture.commit_all(&a, "a edits line one");
+    fixture.write(&b, "conflict.txt", "B-SIDE\nbeta\ngamma\n");
+    fixture.commit_all(&b, "b edits line one");
+    fixture.write(&fixture.repo, "conflict.txt", "alpha\nbeta\nTARGET-THREE\n");
+    fixture.commit_all(&fixture.repo, "target edits line three");
+
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let cycle = collide::collide::gather_for(
+        vec![checkout("a", &a, &key.0), checkout("b", &b, &key.0)],
+        &config(),
+    )
+    .expect("gather");
+
+    assert_eq!(
+        cycle.report.pairings[0].shared[0].verdict,
+        FileVerdict::Conflict
+    );
+    assert_eq!(target_of(&cycle.report, "a").verdict, TargetVerdict::Clean);
+    assert_eq!(target_of(&cycle.report, "b").verdict, TargetVerdict::Clean);
+}
+
+#[test]
+fn no_integration_ref_makes_every_target_verdict_unknown() {
+    let fixture = Fixture::new("target-no-ref");
+    let a = fixture.worktree("no-ref-a", "no-ref-a");
+    let b = fixture.worktree("no-ref-b", "no-ref-b");
+    fixture.git(&fixture.repo, &["update-ref", "-d", "refs/heads/main"]);
+
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let cycle = collide::collide::gather_for(
+        vec![checkout("a", &a, &key.0), checkout("b", &b, &key.0)],
+        &config(),
+    )
+    .expect("gather");
+    for id in ["a", "b"] {
+        let target = target_of(&cycle.report, id);
+        assert_eq!(target.verdict, TargetVerdict::Unknown);
+        assert_eq!(target.target_ref, None);
+        assert_eq!(target.reason.as_deref(), Some("no integration ref found"));
+    }
+}
+
+#[test]
+fn unrelated_integration_target_is_unknown_not_a_conflict() {
+    let fixture = Fixture::new("target-unrelated");
+    let (_related, orphan) = fixture.unrelated_history_pair();
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let cycle = collide::collide::gather_for(vec![checkout("orphan", &orphan, &key.0)], &config())
+        .expect("gather");
+
+    let target = target_of(&cycle.report, "orphan");
+    assert_eq!(target.verdict, TargetVerdict::Unknown);
+    assert_eq!(
+        target.reason.as_deref(),
+        Some("no common ancestor with `refs/heads/main`")
+    );
+}
+
+#[test]
+fn dirty_target_prediction_uses_the_worktree_snapshot() {
+    let fixture = Fixture::new("target-dirty");
+    let dirty = fixture.worktree("dirty-target", "dirty-target");
+    fixture.write(&dirty, "conflict.txt", "DIRTY-WORKTREE\nbeta\ngamma\n");
+    fixture.write(
+        &fixture.repo,
+        "conflict.txt",
+        "INTEGRATION-TARGET\nbeta\ngamma\n",
+    );
+    fixture.commit_all(&fixture.repo, "target edits line one");
+
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let cycle = collide::collide::gather_for(vec![checkout("dirty", &dirty, &key.0)], &config())
+        .expect("gather");
+    assert_eq!(
+        target_of(&cycle.report, "dirty").verdict,
+        TargetVerdict::Conflict
+    );
+}
+
+#[test]
+fn target_prediction_reuses_the_primed_snapshot_without_resnapshotting() {
+    let fixture = Fixture::new("target-reuses-snapshot");
+    let dirty = fixture.worktree("cached-dirty", "cached-dirty");
+    fixture.write(&dirty, "conflict.txt", "DIRTY-WORKTREE\nbeta\ngamma\n");
+    fixture.write(
+        &fixture.repo,
+        "conflict.txt",
+        "INTEGRATION-TARGET\nbeta\ngamma\n",
+    );
+    fixture.commit_all(&fixture.repo, "target edits line one");
+
+    let mut predictor = Predictor::new(TIMEOUT).expect("predictor");
+    predictor.prime(&dirty).expect("prime checkout");
+    predictor
+        .prime_target(&dirty, "refs/heads/main")
+        .expect("prime target");
+
+    // If predict_target snapshots again, this replacement makes the side
+    // byte-identical to the target and the conflict disappears.
+    fixture.write(&dirty, "conflict.txt", "INTEGRATION-TARGET\nbeta\ngamma\n");
+    assert!(
+        predictor
+            .predict_target(&dirty, "refs/heads/main")
+            .expect("target prediction"),
+        "prediction ignored the snapshot cached by prime"
+    );
+}
+
+#[test]
+fn json_reports_target_ref_verdict_and_reason() {
+    let fixture = Fixture::new("target-json");
+    let wt = fixture.worktree("json-wt", "json-wt");
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let cycle =
+        collide::collide::gather_for(vec![checkout("wt", &wt, &key.0)], &config()).expect("gather");
+    let json = json_report(&cycle);
+    let checkout = &json["checkouts"][0];
+    assert_eq!(checkout["target_ref"], "refs/heads/main");
+    assert_eq!(checkout["target_verdict"], "clean");
+    assert_eq!(checkout["target_reason"], serde_json::Value::Null);
 }
 
 #[test]

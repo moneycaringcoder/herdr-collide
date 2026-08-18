@@ -1198,6 +1198,7 @@ pub struct Predictor {
     scratch: PathBuf,
     odb: PathBuf,
     sides: HashMap<PathBuf, Side>,
+    targets: HashMap<(PathBuf, String), Side>,
 }
 
 impl Predictor {
@@ -1219,6 +1220,7 @@ impl Predictor {
             scratch,
             odb,
             sides: HashMap::new(),
+            targets: HashMap::new(),
         })
     }
 
@@ -1251,6 +1253,44 @@ impl Predictor {
         }
         let side = self.build_side(checkout)?;
         self.sides.insert(key, side);
+        Ok(())
+    }
+
+    /// Resolves one local integration ref and caches its commit once per
+    /// repository. Call this during the sequential prime phase; predictions
+    /// only read the cached side and can then fan out through `&self`.
+    pub fn prime_target(&mut self, checkout: &Path, target_ref: &str) -> Result<()> {
+        let common_dir = self.side(checkout)?.common_dir.clone();
+        let key = (common_dir.clone(), target_ref.to_string());
+        if self.targets.contains_key(&key) {
+            return Ok(());
+        }
+
+        let peeled = format!("{target_ref}^{{commit}}");
+        let resolved = git(
+            checkout,
+            &["rev-parse", "--verify", "-q", &peeled],
+            self.timeout,
+        )?;
+        if resolved.timed_out || resolved.code.is_none() {
+            return Err(format!("resolving integration ref `{target_ref}` timed out").into());
+        }
+        if !resolved.ok() || resolved.stdout_trimmed().is_empty() {
+            return Err(
+                format!("integration ref `{target_ref}` does not resolve to a commit").into(),
+            );
+        }
+
+        self.targets.insert(
+            key,
+            Side {
+                common_dir,
+                head: resolved.stdout_trimmed(),
+                tree: None,
+                dirty: false,
+                unmerged: false,
+            },
+        );
         Ok(())
     }
 
@@ -1446,7 +1486,7 @@ impl Predictor {
         // which has both change sets. A second, differently-informed filter one
         // layer down can only disagree with it, and a clean pair costs 1.77 ms
         // to answer properly (docs/git-plumbing.md, "merge-tree cost").
-        let (args_owned, approximate) = self.merge_tree_args(left, l, r)?;
+        let (args_owned, approximate) = self.merge_tree_args(left, l, r, None)?;
         prediction.approximate = approximate;
         let base_args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
         let env = self.odb_env(&l.common_dir);
@@ -1511,29 +1551,52 @@ impl Predictor {
         Ok(prediction)
     }
 
-    /// Builds the trailing merge-tree arguments and reports whether a single
-    /// merge base had to be forced.
-    ///
-    /// Two checkouts with no common ancestor get one answer here regardless of
-    /// how dirty they are: an error, which the caller turns into "prediction
-    /// could not run". The dirty path used to substitute the empty tree as the
-    /// base, which makes every shared path an add/add and reports a confident
-    /// conflict on all of them, while the clean path let `merge-tree` refuse
-    /// with `refusing to merge unrelated histories`. The same two orphan
-    /// branches therefore flipped between "unknown" and "everything conflicts"
-    /// depending on whether one of them happened to have a stray untracked file.
-    /// With no common ancestor there is no merge to predict, and `Unknown` is
-    /// the honest verdict.
-    fn merge_tree_args(&self, cwd: &Path, l: &Side, r: &Side) -> Result<(Vec<String>, bool)> {
-        if !l.dirty && !r.dirty {
-            // Both sides are commits, so no `--merge-base`: merge-tree then
-            // resolves multiple bases recursively, which beats any single base
-            // we could pick on a criss-cross history.
-            return Ok((vec![l.head.clone(), r.head.clone()], false));
-        }
+    /// Predicts whether one already-primed checkout conflicts with the cached
+    /// local integration ref. The checkout's snapshot tree is reused verbatim;
+    /// this path never reads status or creates another snapshot.
+    pub fn predict_target(&self, checkout: &Path, target_ref: &str) -> Result<bool> {
+        let side = self.side(checkout)?;
+        let key = (side.common_dir.clone(), target_ref.to_string());
+        let target = self.targets.get(&key).ok_or_else(|| {
+            format!(
+                "integration ref `{target_ref}` was not primed for {}",
+                checkout.display()
+            )
+        })?;
 
-        // A dirty side is a bare tree, and a tree carries no history, so the
-        // base has to be supplied explicitly.
+        // Establishing the target is a separate claim from running merge-tree:
+        // unrelated histories have no meaningful "clean" or "conflict"
+        // verdict, even though tree-mode plumbing can make them look like an
+        // add/add conflict.
+        let bases = self.merge_bases(checkout, side, target)?;
+        if bases.is_empty() {
+            return Err(format!("no common ancestor with `{target_ref}`").into());
+        }
+        let (args_owned, _) =
+            self.merge_tree_args(checkout, side, target, Some(bases.as_slice()))?;
+        let base_args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+        let env = self.odb_env(&side.common_dir);
+        let mut args = vec!["merge-tree", "--write-tree", "-z", "--name-only"];
+        args.extend(base_args.iter().copied());
+        let named = run_git(checkout, &args, &env, self.timeout)?;
+        if named.code != Some(1) && named.code != Some(0) {
+            return Err(format!(
+                "merge-tree --name-only failed against `{target_ref}`: {}",
+                named.stderr_text()
+            )
+            .into());
+        }
+        if named.stdout.is_empty() {
+            return Err(format!(
+                "merge-tree reported failure with no output against `{target_ref}`: {}",
+                named.stderr_text()
+            )
+            .into());
+        }
+        Ok(named.code == Some(1))
+    }
+
+    fn merge_bases(&self, cwd: &Path, l: &Side, r: &Side) -> Result<Vec<String>> {
         let bases = git(
             cwd,
             &["merge-base", "--all", &l.head, &r.head],
@@ -1547,13 +1610,62 @@ impl Predictor {
             )
             .into());
         }
-        let list: Vec<String> = bases
+        let list = bases
             .stdout_trimmed()
             .lines()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        if !bases.ok() || list.is_empty() {
+        if bases.ok() || bases.code == Some(1) {
+            Ok(list)
+        } else {
+            Err(format!(
+                "merge-base failed in {}: {}",
+                cwd.display(),
+                bases.stderr_text()
+            )
+            .into())
+        }
+    }
+
+    /// Builds the trailing merge-tree arguments and reports whether a single
+    /// merge base had to be forced.
+    ///
+    /// Two checkouts with no common ancestor get one answer here regardless of
+    /// how dirty they are: an error, which the caller turns into "prediction
+    /// could not run". The dirty path used to substitute the empty tree as the
+    /// base, which makes every shared path an add/add and reports a confident
+    /// conflict on all of them, while the clean path let `merge-tree` refuse
+    /// with `refusing to merge unrelated histories`. The same two orphan
+    /// branches therefore flipped between "unknown" and "everything conflicts"
+    /// depending on whether one of them happened to have a stray untracked file.
+    /// With no common ancestor there is no merge to predict, and `Unknown` is
+    /// the honest verdict.
+    fn merge_tree_args(
+        &self,
+        cwd: &Path,
+        l: &Side,
+        r: &Side,
+        known_bases: Option<&[String]>,
+    ) -> Result<(Vec<String>, bool)> {
+        if !l.dirty && !r.dirty {
+            // Both sides are commits, so no `--merge-base`: merge-tree then
+            // resolves multiple bases recursively, which beats any single base
+            // we could pick on a criss-cross history.
+            return Ok((vec![l.head.clone(), r.head.clone()], false));
+        }
+
+        // A dirty side is a bare tree, and a tree carries no history, so the
+        // base has to be supplied explicitly.
+        let owned_bases;
+        let list = match known_bases {
+            Some(bases) => bases,
+            None => {
+                owned_bases = self.merge_bases(cwd, l, r)?;
+                owned_bases.as_slice()
+            }
+        };
+        if list.is_empty() {
             return Err(format!(
                 "no common ancestor between {} and {}, so this pair cannot be predicted",
                 l.head, r.head

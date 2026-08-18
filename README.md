@@ -283,11 +283,15 @@ badge down.
   list rather than adding to it.
 - **`predict_conflicts`** — set to `false` to report shared paths only. Cheaper, and it stops
   distinguishing a real conflict from a plain overlap.
-- **`base_ref`** — the ref each checkout's change set is measured against, as the `<base>` in
-  `git diff <base>...HEAD`. Default `origin/HEAD`; where that does not resolve, `collide` falls back to
-  the first of `origin/main`, `origin/master`, `main`, `master`, `trunk` that exists, and finally to
-  `HEAD` — which still reports the checkout's dirty state, and only loses the committed-since-base
-  half. `--base-ref <REF>` overrides it for a single run.
+- **`base_ref`** — the local ref each checkout's change set and integration-target prediction are
+  measured against. Default `origin/HEAD`; where that does not resolve, `collide` tries, in order,
+  `origin/main`, `origin/master`, local `main`, `master`, and `trunk`, then the symbolic `HEAD` of
+  each non-`origin` remote in configured remote order, and finally local
+  `init.defaultBranch`. If none resolves, the checkout is visibly degraded and its target verdict is
+  `unknown`; `collide` does not fabricate a `HEAD` fallback. `--base-ref <REF>` overrides the probe
+  for a single run, and a configured ref that does not resolve is likewise reported as unknown.
+  Refs are read only from the local ref store: `collide` never fetches, so a verdict against a stale
+  `origin/main` explicitly describes where that ref was, not where the remote branch is now.
 - **`git_timeout_seconds`** — cap on any single git invocation, so one slow repository cannot stall
   the refresh loop.
 
