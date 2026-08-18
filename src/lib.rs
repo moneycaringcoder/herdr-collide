@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod git;
 pub mod herdr;
 pub mod history;
+pub mod ignore;
 pub mod model;
 pub mod render;
 pub mod setup;
