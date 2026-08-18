@@ -478,6 +478,34 @@ fn merge_tree_conflict_types_exclude_auto_merging_and_never_repeat() {
 }
 
 #[test]
+fn merge_tree_conflict_records_retain_their_path_association() {
+    let fixture = Fixture::new("mt-path-types");
+    let (a, _b) = fixture.rename_rename_pair();
+    let (code, stdout) = fixture.merge_tree(
+        &a,
+        &["--write-tree", "-z", "--name-only", "rename-a", "rename-b"],
+    );
+    assert_eq!(code, 1, "the fixture pair was supposed to conflict");
+
+    let parsed = parse_merge_tree_z(&stdout);
+    assert_eq!(parsed.conflicts.len(), 1, "{parsed:?}");
+    assert_eq!(
+        parsed.conflicts[0].paths,
+        vec!["renamed.txt", "renamed-a.txt", "renamed-b.txt"],
+        "all paths in the three-path message record must stay attached to its token"
+    );
+    assert_eq!(
+        parsed.conflicts[0].conflict_type,
+        git::CONFLICT_RENAME_RENAME
+    );
+    assert_eq!(
+        parsed.conflict_types,
+        vec![git::CONFLICT_RENAME_RENAME.to_string()],
+        "the flat compatibility set is derived from the retained records"
+    );
+}
+
+#[test]
 fn change_set_unions_dirty_and_committed_paths_with_line_counts() {
     let fixture = Fixture::new("union");
     let wt = fixture.worktree("wt", "wt");

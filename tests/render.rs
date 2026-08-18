@@ -233,6 +233,7 @@ fn shared(path: &str, verdict: FileVerdict) -> SharedFile {
     SharedFile {
         path: path.to_string(),
         verdict,
+        conflict_type: None,
     }
 }
 
@@ -1039,6 +1040,40 @@ fn the_verdict_word_comes_back_once_there_is_room_for_it() {
     let line = line_with(&narrow, "src/git.rs");
     assert!(!line.contains("conflict"), "{line:?}");
     assert!(line.contains('\u{2718}'), "{line:?}");
+}
+
+#[test]
+fn a_rename_annotation_is_rendered_on_the_conflicting_file_line() {
+    let mut report = report();
+    let file = report.pairings[0]
+        .shared
+        .iter_mut()
+        .find(|file| file.path == "src/git.rs")
+        .expect("conflicting file");
+    file.conflict_type = Some(git::CONFLICT_RENAME_RENAME.to_string());
+
+    let text = detail_at(&report, 80);
+    let line = line_with(&text, "src/git.rs");
+    assert!(
+        line.contains("\u{2718} conflict  src/git.rs  (rename)"),
+        "{line:?}"
+    );
+}
+
+#[test]
+fn a_narrow_file_line_drops_the_rename_annotation_before_the_path() {
+    let mut report = report();
+    let file = report.pairings[0]
+        .shared
+        .iter_mut()
+        .find(|file| file.path == "src/git.rs")
+        .expect("conflicting file");
+    file.conflict_type = Some(git::CONFLICT_RENAME_RENAME.to_string());
+
+    let text = detail_at(&report, 24);
+    let line = line_with(&text, "src/git.rs");
+    assert!(line.ends_with("src/git.rs"), "path was displaced: {line:?}");
+    assert!(!line.contains("rename"), "{line:?}");
 }
 
 #[test]
