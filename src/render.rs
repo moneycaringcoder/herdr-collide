@@ -339,9 +339,9 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
                     "    ",
                     "    ",
                     &format!(
-                        "unknown: submodule contents differ at {paths}; the snapshot records the \
-                         submodule's committed pointer rather than its contents, so a clean merge \
-                         for {scope} was never checked."
+                        "unknown: submodule contents differ at {paths}; the gitlink snapshot alone \
+                         cannot represent those contents, and no successful depth-one nested \
+                         comparison is available, so a clean merge for {scope} was not verified."
                     ),
                     width,
                 );

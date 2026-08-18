@@ -96,45 +96,184 @@ fn uncommitted_edits_to_the_same_line_are_a_conflict() {
 }
 
 #[test]
-fn dirty_contents_in_the_same_submodule_are_unknown_end_to_end() {
-    let fixture = Fixture::new("dirty-submodule-pair");
+fn same_line_edits_inside_a_submodule_are_a_conflict() {
+    let fixture = Fixture::new("dirty-submodule-conflict");
     let (_superproject, first, second, first_submodule) =
         fixture.superproject_with_submodule("embedded");
     let second_submodule = second.join("embedded");
-    fixture.write(&first_submodule, "payload.txt", "first worktree payload\n");
+    fixture.write(&first_submodule, "payload.txt", "FIRST-LONG\nbeta\ngamma\n");
     fixture.write(
         &second_submodule,
         "payload.txt",
-        "second worktree payload\n",
+        "SECOND-LONGER\nbeta\ngamma\n",
     );
 
-    let checkouts = vec![
-        checkout("one", &first, "unused"),
-        checkout("two", &second, "unused"),
-    ];
-    let cycle = collide::collide::gather_for(checkouts, &config()).expect("cycle");
-    assert!(cycle.notes.is_empty(), "{:?}", cycle.notes);
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("one", &first, "unused"),
+            checkout("two", &second, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
     assert_eq!(cycle.report.pairings.len(), 1);
-    assert_eq!(cycle.report.pairings[0].shared.len(), 1);
-    assert_eq!(cycle.report.pairings[0].shared[0].path, "embedded");
-    assert_eq!(
-        cycle.report.pairings[0].shared[0].verdict,
-        FileVerdict::Unknown
+    let shared = &cycle.report.pairings[0].shared[0];
+    assert_eq!(shared.path, "embedded");
+    assert_eq!(shared.verdict, FileVerdict::Conflict);
+    assert!(
+        cycle
+            .notes
+            .iter()
+            .any(|note| note.contains("nested paths `payload.txt` conflict")),
+        "nested conflicting paths were not explained: {:?}",
+        cycle.notes
     );
     for id in ["one", "two"] {
-        let status = status_of(&cycle.report, id);
-        assert_eq!(status.severity, Severity::Unknown);
-        assert_eq!(status.unknown_count, 1);
-        assert_eq!(status.overlap_count, 0);
-        // One unknown shared file, so the badge carries its count. A bare `?`
-        // is the other case: a checkout git could not read at all, which is
-        // unknown with nothing to point at.
-        assert_eq!(collide::render::badge(status), "? 1");
+        assert_eq!(status_of(&cycle.report, id).severity, Severity::Conflict);
     }
 }
 
 #[test]
-fn divergent_committed_gitlinks_are_reported_as_a_real_conflict() {
+fn different_line_edits_inside_a_submodule_are_an_overlap() {
+    let fixture = Fixture::new("dirty-submodule-overlap");
+    let (_superproject, first, second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    let second_submodule = second.join("embedded");
+    fixture.write(&first_submodule, "payload.txt", "FIRST-LONG\nbeta\ngamma\n");
+    fixture.write(
+        &second_submodule,
+        "payload.txt",
+        "alpha\nbeta\nTHIRD-LONGER\n",
+    );
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("one", &first, "unused"),
+            checkout("two", &second, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+    assert!(cycle.notes.is_empty(), "{:?}", cycle.notes);
+    assert_eq!(
+        cycle.report.pairings[0].shared[0].verdict,
+        FileVerdict::Overlap
+    );
+    for id in ["one", "two"] {
+        assert_eq!(status_of(&cycle.report, id).severity, Severity::Overlap);
+    }
+}
+
+#[test]
+fn an_uninitialised_submodule_side_stays_unknown() {
+    let fixture = Fixture::new("uninitialised-submodule");
+    let (_superproject, first, second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    let second_submodule = second.join("embedded");
+
+    fixture.write(&first_submodule, "payload.txt", "committed\nbeta\ngamma\n");
+    fixture.commit_all(&first_submodule, "new nested pointer");
+    let oid = fixture.git(&first_submodule, &["rev-parse", "HEAD"]);
+    fixture.git(
+        &second,
+        &["update-index", "--cacheinfo", "160000", &oid, "embedded"],
+    );
+    fixture.write(&first_submodule, "payload.txt", "dirty\nbeta\ngamma\n");
+    std::fs::remove_dir_all(&second_submodule).expect("remove nested checkout");
+    std::fs::create_dir(&second_submodule).expect("leave uninitialised submodule directory");
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("one", &first, "unused"),
+            checkout("two", &second, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+    assert_eq!(
+        cycle.report.pairings[0].shared[0].verdict,
+        FileVerdict::Unknown
+    );
+    assert!(
+        cycle.notes.iter().any(|note| {
+            note.contains("submodule `embedded` comparison is unknown")
+                && note.contains("right side unavailable")
+        }),
+        "missing nested checkout was not explained: {:?}",
+        cycle.notes
+    );
+}
+
+#[test]
+fn an_unborn_nested_head_stays_unknown() {
+    let fixture = Fixture::new("unborn-submodule");
+    let (_superproject, first, second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    let second_submodule = second.join("embedded");
+    fixture.write(&first_submodule, "payload.txt", "FIRST-LONG\nbeta\ngamma\n");
+    fixture.git(
+        &second_submodule,
+        &["symbolic-ref", "HEAD", "refs/heads/unborn"],
+    );
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("one", &first, "unused"),
+            checkout("two", &second, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+    assert_eq!(
+        cycle.report.pairings[0].shared[0].verdict,
+        FileVerdict::Unknown
+    );
+    assert!(
+        cycle
+            .notes
+            .iter()
+            .any(|note| note.contains("nested HEAD `unborn` is unborn")),
+        "unborn nested HEAD was not explained: {:?}",
+        cycle.notes
+    );
+}
+
+#[test]
+fn nested_scratch_state_is_removed_when_predictor_drops() {
+    let fixture = Fixture::new("nested-scratch-drop");
+    let (_superproject, first, second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    fixture.write(&first_submodule, "payload.txt", "FIRST-LONG\nbeta\ngamma\n");
+
+    let predictor = {
+        let mut predictor = Predictor::new(TIMEOUT).expect("predictor");
+        predictor.prime(&first).expect("prime outer");
+        predictor.prime(&second).expect("prime outer");
+        predictor.prime_submodule(&first, "embedded");
+        predictor.prime_submodule(&second, "embedded");
+        let scratch = predictor.scratch_dir().to_path_buf();
+        assert!(
+            std::fs::read_dir(&scratch)
+                .expect("scratch directory")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("submodule-")),
+            "nested ODB was not created inside predictor scratch"
+        );
+        (predictor, scratch)
+    };
+    let scratch = predictor.1.clone();
+    drop(predictor);
+    assert!(
+        !scratch.exists(),
+        "predictor left nested scratch state behind"
+    );
+}
+
+#[test]
+fn c_only_divergent_gitlink_changes_remain_a_conflict() {
     let fixture = Fixture::new("conflicting-gitlinks");
     let (_superproject, first, second, first_submodule) =
         fixture.superproject_with_submodule("embedded");
@@ -601,6 +740,7 @@ fn conflict_outranks_runaway_and_overlap() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), true)],
+            submodules: Vec::new(),
             failed: false,
             approximate: false,
         }],
@@ -635,6 +775,7 @@ fn a_clean_prediction_downgrades_unknown_to_overlap() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), false)],
+            submodules: Vec::new(),
             failed: false,
             approximate: false,
         }],
@@ -665,6 +806,7 @@ fn a_failed_prediction_leaves_the_verdict_unknown() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: Vec::new(),
+            submodules: Vec::new(),
             failed: true,
             approximate: false,
         }],
@@ -692,6 +834,7 @@ fn json_report_is_stable_and_documented() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), true)],
+            submodules: Vec::new(),
             failed: false,
             approximate: false,
         }],
@@ -772,6 +915,7 @@ fn json_reports_the_unknown_severity_the_schema_was_bumped_for() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: Vec::new(),
+            submodules: Vec::new(),
             failed: true,
             approximate: true,
         }],
@@ -1092,6 +1236,7 @@ fn a_pair_whose_prediction_failed_is_unknown_and_never_an_overlap() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: Vec::new(),
+        submodules: Vec::new(),
         failed: true,
         approximate: false,
     }];
@@ -1128,6 +1273,7 @@ fn a_pair_whose_prediction_succeeded_and_found_nothing_is_a_real_overlap() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("shared.txt".to_string(), false)],
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1154,6 +1300,7 @@ fn a_clean_prediction_cannot_turn_changed_submodule_contents_into_overlap() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("embedded".to_string(), false)],
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1213,6 +1360,7 @@ fn a_git_flagged_submodule_conflict_still_reports_conflict() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("embedded".to_string(), true)],
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1519,6 +1667,7 @@ fn a_rename_probe_that_finds_nothing_leaves_no_pairing_behind() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: Vec::new(),
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1545,6 +1694,7 @@ fn an_approximate_prediction_is_carried_through_to_the_pairing() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("shared.txt".to_string(), true)],
+        submodules: Vec::new(),
         failed: false,
         approximate: true,
     }];
@@ -1653,6 +1803,7 @@ fn a_conflicting_path_in_neither_change_set_is_only_believed_when_a_rename_expla
             ("shared.txt".to_string(), false),
             ("media.bin".to_string(), true),
         ],
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1717,6 +1868,7 @@ fn an_ignored_path_cannot_return_as_an_unlisted_conflict() {
             ("src/a.rs".to_string(), false),
             ("Cargo.lock".to_string(), true),
         ],
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1767,6 +1919,7 @@ fn a_listed_unignored_path_still_returns_as_a_conflict() {
             ("src/a.rs".to_string(), false),
             ("vendor/notes.md".to_string(), true),
         ],
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1809,6 +1962,7 @@ fn a_path_admitted_only_by_a_rename_marks_the_pairing_approximate() {
             ("shared.txt".to_string(), false),
             ("moved.rs".to_string(), true),
         ],
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1839,6 +1993,7 @@ fn a_path_admitted_only_by_a_rename_marks_the_pairing_approximate() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("shared.txt".to_string(), true)],
+        submodules: Vec::new(),
         failed: false,
         approximate: false,
     }];
@@ -1981,6 +2136,7 @@ fn the_severity_ladder_is_total_and_ordered_as_documented() {
                                 left_workspace_id: "one".to_string(),
                                 right_workspace_id: "two".to_string(),
                                 verdicts,
+                                submodules: Vec::new(),
                                 failed: false,
                                 approximate: false,
                             },
@@ -1989,6 +2145,7 @@ fn the_severity_ladder_is_total_and_ordered_as_documented() {
                                 left_workspace_id: "one".to_string(),
                                 right_workspace_id: "three".to_string(),
                                 verdicts: Vec::new(),
+                                submodules: Vec::new(),
                                 failed: true,
                                 approximate: false,
                             },
@@ -2069,6 +2226,7 @@ fn an_unknown_verdict_outranks_a_runaway() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: Vec::new(),
+            submodules: Vec::new(),
             failed: true,
             approximate: false,
         }],

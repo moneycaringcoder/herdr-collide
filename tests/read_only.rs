@@ -467,59 +467,91 @@ fn the_full_pipeline_changes_nothing_in_the_repository() {
 }
 
 #[test]
-fn the_full_pipeline_leaves_the_submodule_repository_unchanged() {
+fn nested_prediction_leaves_both_submodule_repositories_unchanged() {
     let _serialised = scratch_guard();
 
     let fixture = Fixture::new("submodule-read-only");
-    let (superproject, first, second, submodule) = fixture.superproject_with_submodule("embedded");
-    let pipeline_worktrees = vec![superproject, first, second];
-    // The submodule is protected by the fingerprint but is not handed to
-    // `checkouts_for`, which would falsely assign the superproject's repo key.
-    let mut protected_checkouts = pipeline_worktrees.clone();
-    protected_checkouts.push(submodule.clone());
+    let (_superproject, first, second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    let second_submodule = second.join("embedded");
+    fixture.write(&first_submodule, "payload.txt", "FIRST-LONG\nbeta\ngamma\n");
+    fixture.write(
+        &second_submodule,
+        "payload.txt",
+        "SECOND-LONGER\nbeta\ngamma\n",
+    );
 
-    let submodule_git_dir = PathBuf::from(fixture.git(
-        &submodule,
-        &["rev-parse", "--path-format=absolute", "--git-dir"],
-    ));
-    let raw_common_dir = PathBuf::from(fixture.git(
-        &submodule,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    ));
-    let submodule_common_dir = std::fs::canonicalize(&raw_common_dir).unwrap_or(raw_common_dir);
+    let pipeline_worktrees = vec![first.clone(), second.clone()];
+    // Both nested clones are protected independently: each has its own index,
+    // refs, reflogs and object store, and neither is a herdr checkout.
+    let protected_checkouts = vec![
+        first,
+        second,
+        first_submodule.clone(),
+        second_submodule.clone(),
+    ];
+    let nested: Vec<(PathBuf, PathBuf)> = [&first_submodule, &second_submodule]
+        .iter()
+        .map(|checkout| {
+            let git_dir = PathBuf::from(fixture.git(
+                checkout,
+                &["rev-parse", "--path-format=absolute", "--git-dir"],
+            ));
+            let raw_common_dir = PathBuf::from(fixture.git(
+                checkout,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            ));
+            let common_dir = std::fs::canonicalize(&raw_common_dir).unwrap_or(raw_common_dir);
+            (git_dir, common_dir)
+        })
+        .collect();
+
     let before = fingerprint(&fixture, &protected_checkouts);
-    let submodule_index = submodule_git_dir.join("index");
-    assert!(
-        before.index_bytes.contains_key(&submodule_index)
-            && before.index_mtimes.contains_key(&submodule_index),
-        "submodule index bytes and mtime were not fingerprinted: {}",
-        submodule_index.display()
-    );
-    assert!(
-        before.refs.contains_key(&submodule_common_dir),
-        "submodule refs were not fingerprinted under {}",
-        submodule_common_dir.display()
-    );
-    assert!(
-        before.reflogs.keys().any(|path| {
-            path.starts_with(submodule_common_dir.join("logs"))
-                || path.starts_with(submodule_git_dir.join("logs"))
-        }),
-        "submodule reflogs were not fingerprinted under {} or {}",
-        submodule_common_dir.join("logs").display(),
-        submodule_git_dir.join("logs").display()
-    );
-    assert!(
-        before
-            .odb
-            .iter()
-            .any(|path| path.starts_with(submodule_common_dir.join("objects"))),
-        "submodule object paths were not fingerprinted under {}",
-        submodule_common_dir.join("objects").display()
-    );
+    for (git_dir, common_dir) in &nested {
+        let index = git_dir.join("index");
+        assert!(
+            before.index_bytes.contains_key(&index) && before.index_mtimes.contains_key(&index),
+            "nested index bytes and mtime were not fingerprinted: {}",
+            index.display()
+        );
+        assert!(
+            before.refs.contains_key(common_dir),
+            "nested refs were not fingerprinted under {}",
+            common_dir.display()
+        );
+        assert!(
+            before.reflogs.keys().any(|path| {
+                path.starts_with(common_dir.join("logs")) || path.starts_with(git_dir.join("logs"))
+            }),
+            "nested reflogs were not fingerprinted under {} or {}",
+            common_dir.join("logs").display(),
+            git_dir.join("logs").display()
+        );
+        assert!(
+            before
+                .odb
+                .iter()
+                .any(|path| path.starts_with(common_dir.join("objects"))),
+            "nested object paths were not fingerprinted under {}",
+            common_dir.join("objects").display()
+        );
+    }
 
     let notes = run_full_pipeline(&fixture, &pipeline_worktrees);
-    assert!(notes.is_empty(), "pipeline reported problems: {notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("nested paths `payload.txt` conflict")),
+        "nested prediction did not run: {notes:?}"
+    );
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|note| note.contains("submodule `embedded`"))
+            .count(),
+        1,
+        "nested prediction produced unexpected notes: {notes:?}"
+    );
 
     let after = fingerprint(&fixture, &protected_checkouts);
     assert_unchanged(&before, &after);

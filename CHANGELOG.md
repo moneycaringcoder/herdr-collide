@@ -22,6 +22,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is scheduled and manual only, it is not a required check, and a red canary is
   a signal to read herdr's recent changes rather than a reason to hold a pull
   request.
+- A submodule's contents are now compared, so two agents editing the same file inside one
+  submodule get a real verdict instead of `? unknown`. Each direct submodule is treated as
+  the repository it is: its own common directory, its own index copied into scratch, its own
+  HEAD and snapshot, and its own scratch object store whose alternate is the *submodule's*
+  object store rather than the superproject's. Depth is one — a submodule's own submodules
+  are not entered.
+- Every failure still falls back to `? unknown` with the note explaining why: a submodule
+  that is absent or uninitialised on either side, an unborn or unreadable nested HEAD, a
+  nested merge already in progress, no common ancestor, or any timeout. The fallback is the
+  point: a nested comparison that could not run must not report a clean merge.
+- A shared file's path stays superproject-relative. Nested conflicting paths are named in the
+  pane note instead, because a path in that field is superproject-relative everywhere else
+  and mixing the two scopes would corrupt every consumer of it.
+- The read-only guarantee now covers the second repository a submodule introduces: the
+  nested index, refs, reflogs and complete object path set are fingerprinted before and after
+  a run that exercises nested prediction, for both worktrees. Measured cost with one dirty
+  submodule is 616 ms per cycle, about 12% of the default five-second interval.
 
 ### Fixed
 

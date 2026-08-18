@@ -339,6 +339,29 @@ fn probe(dir: &Path, args: &[&str], timeout: Duration) -> Result<Option<String>>
     }
 }
 
+fn probe_with_env(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, OsString)],
+    timeout: Duration,
+) -> Result<Option<String>> {
+    let out = run_git(dir, args, envs, timeout)?;
+    if out.timed_out {
+        return Err(format!("git {} timed out in {}", args.join(" "), dir.display()).into());
+    }
+    match out.code {
+        Some(0) => Ok(Some(out.stdout_trimmed())),
+        Some(1) => Ok(None),
+        _ => Err(format!(
+            "git {} could not answer in {}: {}",
+            args.join(" "),
+            dir.display(),
+            out.stderr_text()
+        )
+        .into()),
+    }
+}
+
 /// Converts a raw git path to a `String`, replacing anything that is not valid
 /// UTF-8 **and** anything that would take control of a terminal, then making
 /// the result unique.
@@ -505,6 +528,54 @@ pub fn head_state(checkout: &Path, timeout: Duration) -> Result<HeadState> {
         }
         // HEAD is not a symref and does not resolve: detached at something that
         // is not there.
+        (None, None) => Ok(HeadState::BrokenHead {
+            name: "HEAD".to_string(),
+        }),
+    }
+}
+
+fn head_state_with_env(
+    checkout: &Path,
+    envs: &[(&str, OsString)],
+    timeout: Duration,
+) -> Result<HeadState> {
+    let symref = probe_with_env(checkout, &["symbolic-ref", "-q", "HEAD"], envs, timeout)?;
+    let oid = probe_with_env(
+        checkout,
+        &["rev-parse", "--verify", "-q", "HEAD^{commit}"],
+        envs,
+        timeout,
+    )?;
+    let short = |full: &str| full.strip_prefix("refs/heads/").unwrap_or(full).to_string();
+    match (symref, oid) {
+        (Some(full), Some(oid)) => Ok(HeadState::Branch {
+            name: short(&full),
+            oid,
+        }),
+        (None, Some(oid)) => Ok(HeadState::Detached { oid }),
+        (Some(full), None) => {
+            let exists = run_git(
+                checkout,
+                &["show-ref", "--verify", "--quiet", &full],
+                envs,
+                timeout,
+            )?;
+            if exists.timed_out || exists.code.is_none() {
+                return Err(format!(
+                    "git show-ref could not answer for {} in {}: {}",
+                    full,
+                    checkout.display(),
+                    exists.stderr_text()
+                )
+                .into());
+            }
+            let name = short(&full);
+            if exists.code == Some(1) {
+                Ok(HeadState::Unborn { name })
+            } else {
+                Ok(HeadState::BrokenHead { name })
+            }
+        }
         (None, None) => Ok(HeadState::BrokenHead {
             name: "HEAD".to_string(),
         }),
@@ -854,9 +925,18 @@ fn count_of(field: &[u8]) -> u64 {
 ///   text-transforming filter it overstates that path's volume, which the
 ///   runaway thresholds treat as an order-of-magnitude signal anyway.
 fn filter_overrides(checkout: &Path, timeout: Duration) -> Vec<String> {
-    let Ok(out) = git(
+    filter_overrides_with_env(checkout, &[], timeout)
+}
+
+fn filter_overrides_with_env(
+    checkout: &Path,
+    envs: &[(&str, OsString)],
+    timeout: Duration,
+) -> Vec<String> {
+    let Ok(out) = run_git(
         checkout,
         &["config", "--name-only", "--get-regexp", "^filter\\."],
+        envs,
         timeout,
     ) else {
         return Vec::new();
@@ -1203,6 +1283,85 @@ pub struct PairPrediction {
     /// Machine-stable conflict-type tokens git reported, e.g.
     /// `CONFLICT (contents)`. Never parse the human prose instead.
     pub conflict_types: Vec<String>,
+    /// Direct-submodule comparisons which refine otherwise uncomparable
+    /// superproject gitlink paths.
+    pub submodules: Vec<SubmodulePrediction>,
+}
+
+/// Result of comparing one direct submodule as a repository in its own right.
+///
+/// This is deliberately depth one: a nested checkout's own submodules remain
+/// gitlinks in its snapshot and are never opened or recursively compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmodulePrediction {
+    /// Superproject-relative gitlink path.
+    pub path: String,
+    /// `Some(true)` is a nested conflict, `Some(false)` a clean nested merge,
+    /// and `None` means the comparison could not be completed honestly.
+    pub conflict: Option<bool>,
+    /// Paths named by nested merge-tree, relative to the submodule checkout.
+    pub conflicting_paths: Vec<String>,
+    /// Why an unavailable comparison stayed unknown.
+    pub reason: Option<String>,
+}
+
+fn nested_repository_dirs(checkout: &Path) -> Result<(PathBuf, PathBuf)> {
+    let dot_git = checkout.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let marker = fs::read_to_string(&dot_git).map_err(|err| {
+            format!(
+                "{} is not an initialised submodule checkout: {err}",
+                checkout.display()
+            )
+        })?;
+        let raw = marker
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| format!("{} has an invalid .git file", checkout.display()))?;
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            checkout.join(path)
+        }
+    };
+    let git_dir = fs::canonicalize(&git_dir).map_err(|err| {
+        format!(
+            "{}: could not resolve nested git dir {}: {err}",
+            checkout.display(),
+            git_dir.display()
+        )
+    })?;
+    let common_dir = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(raw) => {
+            let path = PathBuf::from(raw.trim());
+            if path.is_absolute() {
+                path
+            } else {
+                git_dir.join(path)
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+        Err(err) => {
+            return Err(format!(
+                "{}: could not read nested commondir: {err}",
+                checkout.display()
+            )
+            .into())
+        }
+    };
+    let common_dir = fs::canonicalize(&common_dir).map_err(|err| {
+        format!(
+            "{}: could not resolve nested common dir {}: {err}",
+            checkout.display(),
+            common_dir.display()
+        )
+    })?;
+    Ok((git_dir, common_dir))
 }
 
 /// One checkout, reduced to what merge-tree needs.
@@ -1218,6 +1377,19 @@ struct Side {
     unmerged: bool,
 }
 
+#[derive(Debug, Clone)]
+struct NestedSide {
+    checkout: PathBuf,
+    odb: PathBuf,
+    side: Side,
+}
+
+#[derive(Debug, Clone)]
+enum CachedNestedSide {
+    Ready(NestedSide),
+    Unavailable(String),
+}
+
 impl Side {
     /// The argument to hand merge-tree in tree mode.
     fn tree_ish(&self) -> String {
@@ -1230,14 +1402,15 @@ impl Side {
 
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Holds the per-cycle state that makes prediction cheap: one scratch object
-/// directory for the whole run, and one snapshot per worktree reused across all
-/// of that worktree's pairs.
+/// Holds the per-cycle state that makes prediction cheap: one outer scratch
+/// object directory, one snapshot per worktree, and cached direct-submodule
+/// repository state. Priming is sequential; prediction only reads these maps.
 pub struct Predictor {
     timeout: Duration,
     scratch: PathBuf,
     odb: PathBuf,
     sides: HashMap<PathBuf, Side>,
+    nested_sides: HashMap<(PathBuf, String), CachedNestedSide>,
 }
 
 impl Predictor {
@@ -1259,6 +1432,7 @@ impl Predictor {
             scratch,
             odb,
             sides: HashMap::new(),
+            nested_sides: HashMap::new(),
         })
     }
 
@@ -1292,6 +1466,150 @@ impl Predictor {
         let side = self.build_side(checkout)?;
         self.sides.insert(key, side);
         Ok(())
+    }
+
+    /// Resolves and caches one direct submodule checkout before prediction
+    /// fans out. Failures are cached too, because retrying from worker threads
+    /// would both mutate this map and turn one bounded failure into many.
+    ///
+    /// Only `checkout/path` is opened. A submodule below that repository is
+    /// intentionally left as a gitlink, so comparison depth is exactly one.
+    pub fn prime_submodule(&mut self, checkout: &Path, path: &str) {
+        let key = (canonical(checkout), path.to_string());
+        if self.nested_sides.contains_key(&key) {
+            return;
+        }
+        let nested_checkout = canonical(&checkout.join(path));
+        let cached = match self.build_nested_side(&nested_checkout) {
+            Ok(side) => CachedNestedSide::Ready(side),
+            Err(err) => CachedNestedSide::Unavailable(err.to_string()),
+        };
+        self.nested_sides.insert(key, cached);
+    }
+
+    fn build_nested_side(&self, checkout: &Path) -> Result<NestedSide> {
+        // Bootstrap the repository paths from `.git` so even the authoritative
+        // rev-parse below starts with writes redirected. Direct submodule
+        // checkouts always use a directory or gitfile at this location.
+        let (git_dir, bootstrap_common_dir) = nested_repository_dirs(checkout)?;
+        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let odb = self.scratch.join(format!("submodule-{seq}")).join("odb");
+        fs::create_dir_all(odb.join("pack"))?;
+        fs::create_dir_all(odb.join("info"))?;
+        let bootstrap_env = vec![
+            ("GIT_OBJECT_DIRECTORY", odb.clone().into_os_string()),
+            (
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                bootstrap_common_dir.join("objects").into_os_string(),
+            ),
+        ];
+        let common = run_git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            &bootstrap_env,
+            self.timeout,
+        )?;
+        if common.timed_out || !common.ok() {
+            return Err(format!(
+                "{}: could not resolve nested common dir: {}",
+                checkout.display(),
+                common.stderr_text()
+            )
+            .into());
+        }
+        let raw_common_dir = PathBuf::from(common.stdout_trimmed());
+        let common_dir = fs::canonicalize(&raw_common_dir).map_err(|err| {
+            format!(
+                "{}: could not canonicalize nested common dir {}: {err}",
+                checkout.display(),
+                raw_common_dir.display()
+            )
+        })?;
+        let env = vec![
+            ("GIT_OBJECT_DIRECTORY", odb.clone().into_os_string()),
+            (
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                common_dir.join("objects").into_os_string(),
+            ),
+        ];
+
+        let head = match head_state_with_env(checkout, &env, self.timeout)? {
+            HeadState::Branch { oid, .. } | HeadState::Detached { oid } => oid,
+            HeadState::Unborn { name } => {
+                return Err(
+                    format!("{}: nested HEAD `{name}` is unborn", checkout.display()).into(),
+                )
+            }
+            HeadState::BrokenHead { name } => {
+                return Err(
+                    format!("{}: nested HEAD `{name}` is broken", checkout.display()).into(),
+                )
+            }
+        };
+        let commit = run_git(
+            checkout,
+            &["cat-file", "-e", &format!("{head}^{{commit}}")],
+            &env,
+            self.timeout,
+        )?;
+        if commit.timed_out || !commit.ok() {
+            return Err(format!(
+                "{}: nested HEAD {head} is not a readable commit: {}",
+                checkout.display(),
+                commit.stderr_text()
+            )
+            .into());
+        }
+
+        let status = run_git(
+            checkout,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--renames",
+            ],
+            &env,
+            self.timeout,
+        )?;
+        if status.timed_out || !status.ok() {
+            return Err(format!(
+                "{}: could not read nested status: {}",
+                checkout.display(),
+                status.stderr_text()
+            )
+            .into());
+        }
+        let entries = parse_status_v2(&status.stdout);
+        let dirty = !entries.is_empty();
+        let unmerged = entries
+            .iter()
+            .any(|entry| entry.kind == ChangeKind::Conflicted);
+        let tree = if dirty {
+            Some(self.snapshot_tree_from_git_dir(
+                checkout,
+                &git_dir,
+                &odb,
+                "submodule-index",
+                &env,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(NestedSide {
+            checkout: checkout.to_path_buf(),
+            odb,
+            side: Side {
+                common_dir,
+                head,
+                tree,
+                dirty,
+                unmerged,
+            },
+        })
     }
 
     fn build_side(&self, checkout: &Path) -> Result<Side> {
@@ -1376,17 +1694,26 @@ impl Predictor {
     /// every file in the worktree. The copy keeps the stat cache, so `add -A`
     /// only hashes what actually changed.
     fn snapshot_tree(&self, checkout: &Path, common_dir: &Path) -> Result<String> {
-        let git_dir = {
-            let out = git_ok(
-                checkout,
-                &["rev-parse", "--path-format=absolute", "--git-dir"],
-                self.timeout,
-            )?;
-            PathBuf::from(out.stdout_trimmed())
-        };
+        let out = git_ok(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+            self.timeout,
+        )?;
+        let git_dir = PathBuf::from(out.stdout_trimmed());
+        let env = self.odb_env(common_dir);
+        self.snapshot_tree_from_git_dir(checkout, &git_dir, &self.odb, "index", &env)
+    }
 
+    fn snapshot_tree_from_git_dir(
+        &self,
+        checkout: &Path,
+        git_dir: &Path,
+        odb: &Path,
+        index_prefix: &str,
+        base_env: &[(&str, OsString)],
+    ) -> Result<String> {
         let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-        let index = TempIndex::new(self.scratch.join(format!("index-{seq}")))?;
+        let index = TempIndex::new(self.scratch.join(format!("{index_prefix}-{seq}")))?;
         // A worktree with no index yet legitimately starts from empty. Every
         // *other* failure must not: seeding is what preserves the entries `add`
         // will not revisit, so an unreadable index silently drops every
@@ -1405,10 +1732,14 @@ impl Predictor {
             }
         }
 
-        let mut env = self.odb_env(common_dir);
+        let mut env = base_env.to_vec();
+        debug_assert!(env
+            .iter()
+            .find(|(key, _)| *key == "GIT_OBJECT_DIRECTORY")
+            .is_some_and(|(_, value)| value.as_os_str() == odb.as_os_str()));
         env.push(("GIT_INDEX_FILE", index.path.clone().into_os_string()));
 
-        let overrides = filter_overrides(checkout, self.timeout);
+        let overrides = filter_overrides_with_env(checkout, base_env, self.timeout);
         let mut add_args: Vec<&str> = overrides.iter().map(String::as_str).collect();
         add_args.extend(["add", "-A", "--"]);
         let add = run_git(checkout, &add_args, &env, self.timeout)?;
@@ -1457,9 +1788,9 @@ impl Predictor {
         let l = self.side(left)?;
         let r = self.side(right)?;
 
-        // Different repositories are never comparable, and merge-tree would
-        // happily produce nonsense for two unrelated histories rather than
-        // refuse.
+        // Different superproject common dirs are never comparable. Direct
+        // submodules are separate clones in normal linked worktrees, so their
+        // common dirs are intentionally handled by a different object view.
         if l.common_dir != r.common_dir {
             return Err(format!(
                 "refusing to compare checkouts from different repositories: {} vs {}",
@@ -1469,6 +1800,98 @@ impl Predictor {
             .into());
         }
 
+        let outer_env = self.odb_env(&l.common_dir);
+        let mut prediction = self.predict_sides(left, right, l, r, paths, &outer_env)?;
+        let left_key = canonical(left);
+        let right_key = canonical(right);
+        for path in paths {
+            let nested_left = self.nested_sides.get(&(left_key.clone(), path.clone()));
+            let nested_right = self.nested_sides.get(&(right_key.clone(), path.clone()));
+            if nested_left.is_none() && nested_right.is_none() {
+                continue;
+            }
+            prediction
+                .submodules
+                .push(self.predict_submodule(path, nested_left, nested_right));
+        }
+        Ok(prediction)
+    }
+
+    fn predict_submodule(
+        &self,
+        path: &str,
+        left: Option<&CachedNestedSide>,
+        right: Option<&CachedNestedSide>,
+    ) -> SubmodulePrediction {
+        let unavailable = |reason: String| SubmodulePrediction {
+            path: path.to_string(),
+            conflict: None,
+            conflicting_paths: Vec::new(),
+            reason: Some(reason),
+        };
+        let (Some(left), Some(right)) = (left, right) else {
+            return unavailable("one side was not primed as a direct submodule".to_string());
+        };
+        let l = match left {
+            CachedNestedSide::Ready(side) => side,
+            CachedNestedSide::Unavailable(reason) => {
+                return unavailable(format!("left side unavailable: {reason}"))
+            }
+        };
+        let r = match right {
+            CachedNestedSide::Ready(side) => side,
+            CachedNestedSide::Unavailable(reason) => {
+                return unavailable(format!("right side unavailable: {reason}"))
+            }
+        };
+        if l.side.unmerged || r.side.unmerged {
+            return unavailable(
+                "a nested checkout has an unresolved merge, so its snapshot is advisory"
+                    .to_string(),
+            );
+        }
+
+        let alternates = [
+            l.side.common_dir.join("objects"),
+            r.odb.clone(),
+            r.side.common_dir.join("objects"),
+        ];
+        let alternate_env = match std::env::join_paths(alternates) {
+            Ok(paths) => paths,
+            Err(err) => {
+                return unavailable(format!(
+                    "nested object stores cannot be represented safely: {err}"
+                ))
+            }
+        };
+        let env = vec![
+            ("GIT_OBJECT_DIRECTORY", l.odb.clone().into_os_string()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate_env),
+        ];
+        match self.predict_sides(&l.checkout, &r.checkout, &l.side, &r.side, &[], &env) {
+            Ok(prediction) => SubmodulePrediction {
+                path: path.to_string(),
+                conflict: Some(prediction.pair_conflict),
+                conflicting_paths: prediction
+                    .verdicts
+                    .into_iter()
+                    .filter_map(|(nested_path, hit)| hit.then_some(nested_path))
+                    .collect(),
+                reason: None,
+            },
+            Err(err) => unavailable(err.to_string()),
+        }
+    }
+
+    fn predict_sides(
+        &self,
+        left: &Path,
+        right: &Path,
+        l: &Side,
+        r: &Side,
+        paths: &[String],
+        env: &[(&str, OsString)],
+    ) -> Result<PairPrediction> {
         let mut prediction = PairPrediction {
             advisory: l.unmerged || r.unmerged,
             ..Default::default()
@@ -1476,31 +1899,17 @@ impl Predictor {
 
         // There is deliberately no prefilter here. There used to be one — skip
         // the pair when `paths` is empty, unless either side has a rename — and
-        // it was unreachable for the case it existed to catch. `Side::has_rename`
-        // was built from `status`, so it only ever saw *uncommitted* renames; a
-        // worktree that had committed a directory rename and was otherwise clean
-        // short-circuited to a conflict-free verdict while `merge-tree` on the
-        // same pair exited 1 with `CONFLICT (directory rename suggested)`.
-        //
-        // Deciding which pairs are worth predicting belongs to `collide::analyse`,
-        // which has both change sets. A second, differently-informed filter one
-        // layer down can only disagree with it, and a clean pair costs 1.77 ms
-        // to answer properly (docs/git-plumbing.md, "merge-tree cost").
-        let (args_owned, approximate) = self.merge_tree_args(left, l, r)?;
+        // it was unreachable for the case it existed to catch. Deciding which
+        // outer pairs are worth predicting belongs to `collide::analyse`.
+        let (args_owned, approximate) = self.merge_tree_args(left, l, r, env)?;
         prediction.approximate = approximate;
         let base_args: Vec<&str> = args_owned.iter().map(String::as_str).collect();
-        let env = self.odb_env(&l.common_dir);
 
-        // One phase, not two. `--quiet` used to gate this call because it is
-        // ~15x cheaper, but it is not a sound oracle: on git 2.53.0 it reports
-        // a clean merge for merges that genuinely conflict. See
-        // docs/git-plumbing.md, "The --quiet trap". Losing a conflict is the
-        // one failure this plugin cannot have, so the cheap gate is gone and
-        // the authoritative form runs on every pair that survives the
-        // path-intersection prefilter.
+        // One phase, not two. `--quiet` is not a sound conflict oracle; the
+        // authoritative named form runs for outer and nested repositories.
         let mut args = vec!["merge-tree", "--write-tree", "-z", "--name-only"];
         args.extend(base_args.iter().copied());
-        let named = run_git(left, &args, &env, self.timeout)?;
+        let named = run_git(left, &args, env, self.timeout)?;
         if named.code != Some(1) && named.code != Some(0) {
             return Err(format!(
                 "merge-tree --name-only failed for {} vs {}: {}",
@@ -1510,10 +1919,8 @@ impl Predictor {
             )
             .into());
         }
-        // The exit-code trap: a bad argument also exits 1, with empty stdout
-        // and a message on stderr. A real merge always prints at least the
-        // merged tree OID, so empty stdout means the arguments were rejected,
-        // not that the merge conflicted.
+        // Exit 1 also means a bad argument. A real merge prints at least its
+        // result tree OID, so empty output is never accepted as a conflict.
         if named.stdout.is_empty() {
             return Err(format!(
                 "merge-tree reported failure with no output for {} vs {}: {}",
@@ -1528,21 +1935,18 @@ impl Predictor {
         prediction.conflict_types = parsed.conflict_types;
         prediction.pair_conflict = named.code == Some(1);
         let conflicted: BTreeSet<&String> = parsed.conflicted.iter().collect();
-
         let requested: BTreeSet<&String> = paths.iter().collect();
         prediction.verdicts = paths
             .iter()
-            .map(|p| (p.clone(), conflicted.contains(p)))
+            .map(|path| (path.clone(), conflicted.contains(path)))
             .collect();
         for extra in &parsed.conflicted {
             if !requested.contains(extra) {
                 prediction.verdicts.push((extra.clone(), true));
             }
         }
-        // git's own documentation warns that an empty conflicted-file list is
-        // not a clean merge: some directory-rename conflicts have no individual
-        // conflicted file. The exit status is the authority, so surface the
-        // pair-level verdict rather than silently reporting every path clean.
+        // Some directory-rename conflicts name no individual file. The pair
+        // exit status remains authoritative in both repository scopes.
         if prediction.pair_conflict && parsed.conflicted.is_empty() {
             for verdict in &mut prediction.verdicts {
                 verdict.1 = true;
@@ -1564,7 +1968,13 @@ impl Predictor {
     /// depending on whether one of them happened to have a stray untracked file.
     /// With no common ancestor there is no merge to predict, and `Unknown` is
     /// the honest verdict.
-    fn merge_tree_args(&self, cwd: &Path, l: &Side, r: &Side) -> Result<(Vec<String>, bool)> {
+    fn merge_tree_args(
+        &self,
+        cwd: &Path,
+        l: &Side,
+        r: &Side,
+        env: &[(&str, OsString)],
+    ) -> Result<(Vec<String>, bool)> {
         if !l.dirty && !r.dirty {
             // Both sides are commits, so no `--merge-base`: merge-tree then
             // resolves multiple bases recursively, which beats any single base
@@ -1574,9 +1984,10 @@ impl Predictor {
 
         // A dirty side is a bare tree, and a tree carries no history, so the
         // base has to be supplied explicitly.
-        let bases = git(
+        let bases = run_git(
             cwd,
             &["merge-base", "--all", &l.head, &r.head],
+            env,
             self.timeout,
         )?;
         if bases.timed_out || bases.code.is_none() {
@@ -1604,12 +2015,17 @@ impl Predictor {
         // than one, because the answer is then an approximation of the recursive
         // merge git itself would do.
         let approximate = list.len() > 1;
-        let base_tree = git_ok(
-            cwd,
-            &["rev-parse", &format!("{}^{{tree}}", list[0])],
-            self.timeout,
-        )?
-        .stdout_trimmed();
+        let base = format!("{}^{{tree}}", list[0]);
+        let base_tree = run_git(cwd, &["rev-parse", &base], env, self.timeout)?;
+        if base_tree.timed_out || !base_tree.ok() {
+            return Err(format!(
+                "rev-parse could not resolve merge base in {}: {}",
+                cwd.display(),
+                base_tree.stderr_text()
+            )
+            .into());
+        }
+        let base_tree = base_tree.stdout_trimmed();
 
         Ok((
             vec![

@@ -156,6 +156,8 @@ pub struct PairVerdicts {
     /// a rename can conflict on a path that appears under a different name in
     /// each change set.
     pub verdicts: Vec<(String, bool)>,
+    /// Direct-submodule results keyed by their superproject-relative gitlink.
+    pub submodules: Vec<git::SubmodulePrediction>,
     /// Prediction could not run for this pair; the shared files stay `Unknown`.
     pub failed: bool,
     /// A single merge base had to be forced although the histories offer more
@@ -205,14 +207,28 @@ pub fn apply_predictions(
             .iter()
             .map(|(path, hit)| (path.as_str(), *hit))
             .collect();
+        let submodules: BTreeMap<&str, &git::SubmodulePrediction> = prediction
+            .submodules
+            .iter()
+            .map(|nested| (nested.path.as_str(), nested))
+            .collect();
         for shared in &mut pairing.shared {
             let uncomparable_submodule = [key.0, key.1].iter().any(|id| {
                 filtered
                     .get(id)
                     .is_some_and(|change| change.uncomparable_submodules.contains(&shared.path))
             });
+            let nested = submodules.get(shared.path.as_str());
             shared.verdict = match verdicts.get(shared.path.as_str()) {
+                // A gitlink conflict in the outer merge remains a conflict even
+                // when the nested contents themselves would merge cleanly.
                 Some(true) => FileVerdict::Conflict,
+                _ if nested.is_some_and(|result| result.conflict == Some(true)) => {
+                    FileVerdict::Conflict
+                }
+                _ if nested.is_some_and(|result| result.conflict == Some(false)) => {
+                    FileVerdict::Overlap
+                }
                 _ if uncomparable_submodule => FileVerdict::Unknown,
                 // A path git did not flag merges cleanly, even though both
                 // sides touched it. That discrimination is the whole point of
@@ -752,6 +768,38 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
             }
         }
 
+        // Direct submodules are repositories in their own right. Resolve and
+        // snapshot every needed nested side here, while the predictor is still
+        // mutable and this phase is deliberately sequential.
+        let changes_by_id: BTreeMap<&str, &ChangeSet> =
+            changes.iter().map(|(id, set)| (id.as_str(), set)).collect();
+        for pairing in &report.pairings {
+            let Some(left) = by_id.get(pairing.left_workspace_id.as_str()) else {
+                continue;
+            };
+            let Some(right) = by_id.get(pairing.right_workspace_id.as_str()) else {
+                continue;
+            };
+            for shared in &pairing.shared {
+                let needs_nested = [
+                    pairing.left_workspace_id.as_str(),
+                    pairing.right_workspace_id.as_str(),
+                ]
+                .iter()
+                .any(|id| {
+                    changes_by_id.get(id).is_some_and(|set| {
+                        set.paths.iter().any(|changed| {
+                            changed.path == shared.path && changed.submodule_contents_uncomparable
+                        })
+                    })
+                });
+                if needs_nested {
+                    predictor.prime_submodule(&left.checkout_path, &shared.path);
+                    predictor.prime_submodule(&right.checkout_path, &shared.path);
+                }
+            }
+        }
+
         let jobs: Vec<(&Pairing, &Checkout, &Checkout)> = report
             .pairings
             .iter()
@@ -795,7 +843,7 @@ fn predict_all(
         .clamp(1, 8)
         .min(jobs.len());
 
-    let mut results: Vec<(PairVerdicts, Option<String>)> = Vec::with_capacity(jobs.len());
+    let mut results: Vec<(PairVerdicts, Vec<String>)> = Vec::with_capacity(jobs.len());
     let mut panicked = 0usize;
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -811,29 +859,72 @@ fn predict_all(
                             &right.checkout_path,
                             &paths,
                         ) {
-                            Ok(prediction) => (
-                                PairVerdicts {
-                                    left_workspace_id: pairing.left_workspace_id.clone(),
-                                    right_workspace_id: pairing.right_workspace_id.clone(),
-                                    verdicts: prediction.verdicts,
-                                    failed: false,
-                                    approximate: prediction.approximate,
-                                },
-                                None,
-                            ),
+                            Ok(prediction) => {
+                                let mut nested_notes = Vec::new();
+                                for nested in &prediction.submodules {
+                                    match nested.conflict {
+                                        Some(true) => {
+                                            let detail = if nested.conflicting_paths.is_empty() {
+                                                "the nested merge reported a pair-level conflict \
+                                                 without naming a path"
+                                                    .to_string()
+                                            } else {
+                                                format!(
+                                                    "nested paths {} conflict",
+                                                    nested
+                                                        .conflicting_paths
+                                                        .iter()
+                                                        .map(|path| format!("`{path}`"))
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                )
+                                            };
+                                            nested_notes.push(format!(
+                                                "{} vs {}: submodule `{}` conflicts internally; \
+                                                 {detail}",
+                                                pairing.left_workspace_id,
+                                                pairing.right_workspace_id,
+                                                nested.path
+                                            ));
+                                        }
+                                        None => nested_notes.push(format!(
+                                            "{} vs {}: submodule `{}` comparison is unknown: {}",
+                                            pairing.left_workspace_id,
+                                            pairing.right_workspace_id,
+                                            nested.path,
+                                            nested.reason.as_deref().unwrap_or(
+                                                "the nested comparison could not complete"
+                                            )
+                                        )),
+                                        Some(false) => {}
+                                    }
+                                }
+                                (
+                                    PairVerdicts {
+                                        left_workspace_id: pairing.left_workspace_id.clone(),
+                                        right_workspace_id: pairing.right_workspace_id.clone(),
+                                        verdicts: prediction.verdicts,
+                                        submodules: prediction.submodules,
+                                        failed: false,
+                                        approximate: prediction.approximate,
+                                    },
+                                    nested_notes,
+                                )
+                            }
                             Err(err) => (
                                 PairVerdicts {
                                     left_workspace_id: pairing.left_workspace_id.clone(),
                                     right_workspace_id: pairing.right_workspace_id.clone(),
                                     verdicts: Vec::new(),
+                                    submodules: Vec::new(),
                                     failed: true,
                                     approximate: false,
                                 },
-                                Some(format!(
+                                vec![format!(
                                     "{} vs {}: {err}",
                                     left.checkout_path.display(),
                                     right.checkout_path.display()
-                                )),
+                                )],
                             ),
                         }
                     })
@@ -857,10 +948,8 @@ fn predict_all(
     }
 
     let mut predictions = Vec::with_capacity(results.len());
-    for (prediction, note) in results {
-        if let Some(note) = note {
-            notes.push(note);
-        }
+    for (prediction, prediction_notes) in results {
+        notes.extend(prediction_notes);
         predictions.push(prediction);
     }
     predictions
