@@ -23,6 +23,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a signal to read herdr's recent changes rather than a reason to hold a pull
   request.
 
+### Changed
+
+- Pairings are ranked worst first in `--json` and in the one-shot text report, not
+  only in the detail pane. The ranking rule now lives on `Pairing` and is used by
+  every consumer, so a script and a person are told the same thing about which
+  collision to deal with first — previously the pane sorted and the report vector
+  did not, which left `--json` in checkout-arrival order. Ranking is by conflicting
+  file count, then unknown count, then overlap count, all descending; unknowns rank
+  above overlaps for the same reason the `unknown` severity outranks `overlap`.
+  Array order was already outside the `--json` contract, so the schema version does
+  not move.
+
 ## [0.1.0] - 2026-08-16
 
 First release.
