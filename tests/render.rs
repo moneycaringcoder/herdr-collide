@@ -735,6 +735,75 @@ fn an_approximate_pairing_says_the_merge_base_was_forced() {
 }
 
 #[test]
+fn changed_submodule_contents_get_an_explanation_above_verdicts() {
+    let mut report = report();
+    assert!(
+        !detail(&report).contains("submodule contents differ"),
+        "ordinary pairings must not get the submodule note"
+    );
+
+    let mut changed = ChangedPath::new("embedded", ChangeKind::Unstaged);
+    changed.submodule_contents_uncomparable = true;
+    report.changes.push((
+        "w1".to_string(),
+        ChangeSet {
+            paths: vec![changed],
+            ..ChangeSet::default()
+        },
+    ));
+    report.pairings[0]
+        .shared
+        .push(shared("embedded", FileVerdict::Unknown));
+
+    let text = detail(&report);
+    let flat = flatten(&text);
+    assert!(
+        flat.contains("submodule contents differ at `embedded`"),
+        "{text}"
+    );
+    assert!(
+        flat.contains(
+            "snapshot records the submodule's committed pointer rather than its contents"
+        ),
+        "{text}"
+    );
+    assert!(
+        flat.contains("a clean merge for this path was never checked"),
+        "{text}"
+    );
+
+    let pair = line_index(&text, "api <-> ui");
+    let note = line_index(&text, "submodule contents differ");
+    let first_verdict = line_index(&text, "src/collide.rs");
+    assert!(pair < note && note < first_verdict, "{text}");
+}
+
+#[test]
+fn a_flagged_submodule_conflict_renders_without_an_unknown_note() {
+    let mut report = report();
+    let mut changed = ChangedPath::new("embedded", ChangeKind::Unstaged);
+    changed.submodule_contents_uncomparable = true;
+    report.changes.push((
+        "w1".to_string(),
+        ChangeSet {
+            paths: vec![changed],
+            ..ChangeSet::default()
+        },
+    ));
+    report.pairings[0]
+        .shared
+        .push(shared("embedded", FileVerdict::Conflict));
+
+    let text = detail(&report);
+    assert!(
+        text.lines()
+            .any(|line| line.contains("\u{2718} conflict") && line.contains("embedded")),
+        "{text}"
+    );
+    assert!(!text.contains("submodule contents differ"), "{text}");
+}
+
+#[test]
 fn a_checkout_with_no_change_set_falls_back_to_the_missing_branch() {
     // The base fixture carries no change sets at all, which is what the daemon
     // produces when the whole git pass failed.

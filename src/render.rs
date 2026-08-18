@@ -324,6 +324,31 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
                 );
             }
 
+            let uncomparable_submodules = uncomparable_submodule_paths(report, pairing);
+            if !uncomparable_submodules.is_empty() {
+                let paths = uncomparable_submodules
+                    .iter()
+                    .map(|path| format!("`{path}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let scope = if uncomparable_submodules.len() == 1 {
+                    "this path"
+                } else {
+                    "these paths"
+                };
+                push_wrapped(
+                    &mut out,
+                    "    ",
+                    "    ",
+                    &format!(
+                        "unknown: submodule contents differ at {paths}; the snapshot records the \
+                         submodule's committed pointer rather than its contents, so a clean merge \
+                         for {scope} was never checked."
+                    ),
+                    width,
+                );
+            }
+
             // The same reasoning as the advisory above: a verdict computed
             // against a merge base that had to be guessed at is a weaker claim
             // than one computed against the real base, and only the pane can
@@ -593,6 +618,31 @@ fn is_unmerged(change_set: Option<&ChangeSet>) -> bool {
                 .any(|part| part.trim_start().starts_with(git::DEGRADED_UNMERGED))
         })
         .unwrap_or(false)
+}
+
+fn uncomparable_submodule_paths<'a>(report: &Report, pairing: &'a Pairing) -> Vec<&'a str> {
+    pairing
+        .shared
+        .iter()
+        .filter(|shared| {
+            // A divergent gitlink is a real comparison even when its checkout is dirty,
+            // so this note must follow the verdict rather than the status flag alone.
+            shared.verdict == FileVerdict::Unknown
+                && [
+                    pairing.left_workspace_id.as_str(),
+                    pairing.right_workspace_id.as_str(),
+                ]
+                .iter()
+                .any(|workspace_id| {
+                    report.change_set(workspace_id).is_some_and(|set| {
+                        set.paths.iter().any(|changed| {
+                            changed.path == shared.path && changed.submodule_contents_uncomparable
+                        })
+                    })
+                })
+        })
+        .map(|shared| shared.path.as_str())
+        .collect()
 }
 
 fn verdict_rank(verdict: FileVerdict) -> u8 {
