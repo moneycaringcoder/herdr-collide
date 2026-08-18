@@ -1334,6 +1334,7 @@ fn a_clean_prediction_cannot_turn_changed_submodule_contents_into_overlap() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("embedded".to_string(), false)],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -1393,6 +1394,7 @@ fn a_git_flagged_submodule_conflict_still_reports_conflict() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("embedded".to_string(), true)],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
