@@ -255,7 +255,8 @@ Schema 2 has these keys:
 - top level: `schema`, `checkouts`, `pairings`, `statuses`, `notes`
 - each `checkouts` element: `workspace_id`, `label`, `repo_key`, `repo_root`, `checkout_path`,
   `branch`, `agent`, `is_linked_worktree`, `changed_files`, `lines_added`, `lines_removed`,
-  `has_rename`, `degraded`, `degraded_reason`
+  `has_rename`, `degraded`, `degraded_reason`, `target_ref`, `target_verdict`,
+  `target_reason`, `target_approximate`, `target_advisory`
 - each `pairings` element: `left`, `right`, `conflict_count`, `unknown_count`, `approximate`, `shared`
 - each `pairings[].shared` element: `path`, `verdict`
 - each `statuses` element: `workspace_id`, `severity`, `token`, `badge`, `overlap_count`,
