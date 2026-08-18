@@ -48,6 +48,9 @@ pub struct Config {
     /// workspace ids, labels and branch names, the first-seen timestamp, and
     /// an optional last-seen timestamp when the episode closes.
     pub conflict_history: bool,
+    /// Show desktop notifications when a workspace becomes conflicting.
+    /// Intrusive output is opt-in even though badge reporting is always on.
+    pub notifications_enabled: bool,
     /// Ref every checkout's change set is measured against, as the `<base>` in
     /// `diff <base>...HEAD`. `git::change_set` degrades rather than failing when
     /// it does not resolve, which is the common case for a repo with no
@@ -76,6 +79,7 @@ impl Default for Config {
             ignore_globs: Vec::new(),
             predict_conflicts: true,
             conflict_history: false,
+            notifications_enabled: false,
             base_ref: DEFAULT_BASE_REF.to_string(),
             git_timeout: Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS),
         }
@@ -149,13 +153,14 @@ struct FileConfig {
     ignore_globs: Option<Vec<String>>,
     predict_conflicts: Option<bool>,
     conflict_history: Option<bool>,
+    notifications_enabled: Option<bool>,
     base_ref: Option<String>,
     git_timeout_seconds: Option<u64>,
 }
 
 /// Every key `FileConfig` understands. Kept beside the struct because the
 /// unknown-key warning is only useful while the two agree.
-const KNOWN_KEYS: [&str; 9] = [
+const KNOWN_KEYS: [&str; 10] = [
     "interval_seconds",
     "runaway_files",
     "runaway_lines",
@@ -163,6 +168,7 @@ const KNOWN_KEYS: [&str; 9] = [
     "ignore_globs",
     "predict_conflicts",
     "conflict_history",
+    "notifications_enabled",
     "base_ref",
     "git_timeout_seconds",
 ];
@@ -244,6 +250,9 @@ fn load_file() -> Config {
     }
     if let Some(enabled) = file.conflict_history {
         config.conflict_history = enabled;
+    }
+    if let Some(enabled) = file.notifications_enabled {
+        config.notifications_enabled = enabled;
     }
     if let Some(base_ref) = file.base_ref.filter(|r| !r.trim().is_empty()) {
         config.base_ref = base_ref;

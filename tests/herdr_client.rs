@@ -15,11 +15,17 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use collide::config::Config;
+use collide::daemon::{self, NotificationState};
 use collide::herdr::{error_code, Herdr};
+use collide::model::{
+    Checkout, FileVerdict, Pairing, RepoKey, Report, Severity, SharedFile, WorkspaceStatus,
+};
 use serde_json::{json, Value};
 
 const SOURCE: &str = "test.collide";
@@ -149,6 +155,171 @@ impl Drop for TestServer {
 fn point_at(path: &std::path::Path) {
     std::env::set_var("HERDR_SOCKET_PATH", path);
     std::env::set_var("HERDR_PLUGIN_ID", SOURCE);
+}
+
+fn notification_report(severity: Severity) -> Report {
+    let checkout = |workspace_id: &str, label: &str, branch: &str, checkout_path: &str| Checkout {
+        workspace_id: workspace_id.to_string(),
+        workspace_label: label.to_string(),
+        repo_key: RepoKey("/repo/.git".to_string()),
+        repo_root: PathBuf::from("/repo"),
+        checkout_path: PathBuf::from(checkout_path),
+        is_linked_worktree: true,
+        branch: Some(branch.to_string()),
+        agent: None,
+    };
+    let status = |workspace_id: &str, severity| WorkspaceStatus {
+        workspace_id: workspace_id.to_string(),
+        severity,
+        overlap_count: 0,
+        conflict_count: usize::from(severity == Severity::Conflict),
+        unknown_count: usize::from(severity == Severity::Unknown),
+        runaway: severity == Severity::Runaway,
+        lines_changed: 0,
+        changed_files: 0,
+    };
+    Report {
+        checkouts: vec![
+            checkout("w1", "alpha", "feature/a", "/repo/a"),
+            checkout("w2", "beta", "feature/b", "/repo/b"),
+        ],
+        pairings: vec![Pairing {
+            left_workspace_id: "w1".to_string(),
+            right_workspace_id: "w2".to_string(),
+            shared: vec![SharedFile {
+                path: "src/lib.rs".to_string(),
+                verdict: FileVerdict::Conflict,
+                conflict_type: None,
+            }],
+            approximate: false,
+        }],
+        statuses: vec![status("w1", severity), status("w2", Severity::Clean)],
+        ..Report::default()
+    }
+}
+
+fn notification_reply(id: u64, reason: &str, shown: bool) -> Reply {
+    Reply::Line(
+        json!({
+            "id": format!("collide:{id}"),
+            "result": {
+                "type": "notification_show",
+                "shown": shown,
+                "reason": reason,
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn notification_case(reason: &str, shown: bool) -> Severity {
+    let _guard = env_lock();
+    let transient = matches!(reason, "rate_limited" | "no_foreground_client" | "busy");
+    let mut replies = vec![notification_reply(1, reason, shown)];
+    if transient {
+        replies.push(notification_reply(2, "shown", true));
+    }
+    let server = TestServer::start(replies);
+    let mut client = server.client();
+    let config = Config {
+        notifications_enabled: true,
+        ..Config::default()
+    };
+    let mut state = NotificationState::default();
+    let now = Instant::now();
+
+    daemon::push_notifications(
+        &mut client,
+        &config,
+        &notification_report(Severity::Clean),
+        &mut state,
+        now,
+    );
+    assert!(
+        server.requests().is_empty(),
+        "the baseline cycle never sends"
+    );
+    daemon::push_notifications(
+        &mut client,
+        &config,
+        &notification_report(Severity::Conflict),
+        &mut state,
+        now + Duration::from_secs(1),
+    );
+
+    assert_eq!(
+        server.only_request(),
+        json!({
+            "id": "collide:1",
+            "method": "notification.show",
+            "params": {
+                "title": "Conflict predicted",
+                "body": "alpha: branch feature/a, checkout /repo/a\nWith beta: branch feature/b, checkout /repo/b\nPaths: src/lib.rs"
+            }
+        }),
+        "the request shape is the verified herdr 0.8.0 schema"
+    );
+    let after_first = state.severities().expect("baseline")["w1"];
+    if transient {
+        daemon::push_notifications(
+            &mut client,
+            &config,
+            &notification_report(Severity::Conflict),
+            &mut state,
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(
+            server.requests().len(),
+            2,
+            "a transient edge must be retried on the next cycle"
+        );
+        assert_eq!(
+            state.severities().expect("baseline")["w1"],
+            Severity::Conflict,
+            "the retry's shown reply handles the pending edge"
+        );
+    }
+    after_first
+}
+
+fn rejected_notification_case(result: Value) -> Severity {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![Reply::Line(
+        json!({
+            "id": "collide:1",
+            "result": result,
+        })
+        .to_string(),
+    )]);
+    let mut client = server.client();
+    let config = Config {
+        notifications_enabled: true,
+        ..Config::default()
+    };
+    let mut state = NotificationState::default();
+    let now = Instant::now();
+
+    daemon::push_notifications(
+        &mut client,
+        &config,
+        &notification_report(Severity::Clean),
+        &mut state,
+        now,
+    );
+    daemon::push_notifications(
+        &mut client,
+        &config,
+        &notification_report(Severity::Conflict),
+        &mut state,
+        now + Duration::from_secs(1),
+    );
+
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the malformed reply is rejected only after a notification attempt"
+    );
+    state.severities().expect("baseline")["w1"]
 }
 
 /// A server that goes away and comes back, the way `herdr update --handoff`
@@ -685,6 +856,273 @@ fn an_unreadable_worktree_object_is_counted_rather_than_swallowed() {
         client.skipped_worktrees(),
         2,
         "both unreadable worktree objects must be counted"
+    );
+}
+
+#[test]
+fn a_shown_notification_records_the_edge_as_handled() {
+    assert_eq!(
+        notification_case("shown", true),
+        Severity::Conflict,
+        "a toast that appeared must not be repeated next cycle"
+    );
+}
+
+#[test]
+fn a_rate_limited_notification_leaves_the_edge_pending() {
+    assert_eq!(notification_case("rate_limited", false), Severity::Clean);
+}
+
+#[test]
+fn a_notification_with_no_foreground_client_leaves_the_edge_pending() {
+    assert_eq!(
+        notification_case("no_foreground_client", false),
+        Severity::Clean
+    );
+}
+
+#[test]
+fn a_busy_notification_service_leaves_the_edge_pending() {
+    assert_eq!(notification_case("busy", false), Severity::Clean);
+}
+
+#[test]
+fn disabled_notifications_record_the_edge_without_retrying() {
+    assert_eq!(notification_case("disabled", false), Severity::Conflict);
+}
+
+#[test]
+fn a_wrong_notification_reply_type_is_rejected_and_leaves_the_edge_pending() {
+    assert_eq!(
+        rejected_notification_case(json!({
+            "type": "ok",
+            "shown": true,
+            "reason": "shown",
+        })),
+        Severity::Clean,
+        "a reply for the wrong result shape must not advance the baseline"
+    );
+}
+
+#[test]
+fn a_contradictory_notification_reply_is_rejected_and_leaves_the_edge_pending() {
+    assert_eq!(
+        rejected_notification_case(json!({
+            "type": "notification_show",
+            "shown": true,
+            "reason": "busy",
+        })),
+        Severity::Clean,
+        "shown=true cannot be reconciled with a non-shown delivery reason"
+    );
+}
+
+#[test]
+fn conflict_unknown_conflict_emits_exactly_one_notification() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![notification_reply(1, "shown", true)]);
+    let mut client = server.client();
+    let config = Config {
+        notifications_enabled: true,
+        ..Config::default()
+    };
+    let mut state = NotificationState::default();
+    let now = Instant::now();
+
+    for (offset, severity) in [
+        (0, Severity::Clean),
+        (1, Severity::Conflict),
+        (2, Severity::Unknown),
+    ] {
+        daemon::push_notifications(
+            &mut client,
+            &config,
+            &notification_report(severity),
+            &mut state,
+            now + Duration::from_secs(offset),
+        );
+    }
+    assert_eq!(
+        state.severities().expect("baseline")["w1"],
+        Severity::Conflict,
+        "Unknown is a lost answer and must preserve the last real baseline"
+    );
+
+    daemon::push_notifications(
+        &mut client,
+        &config,
+        &notification_report(Severity::Conflict),
+        &mut state,
+        now + Duration::from_secs(122),
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the second Conflict is the same level, even after the cooldown expires"
+    );
+}
+
+#[test]
+fn an_approximate_pairing_is_hedged_in_the_notification() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![notification_reply(1, "shown", true)]);
+    let mut client = server.client();
+    let config = Config {
+        notifications_enabled: true,
+        ..Config::default()
+    };
+    let mut state = NotificationState::default();
+    let now = Instant::now();
+    let mut conflict = notification_report(Severity::Conflict);
+    conflict.pairings[0].approximate = true;
+
+    daemon::push_notifications(
+        &mut client,
+        &config,
+        &notification_report(Severity::Clean),
+        &mut state,
+        now,
+    );
+    daemon::push_notifications(
+        &mut client,
+        &config,
+        &conflict,
+        &mut state,
+        now + Duration::from_secs(1),
+    );
+
+    let request = server.only_request();
+    let body = request["params"]["body"]
+        .as_str()
+        .expect("notification body");
+    assert!(
+        body.contains(
+            "Approximate: these histories have no single merge base, so this prediction forced one."
+        ),
+        "an approximated verdict must not be presented as final: {body}"
+    );
+}
+
+#[test]
+fn a_failed_refresh_is_written_to_the_daemon_diagnostic_stream() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![Reply::Eof, Reply::Eof]);
+    let dirs = scratch_dir("refresh-diagnostic");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_collide"))
+        .args(["--daemon", "--interval", "1"])
+        .env("HERDR_SOCKET_PATH", &server.path)
+        .env("HERDR_PLUGIN_ID", SOURCE)
+        .env("HERDR_PLUGIN_CONFIG_DIR", &dirs)
+        .env("HERDR_PLUGIN_STATE_DIR", &dirs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start foreground daemon");
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while server.requests().len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("collect daemon output");
+    let _ = std::fs::remove_dir_all(&dirs);
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+
+    assert!(
+        server.requests().len() >= 2,
+        "the daemon must complete a failing refresh before it is stopped"
+    );
+    assert!(
+        stderr.contains("collide: refresh failed:"),
+        "a refresh failure must be visible in the daemon diagnostic stream: {stderr:?}"
+    );
+}
+
+#[test]
+fn notifications_are_off_by_default_and_make_no_wire_request() {
+    let _guard = env_lock();
+    let server = TestServer::start(Vec::new());
+    let mut client = server.client();
+    let mut state = NotificationState::default();
+    let now = Instant::now();
+
+    daemon::push_notifications(
+        &mut client,
+        &Config::default(),
+        &notification_report(Severity::Clean),
+        &mut state,
+        now,
+    );
+    daemon::push_notifications(
+        &mut client,
+        &Config::default(),
+        &notification_report(Severity::Conflict),
+        &mut state,
+        now + Duration::from_secs(1),
+    );
+
+    assert!(
+        server.requests().is_empty(),
+        "the opt-in key is the gate in front of every notification call"
+    );
+}
+
+#[test]
+fn shown_notifications_have_a_per_workspace_minimum_interval_without_sleeping() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![
+        notification_reply(1, "shown", true),
+        notification_reply(2, "shown", true),
+    ]);
+    let mut client = server.client();
+    let config = Config {
+        notifications_enabled: true,
+        ..Config::default()
+    };
+    let mut state = NotificationState::default();
+    let now = Instant::now();
+
+    for (offset, severity) in [
+        (0, Severity::Clean),
+        (1, Severity::Conflict),
+        (2, Severity::Clean),
+        (3, Severity::Conflict),
+    ] {
+        daemon::push_notifications(
+            &mut client,
+            &config,
+            &notification_report(severity),
+            &mut state,
+            now + Duration::from_secs(offset),
+        );
+    }
+
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the second edge is inside the {}s minimum interval",
+        daemon::NOTIFICATION_MIN_INTERVAL.as_secs()
+    );
+    assert_eq!(
+        state.severities().expect("baseline")["w1"],
+        Severity::Conflict,
+        "a suppressed edge is handled, not delayed into a level alert"
+    );
+    for (offset, severity) in [(4, Severity::Clean), (61, Severity::Conflict)] {
+        daemon::push_notifications(
+            &mut client,
+            &config,
+            &notification_report(severity),
+            &mut state,
+            now + Duration::from_secs(offset),
+        );
+    }
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "an edge exactly {}s after the shown toast is eligible",
+        daemon::NOTIFICATION_MIN_INTERVAL.as_secs()
     );
 }
 

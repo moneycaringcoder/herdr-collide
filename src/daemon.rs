@@ -35,6 +35,10 @@ const STOP_POLL: Duration = Duration::from_millis(25);
 /// this, so a daemon that fails every cycle for a week cannot fill the disk.
 pub const MAX_LOG_BYTES: u64 = 1 << 20;
 
+/// A workspace cannot display two notifications inside this window. Transient
+/// attempts are exempt because no toast appeared and the edge is still pending.
+pub const NOTIFICATION_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Which token names this plugin believes herdr is currently rendering, per
 /// workspace.
 ///
@@ -47,6 +51,34 @@ pub const MAX_LOG_BYTES: u64 = 1 << 20;
 /// With a set, the unconfirmed name stays and `badge_plan` reissues its clear on
 /// the next cycle.
 pub type LitTokens = BTreeMap<String, BTreeSet<String>>;
+
+/// Last handled severity per workspace. `BTreeMap` makes edge planning stable
+/// even if a caller hands in statuses in a different order.
+pub type SeverityMap = BTreeMap<String, Severity>;
+
+/// One transition into `Conflict` that may warrant a notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationEdge {
+    pub workspace_id: String,
+    pub previous: Severity,
+    pub current: Severity,
+}
+
+/// Cross-cycle notification bookkeeping, kept beside badge and note state in
+/// the daemon loop rather than persisted: a restart deliberately has no
+/// baseline and must not announce old conflicts as new.
+#[derive(Debug, Default)]
+pub struct NotificationState {
+    severities: Option<SeverityMap>,
+    last_shown: BTreeMap<String, Instant>,
+    disabled_reported: bool,
+}
+
+impl NotificationState {
+    pub fn severities(&self) -> Option<&SeverityMap> {
+        self.severities.as_ref()
+    }
+}
 
 /// The main loop wakes at least this often so a stop request is noticed
 /// promptly even with a long refresh interval.
@@ -236,6 +268,7 @@ pub fn run(config: &Config) -> Result<()> {
     // Notes repeat every cycle for as long as their cause lasts, so only the
     // ones that are new since the last cycle are worth printing.
     let mut reported_notes: Vec<String> = Vec::new();
+    let mut notification_state = NotificationState::default();
 
     // Said at startup as well as from the loop, because the loop's first note
     // has to wait for a working connection and this one does not depend on herdr
@@ -284,6 +317,8 @@ pub fn run(config: &Config) -> Result<()> {
                 &active,
                 &mut reported_notes,
                 &mut conflict_history,
+                &mut notification_state,
+                Instant::now(),
             ) {
                 eprintln!("collide: refresh failed: {err}");
                 // Only a transport failure is worth redialling for; an error
@@ -369,6 +404,8 @@ fn refresh(
     active: &Mutex<LitTokens>,
     reported_notes: &mut Vec<String>,
     conflict_history: &mut crate::history::EpisodeTracker,
+    notification_state: &mut NotificationState,
+    now: Instant,
 ) -> Result<()> {
     let checkouts = client.checkouts()?;
     let skipped = client.skipped_worktrees();
@@ -405,6 +442,7 @@ fn refresh(
     }
     reported_notes.clone_from(&notes);
 
+    push_notifications(client, config, &cycle.report, notification_state, now);
     push(client, config, &cycle.report.statuses, active);
     Ok(())
 }
@@ -418,6 +456,215 @@ pub fn new_notes(previous: &[String], current: &[String]) -> Vec<String> {
         .filter(|note| !previous.contains(note))
         .cloned()
         .collect()
+}
+
+/// Transitions into `Conflict` since the preceding cycle.
+///
+/// `None` means there is no baseline yet, which is deliberately different from
+/// an observed empty cycle. A newly seen workspace has no prior answer either,
+/// so it is recorded by the caller but does not produce an edge. Disappearing
+/// workspaces likewise produce nothing.
+pub fn notification_plan(
+    previous: Option<&SeverityMap>,
+    statuses: &[crate::model::WorkspaceStatus],
+) -> Vec<NotificationEdge> {
+    let Some(previous) = previous else {
+        return Vec::new();
+    };
+    current_severities(statuses)
+        .into_iter()
+        .filter_map(|(workspace_id, current)| {
+            let previous = previous.get(&workspace_id).copied()?;
+            // Do not broaden this to the severity ladder: a runaway is
+            // near-permanent on a busy branch, while Unknown is the absence
+            // of an answer. Neither is news worth training users to mute.
+            (current == Severity::Conflict && previous != Severity::Conflict).then_some(
+                NotificationEdge {
+                    workspace_id,
+                    previous,
+                    current,
+                },
+            )
+        })
+        .collect()
+}
+
+fn current_severities(statuses: &[crate::model::WorkspaceStatus]) -> SeverityMap {
+    statuses
+        .iter()
+        .map(|status| (status.workspace_id.clone(), status.severity))
+        .collect()
+}
+
+/// Sends new-conflict notifications and advances only the edges herdr
+/// says were handled. A transient delivery verdict or call failure leaves the
+/// old severity in place, so the same edge is retried on the next cycle.
+pub fn push_notifications(
+    client: &mut Herdr,
+    config: &Config,
+    report: &crate::model::Report,
+    state: &mut NotificationState,
+    now: Instant,
+) {
+    if !config.notifications_enabled {
+        return;
+    }
+
+    let current = current_severities(&report.statuses);
+    let Some(previous) = state.severities.clone() else {
+        // A restart has no knowledge of when these states began. Treating them
+        // as edges would announce every old conflict again. Unknown is not a
+        // baseline: it is the absence of an answer.
+        state.severities = Some(
+            current
+                .into_iter()
+                .filter(|(_, severity)| *severity != Severity::Unknown)
+                .collect(),
+        );
+        return;
+    };
+    let plan = notification_plan(Some(&previous), &report.statuses);
+    let edge_ids: BTreeSet<&str> = plan.iter().map(|edge| edge.workspace_id.as_str()).collect();
+
+    let mut next = previous;
+    next.retain(|workspace_id, _| current.contains_key(workspace_id));
+    state
+        .last_shown
+        .retain(|workspace_id, _| current.contains_key(workspace_id));
+    // Same severities, decreases, and newly observed workspaces are handled
+    // immediately when they are real answers. Conflict -> unknown is a lost
+    // answer, not a resolution, so it must not overwrite the last real answer
+    // and re-arm an unchanged conflict.
+    for (workspace_id, severity) in &current {
+        if *severity == Severity::Unknown {
+            continue;
+        }
+        if !edge_ids.contains(workspace_id.as_str()) {
+            next.insert(workspace_id.clone(), *severity);
+        }
+    }
+
+    for edge in plan {
+        if state
+            .last_shown
+            .get(&edge.workspace_id)
+            .is_some_and(|last| now.saturating_duration_since(*last) < NOTIFICATION_MIN_INTERVAL)
+        {
+            // This edge happened inside the quiet window. It is handled rather
+            // than delayed: once the window ends it is a level, not new news.
+            next.insert(edge.workspace_id.clone(), edge.current);
+            continue;
+        }
+
+        let (title, body) = notification_copy(&edge, report);
+        match client.show_notification(title, &body) {
+            Ok(herdr::NotificationDelivery::Shown) => {
+                next.insert(edge.workspace_id.clone(), edge.current);
+                state.last_shown.insert(edge.workspace_id, now);
+            }
+            Ok(herdr::NotificationDelivery::Disabled) => {
+                next.insert(edge.workspace_id, edge.current);
+                if !state.disabled_reported {
+                    eprintln!(
+                        "collide: herdr notifications are disabled; notification edges are \
+                         recorded without retrying"
+                    );
+                    state.disabled_reported = true;
+                }
+            }
+            Ok(herdr::NotificationDelivery::Transient(reason)) => {
+                eprintln!(
+                    "collide: notification for {} was not shown ({}) and remains pending",
+                    edge.workspace_id,
+                    transient_reason(reason)
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "collide: notification for {} failed and remains pending: {err}",
+                    edge.workspace_id
+                );
+            }
+        }
+    }
+    state.severities = Some(next);
+}
+
+fn transient_reason(reason: herdr::NotificationTransient) -> &'static str {
+    match reason {
+        herdr::NotificationTransient::RateLimited => "rate_limited",
+        herdr::NotificationTransient::NoForegroundClient => "no_foreground_client",
+        herdr::NotificationTransient::Busy => "busy",
+    }
+}
+
+fn notification_copy(
+    edge: &NotificationEdge,
+    report: &crate::model::Report,
+) -> (&'static str, String) {
+    let title = "Conflict predicted";
+    let Some(checkout) = report
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.workspace_id == edge.workspace_id)
+    else {
+        return (
+            title,
+            format!(
+                "Conflict predicted for workspace {} (previously {})",
+                edge.workspace_id,
+                crate::collide::severity_name(edge.previous)
+            ),
+        );
+    };
+
+    let mut lines = vec![checkout_line(checkout, "")];
+    for pairing in &report.pairings {
+        let peer_id = if pairing.left_workspace_id == edge.workspace_id {
+            Some(pairing.right_workspace_id.as_str())
+        } else if pairing.right_workspace_id == edge.workspace_id {
+            Some(pairing.left_workspace_id.as_str())
+        } else {
+            None
+        };
+        let Some(peer_id) = peer_id else {
+            continue;
+        };
+        let paths: Vec<&str> = pairing
+            .shared
+            .iter()
+            .filter(|shared| shared.verdict == crate::model::FileVerdict::Conflict)
+            .map(|shared| shared.path.as_str())
+            .collect();
+        if paths.is_empty() {
+            continue;
+        }
+        if let Some(peer) = report
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.workspace_id == peer_id)
+        {
+            lines.push(checkout_line(peer, "With "));
+        }
+        lines.push(format!("Paths: {}", paths.join(", ")));
+        if pairing.approximate {
+            lines.push(
+                "Approximate: these histories have no single merge base, so this prediction \
+                 forced one."
+                    .to_string(),
+            );
+        }
+    }
+    (title, lines.join("\n"))
+}
+
+fn checkout_line(checkout: &crate::model::Checkout, prefix: &str) -> String {
+    let branch = checkout.branch.as_deref().unwrap_or("detached HEAD");
+    format!(
+        "{prefix}{}: branch {branch}, checkout {}",
+        checkout.workspace_label,
+        checkout.checkout_path.display()
+    )
 }
 
 /// One badge call to make.

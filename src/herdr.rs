@@ -59,6 +59,21 @@ impl fmt::Display for HerdrError {
 }
 
 impl std::error::Error for HerdrError {}
+/// Whether a successful `notification.show` request put a toast on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDelivery {
+    Shown,
+    Disabled,
+    Transient(NotificationTransient),
+}
+
+/// Reasons that did not display a toast but may succeed on a later cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationTransient {
+    RateLimited,
+    NoForegroundClient,
+    Busy,
+}
 
 /// Error code from a herdr error envelope, or `None` for a transport failure.
 pub fn error_code<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a str> {
@@ -193,6 +208,50 @@ impl Herdr {
             diagnostics.join("; ")
         };
         Err(format!("herdr reported config reload status `{status}`: {detail}").into())
+    }
+
+    /// Shows a desktop notification and distinguishes an accepted request from
+    /// a toast the user actually saw.
+    ///
+    /// Herdr 0.8.0 returns `notification_show`, not `ok`, and its required
+    /// `reason` is the delivery verdict. The `shown` flag is checked too so a
+    /// contradictory response cannot silently lose an alert.
+    pub fn show_notification(&mut self, title: &str, body: &str) -> Result<NotificationDelivery> {
+        let result = self.call(
+            "notification.show",
+            json!({
+                "title": title,
+                "body": body,
+            }),
+        )?;
+        if text(&result, "type") != Some("notification_show") {
+            return Err(format!(
+                "notification.show returned result type `{}`",
+                text(&result, "type").unwrap_or("missing")
+            )
+            .into());
+        }
+        let shown = result
+            .get("shown")
+            .and_then(Value::as_bool)
+            .ok_or("notification.show returned no boolean `shown`")?;
+        let reason = text(&result, "reason").ok_or("notification.show returned no `reason`")?;
+        match (shown, reason) {
+            (true, "shown") => Ok(NotificationDelivery::Shown),
+            (false, "disabled") => Ok(NotificationDelivery::Disabled),
+            (false, "rate_limited") => Ok(NotificationDelivery::Transient(
+                NotificationTransient::RateLimited,
+            )),
+            (false, "no_foreground_client") => Ok(NotificationDelivery::Transient(
+                NotificationTransient::NoForegroundClient,
+            )),
+            (false, "busy") => Ok(NotificationDelivery::Transient(NotificationTransient::Busy)),
+            _ => Err(format!(
+                "notification.show returned contradictory or unknown delivery \
+                 (`shown`: {shown}, `reason`: `{reason}`)"
+            )
+            .into()),
+        }
     }
 
     /// Sets one badge token on a workspace, with a TTL so it self-clears if
