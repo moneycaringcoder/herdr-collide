@@ -536,14 +536,18 @@ worktree per cycle: `rev-parse --show-toplevel` and
 
 ## Known limitations
 
-- **A dirty submodule reads as an overlap, never as a conflict.** `status`
-  reports it as one changed path (`1 .M S.MU … sub`, parsed correctly), but the
-  snapshot's `add -A` records the submodule's *committed* gitlink, so merge-tree
-  compares two identical gitlinks and finds nothing. Two agents editing the same
-  submodule therefore always read as touching the same file harmlessly. The
-  directory also line-counts as zero, so the work is invisible to the runaway
-  thresholds. Predicting inside a submodule means treating it as a repository in
-  its own right, which is a larger change than the gitlink comparison.
+- **Dirty submodule contents can make an otherwise clean verdict unknown.**
+  `status` reports the submodule as one changed path (`1 .M S.MU … sub`), and
+  the parser keeps the commit, modified-content and untracked-content flags.
+  The snapshot's `add -A` still records only the submodule's *committed*
+  gitlink, so modified or untracked content below it is not compared. When
+  merge-tree finds no gitlink conflict, the path reports `unknown` rather than
+  claiming a clean overlap. The `C` flag is independent: a changed recorded
+  pointer gives merge-tree real gitlinks to compare, and any conflict it finds
+  stands even on an `S C M U` record. The directory also line-counts as zero,
+  so work inside it is invisible to the runaway thresholds. Comparing
+  submodule contents means treating it as a repository in its own right, which
+  remains a larger change.
 - **A stat-dirty but content-identical filtered path can be reported as
   conflicting.** See "What that costs, and the one case it gets wrong".
 

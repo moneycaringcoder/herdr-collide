@@ -72,6 +72,82 @@ fn ordinary_records_carry_staged_and_unstaged_kinds() {
 }
 
 #[test]
+fn dirty_submodule_flags_survive_status_framing() {
+    let fixture = Fixture::new("dirty-submodule-status");
+    let (_superproject, first, _second, submodule) =
+        fixture.superproject_with_submodule("embedded");
+    fixture.write(&submodule, "payload.txt", "modified payload\n");
+    fixture.write(&submodule, "untracked.txt", "untracked payload\n");
+    // This tracked ordinary record must still parse after the fixed-position
+    // `<sub>` field has been read from the preceding record.
+    fixture.write(&first, "shared.txt", "following\n");
+
+    let captured = status_bytes(&fixture, &first, false);
+    assert!(
+        captured
+            .windows(b" S.MU ".len())
+            .any(|part| part == b" S.MU "),
+        "git did not produce the dirty-submodule flags this parser test needs: {captured:?}"
+    );
+    assert!(
+        captured
+            .windows(b"1 .M N...".len())
+            .any(|part| part == b"1 .M N..."),
+        "git did not produce the ordinary tracked record this parser test needs: {captured:?}"
+    );
+    let entries = parse_status_v2(&captured);
+    assert_eq!(
+        paths_of(&entries),
+        vec!["embedded".to_string(), "shared.txt".to_string()],
+        "reading `<sub>` desynchronised a later NUL-framed record"
+    );
+
+    let submodule = entries
+        .iter()
+        .find(|entry| entry.path == "embedded")
+        .unwrap();
+    let state = submodule.submodule.expect("S<c><m><u> state");
+    assert!(!state.commit_changed);
+    assert!(state.modified_content);
+    assert!(state.untracked_content);
+    let ordinary = entries
+        .iter()
+        .find(|entry| entry.path == "shared.txt")
+        .unwrap();
+    assert!(ordinary.submodule.is_none(), "ordinary paths use N...");
+}
+
+#[test]
+fn commit_only_submodule_is_comparable_by_gitlink() {
+    let fixture = Fixture::new("commit-only-submodule");
+    let (_superproject, first, _second, submodule) =
+        fixture.superproject_with_submodule("embedded");
+    fixture.write(&submodule, "payload.txt", "new committed payload\n");
+    fixture.commit_all(&submodule, "advance submodule pointer");
+
+    let entries = parse_status_v2(&status_bytes(&fixture, &first, false));
+    let state = entries
+        .iter()
+        .find(|entry| entry.path == "embedded")
+        .and_then(|entry| entry.submodule)
+        .expect("submodule state");
+    assert!(state.commit_changed);
+    assert!(!state.modified_content);
+    assert!(!state.untracked_content);
+
+    let set = change_set(&first, "refs/heads/main", TIMEOUT).expect("change set");
+    let changed = set
+        .paths
+        .iter()
+        .find(|path| path.path == "embedded")
+        .expect("changed gitlink");
+    assert!(
+        !changed.submodule_contents_uncomparable,
+        "a clean C-only submodule has a real gitlink for merge-tree to compare"
+    );
+}
+
+#[test]
 fn rename_record_captures_both_paths_and_does_not_desync_the_stream() {
     let fixture = Fixture::new("rename");
     let wt = fixture.worktree("wt", "wt");
