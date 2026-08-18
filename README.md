@@ -253,6 +253,34 @@ already in progress and approximate predictions with no single merge base are la
 verdict they qualify. A conflicted blob is inspected for kind and size before it is read; blobs over
 8 MiB are reported as `unknown` instead of being loaded into the editor-side plugin process.
 
+## JSON schema
+
+`collide --json` includes an integer `schema` at the top level. Its current value is `2`. The key
+deliberately keeps the name shipped in 0.1.0: renaming the field consumers use to detect incompatible
+changes would itself be incompatible and spend a version bump on cosmetics.
+
+Schema 2 has these keys:
+
+- top level: `schema`, `checkouts`, `pairings`, `statuses`, `notes`
+- each `checkouts` element: `workspace_id`, `label`, `repo_key`, `repo_root`, `checkout_path`,
+  `branch`, `agent`, `is_linked_worktree`, `changed_files`, `lines_added`, `lines_removed`,
+  `has_rename`, `degraded`, `degraded_reason`
+- each `pairings` element: `left`, `right`, `conflict_count`, `unknown_count`, `approximate`, `shared`
+- each `pairings[].shared` element: `path`, `verdict`
+- each `statuses` element: `workspace_id`, `severity`, `token`, `badge`, `overlap_count`,
+  `conflict_count`, `unknown_count`, `runaway`, `lines_changed`, `changed_files`
+- `notes` is an array of strings
+
+Two of those values are enumerations, and they are the reason the version is at `2` rather than `1`:
+`severity` is one of `clean`, `overlap`, `runaway`, `unknown`, `conflict`, and `verdict` is one of
+`overlap`, `conflict`, `unknown`. A consumer matching either of them exhaustively is the consumer a
+new value breaks, which is what the version exists to warn.
+
+Adding a key, or adding an element to an array, does not bump the version. Removing or renaming a
+key, changing a value's type, or adding a value to the `severity` or `verdict` enum does bump it.
+Array order is not part of the contract, so consumers must not depend on `pairings` or any other
+array retaining its current order.
+
 ## Configuration
 
 Configuration is a JSON file at `$HERDR_PLUGIN_CONFIG_DIR/config.json`. herdr injects that directory
