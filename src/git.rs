@@ -1219,6 +1219,11 @@ pub struct PairPrediction {
     /// was not requested (a rename can conflict on a path neither change set
     /// listed under the same name).
     pub verdicts: Vec<(String, bool)>,
+    /// Machine-stable conflict-type tokens keyed by every path in the message
+    /// record that reported them. The association matters: assigning a
+    /// pair-level rename token to an unrelated conflicted path would claim a
+    /// cause git did not name.
+    pub conflict_types_by_path: BTreeMap<String, Vec<String>>,
     /// True when a single merge base had to be forced although more than one
     /// exists, so the answer is an approximation of what a real merge would do.
     pub approximate: bool,
@@ -1890,6 +1895,22 @@ impl Predictor {
         }
 
         let parsed = parse_merge_tree_z(&named.stdout);
+        prediction.conflict_types_by_path = parsed
+            .conflicts
+            .iter()
+            .flat_map(|conflict| {
+                conflict
+                    .paths
+                    .iter()
+                    .map(|path| (path.clone(), conflict.conflict_type.clone()))
+            })
+            .fold(BTreeMap::new(), |mut by_path, (path, conflict_type)| {
+                let types: &mut Vec<String> = by_path.entry(path).or_default();
+                if !types.contains(&conflict_type) {
+                    types.push(conflict_type);
+                }
+                by_path
+            });
         prediction.conflict_types = parsed.conflict_types;
         prediction.pair_conflict = named.code == Some(1);
         let conflicted: BTreeSet<&String> = parsed.conflicted.iter().collect();
@@ -2084,11 +2105,35 @@ impl Drop for TempIndex {
     }
 }
 
+pub const CONFLICT_RENAME_RENAME: &str = "CONFLICT (rename/rename)";
+pub const CONFLICT_RENAME_DELETE: &str = "CONFLICT (rename/delete)";
+pub const CONFLICT_DIRECTORY_RENAME_SUGGESTED: &str = "CONFLICT (directory rename suggested)";
+
+/// The compact pane annotation for a machine-stable merge-tree conflict token.
+// These three tokens — rename/rename, rename/delete, and directory rename
+// suggested — are exactly the conflict shapes that make a `(rename)` claim true.
+pub fn conflict_type_annotation(conflict_type: &str) -> Option<&'static str> {
+    match conflict_type {
+        CONFLICT_RENAME_RENAME | CONFLICT_RENAME_DELETE | CONFLICT_DIRECTORY_RENAME_SUGGESTED => {
+            Some("rename")
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MergeTreeConflict {
+    pub paths: Vec<String>,
+    pub conflict_type: String,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergeTreeOutput {
     pub tree: String,
     pub conflicted: Vec<String>,
     pub conflict_types: Vec<String>,
+    /// Conflict message records with the path association git reported.
+    pub conflicts: Vec<MergeTreeConflict>,
 }
 
 /// Parses `merge-tree --write-tree -z --name-only`.
@@ -2116,14 +2161,13 @@ pub fn parse_merge_tree_z(bytes: &[u8]) -> MergeTreeOutput {
     i += 1; // the empty field closing the file section
 
     // Message records. Parsing is best-effort: the file section above is the
-    // authoritative answer, these only add the machine-stable type token.
+    // authoritative answer, while these preserve git's machine-stable reason
+    // and exactly the paths to which git attached it.
     //
     // Not every message record is a conflict. git emits an `Auto-merging`
-    // record for each file it merged successfully, in exactly the same shape,
-    // and taking every type field verbatim filled this list with noise — for a
-    // two-file conflict, `["Auto-merging", "CONFLICT (contents)", "Auto-merging",
-    // "CONFLICT (contents)"]`, which `Vec::dedup` cannot collapse because it only
-    // removes *adjacent* duplicates. Keep the conflict tokens, and use a set.
+    // record for each file it merged successfully, in exactly the same shape.
+    // Keep only conflict records, then derive the compatibility-oriented flat
+    // token set from those retained records.
     let mut types: BTreeSet<String> = BTreeSet::new();
     while i < fields.len() {
         let Ok(count) = std::str::from_utf8(fields[i])
@@ -2139,7 +2183,15 @@ pub fn parse_merge_tree_z(bytes: &[u8]) -> MergeTreeOutput {
         }
         let token = lossy(fields[type_at]);
         if token.starts_with("CONFLICT (") {
-            types.insert(token);
+            let paths = fields[i + 1..type_at]
+                .iter()
+                .map(|path| lossy(path))
+                .collect();
+            types.insert(token.clone());
+            out.conflicts.push(MergeTreeConflict {
+                paths,
+                conflict_type: token,
+            });
         }
         i = type_at + 2; // skip the human message too
     }
