@@ -23,7 +23,7 @@
 //! description, so two acquisitions in one process contend the way two processes
 //! would.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -614,6 +614,190 @@ fn one_workspaces_severity_does_not_disturb_another() {
     )));
 }
 
+fn severities(pairs: &[(&str, Severity)]) -> BTreeMap<String, Severity> {
+    pairs
+        .iter()
+        .map(|(workspace_id, severity)| (workspace_id.to_string(), *severity))
+        .collect()
+}
+
+#[test]
+fn the_first_notification_cycle_establishes_a_baseline_without_alerting() {
+    let current = [status("w6", Severity::Conflict, 1, 0)];
+
+    assert!(
+        daemon::notification_plan(None, &current).is_empty(),
+        "a restart must not turn an old conflict into new news"
+    );
+}
+
+#[test]
+fn every_lower_severity_escalating_to_conflict_is_an_edge() {
+    for previous in [
+        Severity::Clean,
+        Severity::Overlap,
+        Severity::Runaway,
+        Severity::Unknown,
+    ] {
+        let plan = daemon::notification_plan(
+            Some(&severities(&[("w6", previous)])),
+            &[status("w6", Severity::Conflict, 1, 0)],
+        );
+
+        assert_eq!(plan.len(), 1, "{previous:?} -> conflict must notify");
+        assert_eq!(plan[0].workspace_id, "w6");
+        assert_eq!(plan[0].previous, previous);
+        assert_eq!(plan[0].current, Severity::Conflict);
+    }
+}
+
+#[test]
+fn clean_to_runaway_is_not_a_notification_edge() {
+    assert!(daemon::notification_plan(
+        Some(&severities(&[("w6", Severity::Clean)])),
+        &[status("w6", Severity::Runaway, 0, 0)],
+    )
+    .is_empty());
+}
+
+#[test]
+fn overlap_to_unknown_is_not_a_notification_edge() {
+    assert!(daemon::notification_plan(
+        Some(&severities(&[("w6", Severity::Overlap)])),
+        &[status("w6", Severity::Unknown, 0, 0)],
+    )
+    .is_empty());
+}
+
+#[test]
+fn no_severity_transition_to_runaway_is_notification_news() {
+    for previous in [
+        Severity::Clean,
+        Severity::Overlap,
+        Severity::Runaway,
+        Severity::Unknown,
+        Severity::Conflict,
+    ] {
+        assert!(
+            daemon::notification_plan(
+                Some(&severities(&[("w6", previous)])),
+                &[status("w6", Severity::Runaway, 0, 0)],
+            )
+            .is_empty(),
+            "{previous:?} -> runaway must not notify"
+        );
+    }
+}
+
+#[test]
+fn no_severity_transition_to_unknown_is_notification_news() {
+    for previous in [
+        Severity::Clean,
+        Severity::Overlap,
+        Severity::Runaway,
+        Severity::Unknown,
+        Severity::Conflict,
+    ] {
+        assert!(
+            daemon::notification_plan(
+                Some(&severities(&[("w6", previous)])),
+                &[status("w6", Severity::Unknown, 0, 0)],
+            )
+            .is_empty(),
+            "{previous:?} -> unknown must not notify"
+        );
+    }
+}
+
+#[test]
+fn no_severity_transition_to_overlap_is_notification_news() {
+    for previous in [
+        Severity::Clean,
+        Severity::Overlap,
+        Severity::Runaway,
+        Severity::Unknown,
+        Severity::Conflict,
+    ] {
+        assert!(
+            daemon::notification_plan(
+                Some(&severities(&[("w6", previous)])),
+                &[status("w6", Severity::Overlap, 0, 1)],
+            )
+            .is_empty(),
+            "{previous:?} -> overlap must not notify"
+        );
+    }
+}
+
+#[test]
+fn a_conflict_becoming_overlap_does_not_interrupt_the_user() {
+    assert!(daemon::notification_plan(
+        Some(&severities(&[("w6", Severity::Conflict)])),
+        &[status("w6", Severity::Overlap, 0, 1)],
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_new_workspace_has_no_notification_baseline() {
+    assert!(daemon::notification_plan(
+        Some(&severities(&[("w6", Severity::Clean)])),
+        &[
+            status("w6", Severity::Clean, 0, 0),
+            status("w7", Severity::Conflict, 1, 0),
+        ],
+    )
+    .is_empty());
+}
+
+#[test]
+fn the_first_notification_cycle_never_has_edges_for_any_severity() {
+    let current = [
+        status("clean", Severity::Clean, 0, 0),
+        status("overlap", Severity::Overlap, 0, 1),
+        status("runaway", Severity::Runaway, 0, 0),
+        status("unknown", Severity::Unknown, 0, 0),
+        status("conflict", Severity::Conflict, 1, 0),
+    ];
+
+    assert!(daemon::notification_plan(None, &current).is_empty());
+}
+
+#[test]
+fn an_existing_conflict_is_a_level_not_an_edge() {
+    assert!(daemon::notification_plan(
+        Some(&severities(&[("w6", Severity::Conflict)])),
+        &[status("w6", Severity::Conflict, 1, 0)],
+    )
+    .is_empty());
+}
+
+#[test]
+fn losing_a_conflict_answer_is_not_a_resolution_or_a_notification() {
+    assert!(daemon::notification_plan(
+        Some(&severities(&[("w6", Severity::Conflict)])),
+        &[status("w6", Severity::Unknown, 0, 0)],
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_conflict_becoming_clean_does_not_interrupt_the_user() {
+    assert!(daemon::notification_plan(
+        Some(&severities(&[("w6", Severity::Conflict)])),
+        &[status("w6", Severity::Clean, 0, 0)],
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_workspace_disappearing_is_not_a_notification_edge() {
+    assert!(
+        daemon::notification_plan(Some(&severities(&[("w6", Severity::Conflict)])), &[],)
+            .is_empty()
+    );
+}
+
 #[test]
 fn only_notes_that_are_new_since_the_last_cycle_are_reported() {
     // A note repeats every cycle for as long as its cause lasts, and at a 5s
@@ -729,7 +913,7 @@ fn a_config_file_overrides_only_the_fields_it_names() {
 
     std::fs::write(
         dirs.config_file(),
-        r#"{"interval_seconds": 30, "runaway_files": 7, "ignore_suffixes": [".snap"]}"#,
+        r#"{"interval_seconds": 30, "runaway_files": 7, "ignore_suffixes": [".snap"], "notifications_enabled": true}"#,
     )
     .expect("write config");
 
@@ -742,6 +926,11 @@ fn a_config_file_overrides_only_the_fields_it_names() {
     assert_eq!(
         config.predict_conflicts,
         Config::default().predict_conflicts
+    );
+    assert!(config.notifications_enabled);
+    assert!(
+        !Config::default().notifications_enabled,
+        "desktop notifications are opt-in"
     );
 
     // The command line still wins over the file.

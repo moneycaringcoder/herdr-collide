@@ -41,6 +41,9 @@ pub struct Config {
     pub ignore_suffixes: Vec<String>,
     /// Predict real conflicts rather than only reporting shared paths.
     pub predict_conflicts: bool,
+    /// Show desktop notifications when a workspace becomes conflicting.
+    /// Intrusive output is opt-in even though badge reporting is always on.
+    pub notifications_enabled: bool,
     /// Ref every checkout's change set is measured against, as the `<base>` in
     /// `diff <base>...HEAD`. `git::change_set` degrades rather than failing when
     /// it does not resolve, which is the common case for a repo with no
@@ -67,6 +70,7 @@ impl Default for Config {
                 "go.sum".into(),
             ],
             predict_conflicts: true,
+            notifications_enabled: false,
             base_ref: DEFAULT_BASE_REF.to_string(),
             git_timeout: Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS),
         }
@@ -138,18 +142,20 @@ struct FileConfig {
     runaway_lines: Option<u64>,
     ignore_suffixes: Option<Vec<String>>,
     predict_conflicts: Option<bool>,
+    notifications_enabled: Option<bool>,
     base_ref: Option<String>,
     git_timeout_seconds: Option<u64>,
 }
 
 /// Every key `FileConfig` understands. Kept beside the struct because the
 /// unknown-key warning is only useful while the two agree.
-const KNOWN_KEYS: [&str; 7] = [
+const KNOWN_KEYS: [&str; 8] = [
     "interval_seconds",
     "runaway_files",
     "runaway_lines",
     "ignore_suffixes",
     "predict_conflicts",
+    "notifications_enabled",
     "base_ref",
     "git_timeout_seconds",
 ];
@@ -225,6 +231,9 @@ fn load_file() -> Config {
     }
     if let Some(predict) = file.predict_conflicts {
         config.predict_conflicts = predict;
+    }
+    if let Some(enabled) = file.notifications_enabled {
+        config.notifications_enabled = enabled;
     }
     if let Some(base_ref) = file.base_ref.filter(|r| !r.trim().is_empty()) {
         config.base_ref = base_ref;

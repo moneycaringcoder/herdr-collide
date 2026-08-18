@@ -269,6 +269,7 @@ badge down.
     "go.sum"
   ],
   "predict_conflicts": true,
+  "notifications_enabled": false,
   "base_ref": "origin/HEAD",
   "git_timeout_seconds": 10
 }
@@ -284,6 +285,12 @@ badge down.
   list rather than adding to it.
 - **`predict_conflicts`** — set to `false` to report shared paths only. Cheaper, and it stops
   distinguishing a real conflict from a plain overlap.
+- **`notifications_enabled`** — opt in to desktop notifications when a workspace becomes
+  conflicting after a non-conflicting baseline. Default `false`. The first cycle establishes a
+  baseline, unchanged conflicts do not repeat, and a workspace cannot show notifications more than
+  once per minute. Notification bodies identify the affected branch names, checkout paths, and
+  conflicting paths. Transitions into runaway, unknown, or overlap do not notify; neither does a
+  transition from conflict to clean.
 - **`base_ref`** — the ref each checkout's change set is measured against, as the `<base>` in
   `git diff <base>...HEAD`. Default `origin/HEAD`; where that does not resolve, `collide` falls back to
   the first of `origin/main`, `origin/master`, `main`, `master`, `trunk` that exists, and finally to
