@@ -35,6 +35,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   conflicting path the predictor named but no change set listed. Filtering only the
   first is how an ignored lockfile previously came back as a runaway badge, so each of
   the four has its own test.
+- The `--json` schema is now a documented promise rather than an implementation
+  detail. `README.md` records the `schema` key, its current value, the full key
+  inventory, both enum domains, and the rule for when the number moves: adding a
+  key or an array element is compatible, while removing or renaming a key,
+  changing a value's type, or adding a `severity` or `verdict` value is not.
+  Array order is explicitly outside the contract.
+- A schema test that fails when the shape moves without the version. The existing
+  tests would notice a renamed or removed key by way of the value they assert; an
+  *added* key passed silently, and the enum domains were unpinned entirely. The
+  new test compares the exact key set at every level and maps every `Severity` and
+  `FileVerdict` variant through an exhaustive match with no wildcard, so a new
+  variant stops compiling rather than quietly widening the output.
 
 ### Fixed
 
