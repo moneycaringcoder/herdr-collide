@@ -305,11 +305,10 @@ pub fn apply_predictions(
             if !*hit || known.contains(path.as_str()) {
                 continue;
             }
-            // An ignored path is ignored here too. `known` was built from the
-            // filtered intersection, so without this a `Cargo.lock` that both
-            // sides regenerated comes straight back as a conflict through the
-            // unlisted-path door — the single commonest false alarm there is,
-            // and the one `ignore_suffixes` exists to suppress.
+            // Ignored paths are ignored here too. `known` was built from the
+            // filtered intersection, so without this a generated path that both
+            // sides changed can come straight back as a conflict through the
+            // unlisted-path door.
             if is_ignored(path, config) {
                 continue;
             }
@@ -343,10 +342,10 @@ pub fn apply_predictions(
     report.statuses = statuses(&report.checkouts, &filtered, &report.pairings, config);
 }
 
-/// A change set with `ignore_suffixes` applied, reduced to what the pairing
-/// pass needs. Lockfiles and generated manifests overlap on essentially every
-/// concurrent branch and carry no information, so they are dropped before
-/// anything counts them — including the runaway thresholds.
+/// A change set with configured ignore rules applied, reduced to what the
+/// pairing pass needs. Lockfiles and generated output overlap constantly and
+/// carry no information, so they are dropped before anything counts them —
+/// including the runaway thresholds.
 #[derive(Debug, Clone)]
 struct FilteredChange {
     paths: BTreeSet<String>,
@@ -528,14 +527,14 @@ pub fn work_tree_root(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Suffix match against `Config::ignore_suffixes`, anchored to a path-component
-/// or extension boundary.
+/// Match configured suffix and glob rules against a repository-relative path.
 ///
-/// A bare `ends_with` is too eager: `go.sum` would swallow `tools/cargo.sum`
-/// and `Cargo.lock` would swallow `vendor/NotReallyCargo.lock`, dropping real
-/// changes from the change set with nothing to show for it. A suffix that
-/// starts with `.` is an extension and may match mid-name; anything else must
-/// begin at the start of the path or straight after a `/`.
+/// A bare suffix `ends_with` is too eager: `go.sum` would swallow
+/// `tools/cargo.sum` and `Cargo.lock` would swallow
+/// `vendor/NotReallyCargo.lock`, dropping real changes from the change set with
+/// nothing to show for it. A suffix that starts with `.` is an extension and
+/// may match mid-name; anything else must begin at the start of the path or
+/// straight after a `/`.
 pub fn is_ignored(path: &str, config: &Config) -> bool {
     config.ignore_suffixes.iter().any(|suffix| {
         if suffix.is_empty() || !path.ends_with(suffix.as_str()) {
@@ -546,7 +545,7 @@ pub fn is_ignored(path: &str, config: &Config) -> bool {
         }
         let start = path.len() - suffix.len();
         start == 0 || path.as_bytes()[start - 1] == b'/'
-    })
+    }) || crate::ignore::matches_any(path, &config.ignore_globs)
 }
 
 /// An unborn branch and a branch deleted underneath a worktree both leave the
