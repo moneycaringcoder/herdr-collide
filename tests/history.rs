@@ -82,6 +82,7 @@ fn report(
         .map(|verdict| SharedFile {
             path: "src/lib.rs".to_string(),
             verdict,
+            conflict_type: None,
         })
         .into_iter()
         .collect();
