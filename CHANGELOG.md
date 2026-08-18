@@ -22,6 +22,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is scheduled and manual only, it is not a required check, and a red canary is
   a signal to read herdr's recent changes rather than a reason to hold a pull
   request.
+- Optional desktop notifications when a workspace *becomes* conflicting, off by default
+  (`notifications_enabled`). A conflict that has existed for ten minutes is not news; the
+  edge is. Only a transition into `conflict` from a non-`conflict` severity notifies:
+  transitions into `runaway`, `unknown` or `overlap` do not, because a runaway is
+  near-permanent on a busy branch and an unknown is the absence of an answer, and neither
+  is worth training someone to mute.
+- Losing a conflict is never announced as resolving one. `conflict` → `unknown` means the
+  answer was lost, so it neither notifies nor overwrites the last real answer — otherwise a
+  single git timeout would re-announce an unchanged conflict as new news every minute for as
+  long as the timeouts continued. `conflict` → `clean` does not interrupt anyone either.
+  Neither does the first cycle after the daemon starts, which has no baseline at all.
+- A notification distinguishes being sent from being seen. herdr answers with a reason, so
+  `rate_limited`, `busy` and `no_foreground_client` leave the alert pending for the next
+  cycle rather than recording a toast that never appeared, and a reply the client cannot
+  trust is rejected rather than believed. A prediction that rests on a forced merge base
+  says so in the notification, as it already does everywhere else.
 - `collide --why <PATH>` shows the conflicting hunks behind an `✘ conflict` verdict. The
   verdict is a summary of a real merge that already ran in a temporary index, so the
   command reads the merged blob out of that prediction's own object store rather than

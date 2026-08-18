@@ -308,6 +308,7 @@ badge down.
   ],
   "ignore_globs": [],
   "predict_conflicts": true,
+  "notifications_enabled": false,
   "base_ref": "origin/HEAD",
   "git_timeout_seconds": 10
 }
@@ -338,6 +339,12 @@ badge down.
   `--why` command always predicts because it cannot explain a path honestly without doing so.
 - **`predict_conflicts`** — set to `false` to report shared paths only. Cheaper, and it stops
   distinguishing a real conflict from a plain overlap.
+- **`notifications_enabled`** — opt in to desktop notifications when a workspace becomes
+  conflicting after a non-conflicting baseline. Default `false`. The first cycle establishes a
+  baseline, unchanged conflicts do not repeat, and a workspace cannot show notifications more than
+  once per minute. Notification bodies identify the affected branch names, checkout paths, and
+  conflicting paths. Transitions into runaway, unknown, or overlap do not notify; neither does a
+  transition from conflict to clean.
 - **`base_ref`** — the local ref each checkout's change set and integration-target prediction are
   measured against. Default `origin/HEAD`; where that does not resolve, `collide` tries, in order,
   `origin/main`, `origin/master`, local `main`, `master`, and `trunk`, then the symbolic `HEAD` of

@@ -225,9 +225,12 @@ row. Never claim a pane running a real agent. Two costs make this non-default:
 
 ### `notification.show` — params `{title, body?, sound?, position?}`
 
-Documented for completeness; **this plugin does not call it**. The client used
-to carry a `notify` helper that only a test exercised, which is how a path rots.
-It is four lines if a future version wants it back. The reply is not `ok`:
+The opt-in daemon notification path calls this when a workspace becomes
+conflicting from any non-conflict severity, with a required `title` and a
+`body` naming the affected branches, checkout paths, and conflicting paths. It
+intentionally omits `sound` and `position`.
+
+The reply is not `ok`:
 
 ```
 {"type":"notification_show","shown":true,"reason":"shown"}
@@ -235,6 +238,8 @@ It is four lines if a future version wants it back. The reply is not `ok`:
 
 `reason` is one of `shown | disabled | rate_limited | no_foreground_client |
 busy`, so "the call succeeded" and "the toast appeared" are different questions.
+Only `shown` records a delivery. The three transient reasons remain pending for
+the next cycle; `disabled` is handled without retrying the same edge.
 
 ### `server.reload_config` — params `{}`
 

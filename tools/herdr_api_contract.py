@@ -6,16 +6,15 @@ in the upstream tree, which is byte-compared against the running code by
 upstream's own `generated_protocol_schema_artifact_is_current` test, or the
 output of `herdr api schema` from a local build.
 
-The contract below is deliberately narrow. It names the three methods collide
+The contract below is deliberately narrow. It names the four methods collide
 calls, the parameters it sends, and the response fields it reads, and nothing
 else. Upstream is free to add, remove, and rename anything collide does not
 touch; this only fails when the surface collide actually stands on moves.
 
-Note what is absent: `worktree.list`, `pane.report_agent`, `pane.release_agent`
-and `notification.show` are all documented in `docs/herdr-protocol.md` and none
-of them is called by this client. They are not in the contract, because a
-canary that guards methods the plugin does not use goes red for reasons that
-cost a maintainer an afternoon and change nothing.
+`worktree.list`, `pane.report_agent` and `pane.release_agent` are documented in
+`docs/herdr-protocol.md` but are not called by this client, so they are not in
+the contract. A canary that guards methods the plugin does not use goes red for
+reasons that cost a maintainer an afternoon and change nothing.
 """
 
 from __future__ import annotations
@@ -42,6 +41,10 @@ MIN_PROTOCOL = 19
 REQUESTS: dict[str, dict[str, tuple[str, ...]]] = {
     "session.snapshot": {"required": (), "optional": ()},
     "server.reload_config": {"required": (), "optional": ()},
+    "notification.show": {
+        "required": ("title",),
+        "optional": ("body",),
+    },
     "workspace.report_metadata": {
         "required": ("workspace_id", "source", "tokens"),
         # Omitted entirely on a pure delete: Herdr rejects a TTL alongside a
@@ -61,6 +64,9 @@ RESULTS: dict[str, tuple[str, ...]] = {
     # reload. Only `status == "applied"` means the file took effect, and
     # `diagnostics` is what the failure is reported with.
     "config_reload": ("status", "diagnostics"),
+    # A successful request does not prove a toast appeared. Both fields are
+    # required to distinguish delivery from transient and disabled outcomes.
+    "notification_show": ("shown", "reason"),
 }
 
 # Response objects collide reads fields out of.
