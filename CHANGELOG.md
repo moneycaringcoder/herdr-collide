@@ -35,6 +35,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Array order was already outside the `--json` contract, so the schema version does
   not move.
 
+### Fixed
+
+- The runaway badge carries two different units and the legend named only one of
+  them. `⚠ 4.2k` is a changed-line count and `⚠ 60f` is a file count, but the
+  legend read `runaway change set (f = files)`, which explains the suffix and
+  leaves the bare number — the common case — unexplained. It now reads
+  `runaway change set (lines, or f = files)`.
+- Legend lines are wrapped rather than truncated, so a narrow pane no longer cuts
+  the end off an explanation. Truncating an explanation removes the explanation,
+  which is the rule the notes already followed and the legend did not.
+- The README's sidebar sample explained an overlap badge it never showed. The
+  sample now includes the overlap row its own prose describes.
+
 ### Tests
 
 - Fixtures for the two repository layouts that were previously only assumed to
