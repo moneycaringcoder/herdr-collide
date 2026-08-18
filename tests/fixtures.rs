@@ -76,6 +76,10 @@ impl Fixture {
     pub fn init_repo(&self, path: &Path) {
         std::fs::create_dir_all(path).expect("create repo dir");
         self.git(path, &["init", "-q", "-b", "main"]);
+        self.configure_repo(path);
+    }
+
+    fn configure_repo(&self, path: &Path) {
         // Local config only, so a runner with no identity still commits.
         self.git(path, &["config", "user.email", "fixture@example.invalid"]);
         self.git(path, &["config", "user.name", "collide fixture"]);
@@ -360,6 +364,96 @@ impl Fixture {
         self.git(&path, &["add", "-A"]);
         self.commit(&path, "foreign base");
         path
+    }
+
+    /// A repository whose working tree and common git directory are siblings,
+    /// plus one linked worktree of that repository.
+    pub fn separate_git_dir_repo(&self, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let repo = self.root.join(name);
+        let store = self.root.join(format!("{name}-store"));
+        std::fs::create_dir_all(&repo).expect("create separate-git-dir worktree");
+        let separate_git_dir = format!("--separate-git-dir={}", store.display());
+        self.git(
+            &repo,
+            &["init", "-q", "-b", "main", separate_git_dir.as_str()],
+        );
+        self.configure_repo(&repo);
+        self.write(&repo, "base.txt", "base\n");
+        self.commit_all(&repo, "base");
+
+        let linked = self.root.join(format!("{name}-linked"));
+        let branch = format!("{name}-linked");
+        self.git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch.as_str(),
+                linked.to_str().unwrap(),
+                "main",
+            ],
+        );
+        (repo, store, linked)
+    }
+
+    /// The primary repository as a superproject, with two linked worktrees and
+    /// a real checkout of its independently initialized submodule.
+    pub fn superproject_with_submodule(&self, name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let source = self.root.join(format!("{name}-source"));
+        self.init_repo(&source);
+        self.write(&source, "payload.txt", "submodule payload\n");
+        self.commit_all(&source, "submodule base");
+
+        let (code, _stdout, stderr) = self.try_git(
+            &self.repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().unwrap(),
+                name,
+            ],
+        );
+        assert_eq!(
+            code,
+            0,
+            "git refused local-path submodule {} in {}: {stderr}",
+            source.display(),
+            self.repo.display()
+        );
+        self.commit_all(&self.repo, "add submodule");
+
+        let first_name = format!("{name}-super-a");
+        let first_branch = format!("{name}/super-a");
+        let first = self.worktree(&first_name, &first_branch);
+        let second_name = format!("{name}-super-b");
+        let second_branch = format!("{name}/super-b");
+        let second = self.worktree(&second_name, &second_branch);
+        for worktree in [&first, &second] {
+            let (code, _stdout, stderr) = self.try_git(
+                worktree,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--",
+                    name,
+                ],
+            );
+            assert_eq!(
+                code,
+                0,
+                "git could not initialize local-path submodule in {}: {stderr}",
+                worktree.display()
+            );
+        }
+
+        (self.repo.clone(), first.clone(), second, first.join(name))
     }
 
     // -----------------------------------------------------------------------
