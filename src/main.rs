@@ -12,6 +12,7 @@ Usage: collide [VERB]
 Analysis:
   --once              Print a one-shot collision report and exit
   --json              Print the same report as JSON and exit
+  --why <PATH>        Explain one shared path with the merge's real conflict hunks
   --watch             Live detail view, refreshing on an interval
 
 History:
@@ -47,14 +48,15 @@ fn main() {
 }
 
 /// Options that take a value, and so must never be mistaken for the verb.
-const VALUED: [&str; 2] = ["--interval", "--base-ref"];
+const VALUED: [&str; 3] = ["--interval", "--base-ref", "--why"];
 
 /// Every verb this binary accepts. The list is explicit on purpose — see
 /// [`verb_of`].
-const VERBS: [&str; 15] = [
+const VERBS: [&str; 16] = [
     "--once",
     "--json",
     "--watch",
+    "--why",
     "--history",
     "--history-clear",
     "--enable",
@@ -91,29 +93,44 @@ const VERBS: [&str; 15] = [
 /// silently ran only the first of the two, which for a pair of verbs that undo
 /// each other is the worst possible way to be wrong.
 fn verb_of(args: &[String]) -> Result<&str> {
-    let mut skip_value = false;
     let mut verb: Option<&str> = None;
-    for arg in args {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
-        let name = arg.split('=').next().unwrap_or(arg);
-        if VALUED.contains(&name) {
-            // `--interval=5` carries its value; bare `--interval 5` does not.
-            skip_value = !arg.contains('=');
-            continue;
-        }
-        if VERBS.contains(&arg.as_str()) {
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+        let inline_name = arg
+            .split_once('=')
+            .map(|(name, _)| name)
+            .filter(|name| VALUED.contains(name));
+        let name = inline_name.unwrap_or(arg);
+        if VERBS.contains(&name) {
             match verb {
-                None => verb = Some(arg.as_str()),
-                Some(first) if first == arg.as_str() => {}
+                None => verb = Some(name),
+                Some(first) if first == name => {}
                 Some(first) => {
                     return Err(format!(
-                        "more than one verb given: `{first}` and `{arg}`\n\n{USAGE}"
+                        "more than one verb given: `{first}` and `{name}`\n\n{USAGE}"
                     )
                     .into())
                 }
+            }
+            if VALUED.contains(&name) && !arg.contains('=') {
+                if i + 1 >= args.len() {
+                    return Err(format!("{name} needs a value").into());
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if VALUED.contains(&name) {
+            if !arg.contains('=') {
+                if i + 1 >= args.len() {
+                    return Err(format!("{name} needs a value").into());
+                }
+                i += 2;
+            } else {
+                i += 1;
             }
             continue;
         }
@@ -128,6 +145,13 @@ fn run(args: &[String]) -> Result<()> {
         "--once" => analysis::run_once(&config::load_with_args(args)?),
         "--json" => analysis::run_json(&config::load_with_args(args)?),
         "--watch" => render::run_watch(&config::load_with_args(args)?),
+        "--why" => {
+            let path = config::value_arg(args, "--why")?.ok_or("--why needs a value")?;
+            if path.trim().is_empty() {
+                return Err("--why needs a path, not an empty string".into());
+            }
+            analysis::run_why(&config::load_with_args(args)?, &path)
+        }
         "--history" => history::run_history(),
         "--history-clear" => history::run_clear(),
         "--enable" => daemon::enable(args),
@@ -154,7 +178,7 @@ fn run(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{verb_of, VERBS};
+    use super::{config, run, verb_of, VERBS};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -184,6 +208,41 @@ mod tests {
     fn an_option_value_is_never_mistaken_for_a_verb() {
         // A value that looks like a verb must still be treated as a value.
         assert_eq!(verb(&["--base-ref", "--json"]), "--once");
+    }
+
+    #[test]
+    fn why_is_a_value_taking_verb_in_both_spellings() {
+        assert_eq!(verb(&["--why", "conflict.txt"]), "--why");
+        assert_eq!(verb(&["--why=conflict.txt"]), "--why");
+        assert_eq!(
+            verb(&["--why", "first.txt", "--why", "second.txt"]),
+            "--why"
+        );
+    }
+
+    #[test]
+    fn why_value_uses_both_spellings_and_last_occurrence_wins() {
+        let parsed = args(&["--why=first.txt", "--why", "second.txt"]);
+        assert_eq!(
+            config::value_arg(&parsed, "--why").expect("why value"),
+            Some("second.txt".to_string())
+        );
+    }
+    #[test]
+    fn why_value_is_not_mistaken_for_a_second_verb() {
+        assert_eq!(verb(&["--why", "--json"]), "--why");
+    }
+
+    #[test]
+    fn why_without_a_value_is_an_error() {
+        let err = verb_of(&args(&["--why"])).unwrap_err();
+        assert_eq!(err.to_string(), "--why needs a value");
+    }
+
+    #[test]
+    fn why_rejects_an_empty_inline_value() {
+        let err = run(&args(&["--why="])).unwrap_err();
+        assert_eq!(err.to_string(), "--why needs a path, not an empty string");
     }
 
     /// The trap that broke a sibling plugin: with verbs recognised by
@@ -228,9 +287,26 @@ mod tests {
     }
 
     #[test]
+    fn value_tails_on_boolean_verbs_are_not_discarded() {
+        for malformed in ["--json=oops", "--once=", "--help=x", "--disable=x"] {
+            let err = verb_of(&args(&[malformed])).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("unrecognised argument `{malformed}`")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     fn every_verb_in_the_list_is_accepted() {
         for name in VERBS {
-            assert_eq!(verb(&[name]), name);
+            let given = if name == "--why" {
+                vec!["--why", "conflict.txt"]
+            } else {
+                vec![name]
+            };
+            assert_eq!(verb(&given), name);
         }
     }
 }

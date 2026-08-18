@@ -670,23 +670,44 @@ pub struct Cycle {
     pub notes: Vec<String>,
 }
 
+struct PredictedPair {
+    verdicts: PairVerdicts,
+    prediction: Option<git::PairPrediction>,
+}
+
+struct RetainedGather {
+    cycle: Cycle,
+    predictor: Option<git::Predictor>,
+    predictions: Vec<RetainedPrediction>,
+}
+
+struct RetainedPrediction {
+    left_workspace_id: String,
+    right_workspace_id: String,
+    prediction: git::PairPrediction,
+}
+
 /// Talks to herdr and git, then runs the pure pass.
 pub fn gather(config: &Config) -> Result<Cycle> {
+    Ok(gather_retained(config)?.cycle)
+}
+
+fn gather_retained(config: &Config) -> Result<RetainedGather> {
     let mut herdr = crate::herdr::Herdr::connect()?;
     let checkouts = herdr.checkouts()?;
     let skipped = herdr.skipped_worktrees();
-    let mut cycle = gather_for(checkouts, config)?;
+    let mut gathered = gather_for_retained(checkouts, config)?;
     // A workspace herdr calls a repository but whose worktree object this client
     // could not read is dropped, which makes the session look smaller than it
     // is. The daemon reports that; so must the one-shot commands, which are what
     // somebody runs when they are actually looking.
     if skipped > 0 {
-        cycle.notes.push(format!(
+        gathered.cycle.notes.push(format!(
             "{skipped} workspace(s) carried a worktree object this client could not read; \
              they are missing from this report"
         ));
     }
-    Ok(cycle)
+    Ok(gathered)
 }
 
 /// The ref one checkout's change set is measured against.
@@ -714,6 +735,10 @@ pub fn base_ref_for(checkout: &std::path::Path, config: &Config) -> String {
 /// The gathering pass, given a checkout list. Split out from [`gather`] so it
 /// can be driven from a fixture without a herdr socket.
 pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
+    Ok(gather_for_retained(checkouts, config)?.cycle)
+}
+
+fn gather_for_retained(checkouts: Vec<Checkout>, config: &Config) -> Result<RetainedGather> {
     let mut notes = Vec::new();
 
     // Repo identity is re-derived from git rather than trusted from herdr: two
@@ -795,6 +820,8 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
 
     let mut report = analyse(&verified, &changes, &trees, config);
 
+    let mut retained_predictor = None;
+    let mut retained_predictions = Vec::new();
     if config.predict_conflicts && !verified.is_empty() {
         let by_id: BTreeMap<&str, &Checkout> = verified
             .iter()
@@ -917,8 +944,20 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
             })
             .collect();
 
-        let predictions = predict_all(&predictor, &jobs, &mut notes);
-        apply_predictions(&mut report, &predictions, &changes, config);
+        let predicted = predict_all(&predictor, &jobs, &mut notes);
+        let verdicts: Vec<PairVerdicts> =
+            predicted.iter().map(|pair| pair.verdicts.clone()).collect();
+        apply_predictions(&mut report, &verdicts, &changes, config);
+        retained_predictions = predicted
+            .into_iter()
+            .filter_map(|pair| {
+                pair.prediction.map(|prediction| RetainedPrediction {
+                    left_workspace_id: pair.verdicts.left_workspace_id,
+                    right_workspace_id: pair.verdicts.right_workspace_id,
+                    prediction,
+                })
+            })
+            .collect();
 
         report.targets = verified
             .iter()
@@ -990,12 +1029,18 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
         // and promoting every stale-branch target conflict before this signal
         // has been observed in real sessions could mute the pairwise collision
         // warning users already rely on.
+
+        retained_predictor = Some(predictor);
     }
 
-    Ok(Cycle {
-        report,
-        changes,
-        notes,
+    Ok(RetainedGather {
+        cycle: Cycle {
+            report,
+            changes,
+            notes,
+        },
+        predictor: retained_predictor,
+        predictions: retained_predictions,
     })
 }
 
@@ -1006,7 +1051,7 @@ fn predict_all(
     predictor: &git::Predictor,
     jobs: &[(&Pairing, &Checkout, &Checkout)],
     notes: &mut Vec<String>,
-) -> Vec<PairVerdicts> {
+) -> Vec<PredictedPair> {
     if jobs.is_empty() {
         return Vec::new();
     }
@@ -1016,7 +1061,7 @@ fn predict_all(
         .clamp(1, 8)
         .min(jobs.len());
 
-    let mut results: Vec<(PairVerdicts, Vec<String>)> = Vec::with_capacity(jobs.len());
+    let mut results: Vec<(PredictedPair, Vec<String>)> = Vec::with_capacity(jobs.len());
     let mut panicked = 0usize;
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -1082,28 +1127,40 @@ fn predict_all(
                                         Some(false) => {}
                                     }
                                 }
+                                // `--why` keeps the prediction to read its merged
+                                // tree, so every field it needs is cloned rather
+                                // than moved out of it here.
+                                let verdicts = PairVerdicts {
+                                    left_workspace_id: pairing.left_workspace_id.clone(),
+                                    right_workspace_id: pairing.right_workspace_id.clone(),
+                                    verdicts: prediction.verdicts.clone(),
+                                    conflict_types_by_path: prediction
+                                        .conflict_types_by_path
+                                        .clone(),
+                                    submodules: prediction.submodules.clone(),
+                                    failed: false,
+                                    approximate: prediction.approximate,
+                                };
                                 (
-                                    PairVerdicts {
-                                        left_workspace_id: pairing.left_workspace_id.clone(),
-                                        right_workspace_id: pairing.right_workspace_id.clone(),
-                                        verdicts: prediction.verdicts,
-                                        conflict_types_by_path: prediction.conflict_types_by_path,
-                                        submodules: prediction.submodules,
-                                        failed: false,
-                                        approximate: prediction.approximate,
+                                    PredictedPair {
+                                        verdicts,
+                                        prediction: Some(prediction),
                                     },
                                     nested_notes,
                                 )
                             }
                             Err(err) => (
-                                PairVerdicts {
-                                    left_workspace_id: pairing.left_workspace_id.clone(),
-                                    right_workspace_id: pairing.right_workspace_id.clone(),
-                                    verdicts: Vec::new(),
-                                    submodules: Vec::new(),
-                                    conflict_types_by_path: BTreeMap::new(),
-                                    failed: true,
-                                    approximate: false,
+                                PredictedPair {
+                                    verdicts: PairVerdicts {
+                                        left_workspace_id: pairing.left_workspace_id.clone(),
+                                        right_workspace_id: pairing.right_workspace_id.clone(),
+                                        verdicts: Vec::new(),
+                                        submodules: Vec::new(),
+                                        conflict_types_by_path: BTreeMap::new(),
+                                        failed: true,
+                                        approximate: false,
+                                    },
+                                    prediction: None,
                                 },
                                 vec![format!(
                                     "{} vs {}: {err}",
@@ -1140,6 +1197,349 @@ fn predict_all(
     predictions
 }
 
+/// Result of explaining one path. A failed prediction is kept separate from
+/// the text so the CLI can print the reason and still return a non-zero status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhyReport {
+    pub text: String,
+    pub prediction_failed: bool,
+}
+
+/// Drives `--why` from a supplied checkout list, for fixtures and embedders.
+pub fn why_for(checkouts: Vec<Checkout>, config: &Config, path: &str) -> Result<WhyReport> {
+    let mut gather_config = config.clone();
+    gather_config.predict_conflicts = true;
+    let gathered = gather_for_retained(checkouts, &gather_config)?;
+    explain_path(&gathered, path)
+}
+
+fn explain_path(gathered: &RetainedGather, path: &str) -> Result<WhyReport> {
+    let cycle = &gathered.cycle;
+    let shown_path = git::lossy(path.as_bytes());
+    let pairs: Vec<(&Pairing, bool)> = cycle
+        .report
+        .pairings
+        .iter()
+        .filter_map(|pairing| {
+            if pairing.shared.iter().any(|shared| shared.path == path) {
+                return Some((pairing, false));
+            }
+            let prediction = retained_prediction(&gathered.predictions, pairing)?;
+            let unnamed_pair_conflict =
+                prediction.pair_conflict && prediction.conflicted_paths.is_empty();
+            if unnamed_pair_conflict && path_listed_for_pair(cycle, pairing, path) {
+                Some((pairing, true))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if pairs.is_empty() {
+        if let Some(report) = unavailable_path_report(cycle, &shown_path) {
+            return Ok(report);
+        }
+        return Ok(WhyReport {
+            text: format!("`{shown_path}` is not shared by any worktree pair\n"),
+            prediction_failed: false,
+        });
+    }
+
+    let by_id: BTreeMap<&str, &Checkout> = cycle
+        .report
+        .checkouts
+        .iter()
+        .map(|checkout| (checkout.workspace_id.as_str(), checkout))
+        .collect();
+    let mut out = String::new();
+    let mut prediction_failed = false;
+
+    for (pairing, unnamed_pair_conflict) in pairs {
+        let Some(left) = by_id.get(pairing.left_workspace_id.as_str()).copied() else {
+            prediction_failed = true;
+            out.push_str(&format!(
+                "unknown: `{shown_path}`: prediction did not run because the left worktree \
+                 disappeared from the gathered report\n"
+            ));
+            continue;
+        };
+        let Some(right) = by_id.get(pairing.right_workspace_id.as_str()).copied() else {
+            prediction_failed = true;
+            out.push_str(&format!(
+                "unknown: `{shown_path}`: prediction did not run because the right worktree \
+                 disappeared from the gathered report\n"
+            ));
+            continue;
+        };
+        let left_name = why_name(Some(left));
+        let right_name = why_name(Some(right));
+        let Some(prediction) = retained_prediction(&gathered.predictions, pairing) else {
+            prediction_failed = true;
+            out.push_str(&format!(
+                "unknown: `{shown_path}` between {left_name} and {right_name}: \
+                 prediction did not run\n"
+            ));
+            continue;
+        };
+
+        let verdict = if unnamed_pair_conflict {
+            FileVerdict::Conflict
+        } else {
+            pairing
+                .shared
+                .iter()
+                .find(|shared| shared.path == path)
+                .map(|shared| shared.verdict)
+                .unwrap_or(FileVerdict::Unknown)
+        };
+        let blob = if verdict == FileVerdict::Conflict {
+            match gathered.predictor.as_ref() {
+                Some(predictor) => {
+                    match predictor.merged_blob(&left.checkout_path, &prediction.merged_tree, path)
+                    {
+                        Ok(blob) if blob.is_empty() => WhyBlob::Empty,
+                        Ok(blob) => WhyBlob::Content(crate::render::sanitize_content(&blob)),
+                        Err(err) => WhyBlob::Unreadable(err.to_string()),
+                    }
+                }
+                None => WhyBlob::Unreadable("the retained prediction tree is unavailable".into()),
+            }
+        } else {
+            WhyBlob::NotNeeded
+        };
+
+        let pair_report = explain_pair_prediction(
+            prediction,
+            verdict,
+            !path_listed_for_pair(cycle, pairing, path),
+            &left_name,
+            &right_name,
+            &shown_path,
+            blob,
+        );
+        out.push_str(&pair_report.text);
+        prediction_failed |= pair_report.prediction_failed;
+    }
+
+    for note in &cycle.notes {
+        prediction_failed = true;
+        out.push_str(&format!("note: {note}\n"));
+    }
+
+    Ok(WhyReport {
+        text: out,
+        prediction_failed,
+    })
+}
+
+fn retained_prediction<'a>(
+    predictions: &'a [RetainedPrediction],
+    pairing: &Pairing,
+) -> Option<&'a git::PairPrediction> {
+    predictions
+        .iter()
+        .find(|prediction| {
+            prediction.left_workspace_id == pairing.left_workspace_id
+                && prediction.right_workspace_id == pairing.right_workspace_id
+        })
+        .map(|prediction| &prediction.prediction)
+}
+
+fn path_listed_for_pair(cycle: &Cycle, pairing: &Pairing, path: &str) -> bool {
+    cycle.changes.iter().any(|(id, changes)| {
+        (id == &pairing.left_workspace_id || id == &pairing.right_workspace_id)
+            && changes.paths.iter().any(|changed| changed.path == path)
+    })
+}
+
+fn unavailable_path_report(cycle: &Cycle, shown_path: &str) -> Option<WhyReport> {
+    let changes: BTreeMap<&str, &ChangeSet> = cycle
+        .changes
+        .iter()
+        .map(|(id, changes)| (id.as_str(), changes))
+        .collect();
+    let mut out = String::new();
+    for checkout in &cycle.report.checkouts {
+        match changes.get(checkout.workspace_id.as_str()) {
+            Some(changes) if changes.degraded => {
+                let reason = changes
+                    .degraded_reason
+                    .as_deref()
+                    .unwrap_or("reason not reported");
+                out.push_str(&format!(
+                    "unknown: `{shown_path}` may be shared with {}: \
+                     its change set is degraded: {reason}\n",
+                    why_name(Some(checkout))
+                ));
+            }
+            None => out.push_str(&format!(
+                "unknown: `{shown_path}` may be shared with {}: \
+                 its change set is unavailable\n",
+                why_name(Some(checkout))
+            )),
+            Some(_) => {}
+        }
+    }
+    if out.is_empty() && !cycle.notes.is_empty() {
+        out.push_str(&format!(
+            "unknown: `{shown_path}` may be shared by a worktree that could not be read\n"
+        ));
+    }
+    if out.is_empty() {
+        return None;
+    }
+    for note in &cycle.notes {
+        out.push_str(&format!("note: {note}\n"));
+    }
+    Some(WhyReport {
+        text: out,
+        prediction_failed: true,
+    })
+}
+
+enum WhyBlob {
+    NotNeeded,
+    Content(String),
+    Empty,
+    Unreadable(String),
+}
+
+fn explain_pair_prediction(
+    prediction: &git::PairPrediction,
+    verdict: FileVerdict,
+    rename_inferred: bool,
+    left_name: &str,
+    right_name: &str,
+    shown_path: &str,
+    blob: WhyBlob,
+) -> WhyReport {
+    let mut out = String::new();
+
+    let mut named_advisory = false;
+    for (advisory, name) in [
+        (prediction.left_advisory, left_name),
+        (prediction.right_advisory, right_name),
+    ] {
+        if advisory {
+            named_advisory = true;
+            out.push_str(&format!(
+                "advisory: a merge is in progress in {name}, so these verdicts were computed \
+                 from a tree that still contains conflict markers.\n"
+            ));
+        }
+    }
+    if prediction.advisory && !named_advisory {
+        out.push_str(&format!(
+            "advisory: a merge is in progress in one of {left_name} or {right_name}, so these \
+             verdicts were computed from a tree that still contains conflict markers.\n"
+        ));
+    }
+    if prediction.approximate {
+        out.push_str(
+            "approximate: these two histories offer no single merge base, so one was forced and \
+             the verdicts below approximate what a real merge would do.\n",
+        );
+    }
+    if rename_inferred {
+        out.push_str(
+            "approximate: git reported this conflicting path, but neither change set listed it; \
+             a rename makes the match plausible rather than certain.\n",
+        );
+    }
+
+    let prediction_failed = match verdict {
+        FileVerdict::Overlap => {
+            out.push_str(&format!(
+                "overlap: `{shown_path}` was touched by {left_name} and {right_name}, \
+                 but their changes merge cleanly\n"
+            ));
+            false
+        }
+        FileVerdict::Unknown => {
+            out.push_str(&format!(
+                "unknown: `{shown_path}` between {left_name} and {right_name}: \
+                 prediction did not produce a verdict\n"
+            ));
+            true
+        }
+        FileVerdict::Conflict => match blob {
+            WhyBlob::Content(content) if has_conflict_marker(&content) => {
+                out.push_str(&format!(
+                    "conflict: `{shown_path}` between {left_name} and {right_name}\n"
+                ));
+                out.push_str(&content);
+                if !content.ends_with('\n') {
+                    out.push('\n');
+                }
+                false
+            }
+            WhyBlob::Content(_) if prediction.conflicted_paths.is_empty() => {
+                let kinds = if prediction.conflict_types.is_empty() {
+                    "conflict type not reported".to_string()
+                } else {
+                    prediction.conflict_types.join(", ")
+                };
+                out.push_str(&format!(
+                    "conflict: the merge between {left_name} and {right_name} conflicts as a \
+                     whole ({kinds}); git named no conflicting file, so there are no hunks for \
+                     `{shown_path}`\n"
+                ));
+                true
+            }
+            WhyBlob::Content(_) => {
+                let kinds = if prediction.conflict_types.is_empty() {
+                    "conflict type not reported".to_string()
+                } else {
+                    prediction.conflict_types.join(", ")
+                };
+                out.push_str(&format!(
+                    "conflict: the merge between {left_name} and {right_name} conflicts as a \
+                     whole ({kinds}); git named `{shown_path}` as conflicting, but its merged \
+                     blob contains no conflict markers, so there are no hunks to show\n"
+                ));
+                true
+            }
+            WhyBlob::Empty => {
+                out.push_str(&format!(
+                    "unknown: `{shown_path}` between {left_name} and {right_name}: \
+                     prediction ran but its conflicting blob was empty\n"
+                ));
+                true
+            }
+            WhyBlob::Unreadable(err) => {
+                out.push_str(&format!(
+                    "unknown: `{shown_path}` between {left_name} and {right_name}: \
+                     prediction ran but its conflicting hunks could not be read: {err}\n"
+                ));
+                true
+            }
+            WhyBlob::NotNeeded => {
+                out.push_str(&format!(
+                    "unknown: `{shown_path}` between {left_name} and {right_name}: \
+                     prediction marked a conflict without retaining its merged blob\n"
+                ));
+                true
+            }
+        },
+    };
+
+    WhyReport {
+        text: out,
+        prediction_failed,
+    }
+}
+
+fn has_conflict_marker(content: &str) -> bool {
+    content.starts_with("<<<<<<<") || content.contains("\n<<<<<<<")
+}
+
+fn why_name(checkout: Option<&Checkout>) -> String {
+    match checkout {
+        Some(checkout) => git::lossy(checkout.workspace_label.as_bytes()),
+        None => "(missing worktree)".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
@@ -1154,6 +1554,19 @@ pub fn run_json(config: &Config) -> Result<()> {
     let cycle = gather(config)?;
     println!("{}", serde_json::to_string_pretty(&json_report(&cycle))?);
     Ok(())
+}
+
+pub fn run_why(config: &Config, path: &str) -> Result<()> {
+    let mut gather_config = config.clone();
+    gather_config.predict_conflicts = true;
+    let gathered = gather_retained(&gather_config)?;
+    let report = explain_path(&gathered, path)?;
+    print!("{}", report.text);
+    if report.prediction_failed {
+        Err("one or more conflict predictions did not produce an answer".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Plain-text one-shot report. Deliberately independent of `render`, which owns
@@ -1365,5 +1778,104 @@ pub fn target_verdict_name(verdict: TargetVerdict) -> &'static str {
         TargetVerdict::Clean => "clean",
         TargetVerdict::Conflict => "conflict",
         TargetVerdict::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod why_tests {
+    use super::{explain_pair_prediction, FileVerdict, WhyBlob};
+    use crate::git::PairPrediction;
+
+    fn prediction() -> PairPrediction {
+        PairPrediction {
+            verdicts: vec![("conflict.txt".to_string(), true)],
+            conflicted_paths: vec!["conflict.txt".to_string()],
+            merged_tree: "tree".to_string(),
+            ..PairPrediction::default()
+        }
+    }
+
+    #[test]
+    fn why_qualifiers_precede_the_verdict_they_limit() {
+        let mut prediction = prediction();
+        prediction.approximate = true;
+        prediction.advisory = true;
+        prediction.left_advisory = true;
+        let report = explain_pair_prediction(
+            &prediction,
+            FileVerdict::Conflict,
+            false,
+            "left",
+            "right",
+            "conflict.txt",
+            WhyBlob::Content("<<<<<<< left\n=======\n>>>>>>> right\n".to_string()),
+        );
+
+        assert!(!report.prediction_failed, "{}", report.text);
+        let advisory = report.text.find("advisory:").expect("advisory qualifier");
+        let approximate = report
+            .text
+            .find("approximate:")
+            .expect("approximate qualifier");
+        let verdict = report.text.find("conflict:").expect("conflict verdict");
+        assert!(advisory < verdict, "{}", report.text);
+        assert!(approximate < verdict, "{}", report.text);
+        assert!(report.text.contains("merge is in progress in left"));
+        assert!(report.text.contains("no single merge base"));
+    }
+
+    #[test]
+    fn marker_free_pair_conflict_is_not_presented_as_hunks() {
+        let mut prediction = prediction();
+        prediction.conflicted_paths.clear();
+        prediction.pair_conflict = true;
+        prediction.conflict_types = vec!["CONFLICT (directory rename suggested)".to_string()];
+        let report = explain_pair_prediction(
+            &prediction,
+            FileVerdict::Conflict,
+            false,
+            "left",
+            "right",
+            "docs/notes-c.md",
+            WhyBlob::Content("clean merged content\n".to_string()),
+        );
+
+        assert!(report.prediction_failed, "{}", report.text);
+        assert!(
+            report.text.contains("conflicts as a whole"),
+            "{}",
+            report.text
+        );
+        assert!(
+            report.text.contains("git named no conflicting file"),
+            "{}",
+            report.text
+        );
+        assert!(
+            !report.text.contains("conflict: `docs/notes-c.md`"),
+            "{}",
+            report.text
+        );
+    }
+
+    #[test]
+    fn empty_and_unreadable_conflict_blobs_request_failure_status() {
+        let prediction = prediction();
+        for blob in [
+            WhyBlob::Empty,
+            WhyBlob::Unreadable("permission denied".to_string()),
+        ] {
+            let report = explain_pair_prediction(
+                &prediction,
+                FileVerdict::Conflict,
+                false,
+                "left",
+                "right",
+                "conflict.txt",
+                blob,
+            );
+            assert!(report.prediction_failed, "{}", report.text);
+            assert!(report.text.starts_with("unknown:"), "{}", report.text);
+        }
     }
 }
