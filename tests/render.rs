@@ -1246,6 +1246,7 @@ fn equally_ranked_pairings_use_display_labels_as_the_tie_breaker() {
         ],
         statuses: Vec::new(),
         changes: Vec::new(),
+        targets: Vec::new(),
     };
 
     let text = detail_at(&report, 80);
