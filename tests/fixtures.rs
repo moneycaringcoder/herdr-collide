@@ -479,6 +479,37 @@ impl Fixture {
         (a, b)
     }
 
+    /// One worktree renames and edits a file while the other edits its old
+    /// name, all without commits. Git carries the content conflict onto the
+    /// destination path, which only the rename side lists under that name.
+    pub fn uncommitted_rename_edit_pair(&self) -> (PathBuf, PathBuf) {
+        let a = self.worktree("wrename-edit-a", "wrename-edit-a");
+        self.git(&a, &["mv", "shared.txt", "moved-shared.txt"]);
+        let from_a: String = (1..=12)
+            .map(|n| {
+                if n == 1 {
+                    "FROM-A\n".to_string()
+                } else {
+                    format!("line {n}\n")
+                }
+            })
+            .collect();
+        self.write(&a, "moved-shared.txt", &from_a);
+
+        let b = self.worktree("wrename-edit-b", "wrename-edit-b");
+        let from_b: String = (1..=12)
+            .map(|n| {
+                if n == 1 {
+                    "FROM-B\n".to_string()
+                } else {
+                    format!("line {n}\n")
+                }
+            })
+            .collect();
+        self.write(&b, "shared.txt", &from_b);
+        (a, b)
+    }
+
     /// Two worktrees with *uncommitted* conflicting edits: nothing is committed
     /// on either side, so prediction has to go through the temp-index snapshot.
     pub fn uncommitted_conflict_pair(&self) -> (PathBuf, PathBuf) {
@@ -682,6 +713,38 @@ impl Fixture {
         let b = self.worktree("dirrename-b", "dirrename-b");
         self.write(&b, "docs/notes-c.md", "notes c\n");
         self.commit_all(&b, "b adds into the old directory");
+        (a, b)
+    }
+
+    /// A criss-cross pair whose tips have two best merge bases. One side is
+    /// left dirty so merge-tree must receive a bare tree and the predictor must
+    /// force one of those bases rather than asking git for a recursive merge.
+    pub fn criss_cross_pair(&self) -> (PathBuf, PathBuf) {
+        let a = self.worktree("criss-a", "criss-a");
+        self.write(&a, "conflict.txt", "FROM-A\nbeta\ngamma\n");
+        self.commit_all(&a, "a1");
+        let a1 = self.git(&a, &["rev-parse", "HEAD"]);
+        let a_tree = self.git(&a, &["rev-parse", "HEAD^{tree}"]);
+
+        let b = self.worktree("criss-b", "criss-b");
+        self.write(&b, "conflict.txt", "FROM-B\nbeta\ngamma\n");
+        self.commit_all(&b, "b1");
+        let b1 = self.git(&b, &["rev-parse", "HEAD"]);
+        let b_tree = self.git(&b, &["rev-parse", "HEAD^{tree}"]);
+
+        let a2 = self.git(
+            &self.repo,
+            &["commit-tree", &a_tree, "-p", &a1, "-p", &b1, "-m", "a2"],
+        );
+        let b2 = self.git(
+            &self.repo,
+            &["commit-tree", &b_tree, "-p", &b1, "-p", &a1, "-m", "b2"],
+        );
+        self.git(&self.repo, &["update-ref", "refs/heads/criss-a", &a2, &a1]);
+        self.git(&self.repo, &["update-ref", "refs/heads/criss-b", &b2, &b1]);
+        self.git(&a, &["reset", "--hard", "criss-a"]);
+        self.git(&b, &["reset", "--hard", "criss-b"]);
+        self.write(&a, "local-only.txt", "dirty snapshot\n");
         (a, b)
     }
 
