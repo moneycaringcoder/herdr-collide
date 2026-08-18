@@ -233,6 +233,7 @@ Everything is also available from the command line, which is handy when the plug
 ```
 collide --once      # one-shot report
 collide --json      # the same report as JSON
+collide --why path/to/file  # show the real conflicting hunks for one shared path
 collide --watch     # the live detail view
 collide --enable | --disable | --toggle
 collide --setup | --setup-rollback
@@ -243,6 +244,14 @@ collide --help
 
 Options may come before or after the verb, so `collide --base-ref main --once` and
 `collide --once --base-ref main` are the same command.
+
+`--why` is CLI-only. It needs a non-empty path supplied at invocation time, while every plugin
+action is a fixed argument array and has no runtime path substitution. It runs the same prediction
+pass as `--once`, then reads conflict content from the retained temporary merge tree rather than
+running a second merge. Clean overlaps are named without a diff. Advisory predictions from a merge
+already in progress and approximate predictions with no single merge base are labelled before the
+verdict they qualify. A conflicted blob is inspected for kind and size before it is read; blobs over
+8 MiB are reported as `unknown` instead of being loaded into the editor-side plugin process.
 
 ## JSON schema
 
@@ -324,6 +333,9 @@ badge down.
   expansion, or negation; those characters are literal. For example, `vendor/**` matches
   `vendor/a/b` but not `my-vendor/a`. The default is an empty list. Setting the key replaces the
   whole list rather than adding to it.
+- **`predict_conflicts`** — set to `false` to report shared paths only in the regular reports.
+  Cheaper, and it stops distinguishing a real conflict from a plain overlap there. The on-demand
+  `--why` command always predicts because it cannot explain a path honestly without doing so.
 - **`predict_conflicts`** — set to `false` to report shared paths only. Cheaper, and it stops
   distinguishing a real conflict from a plain overlap.
 - **`base_ref`** — the local ref each checkout's change set and integration-target prediction are
