@@ -23,7 +23,15 @@ use crate::model::{
 };
 use crate::Result;
 
-/// JSON schema version emitted by `--json`. Bump on any incompatible change.
+/// JSON schema version emitted by `--json`.
+///
+/// The key deliberately remains `schema`: renaming the field consumers use to
+/// detect incompatible changes would itself be incompatible and spend a version
+/// bump on cosmetics. Adding a key or an element to an array does not bump the
+/// version. Removing or renaming a key, changing a value's type, or adding a
+/// value to the `severity` or `verdict` enum does bump it. Array order is not
+/// part of the contract.
+///
 /// Bumped to 2 when `severity` gained the `unknown` value: a consumer matching
 /// exhaustively on the old four would break on it, which is exactly what a
 /// schema version is for.
