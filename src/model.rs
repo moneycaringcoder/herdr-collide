@@ -99,6 +99,9 @@ pub struct ChangedPath {
     /// collide — but one rename is one changed file, so the origin half must not
     /// count twice toward `runaway_files`.
     pub is_rename_origin: bool,
+    /// The submodule's working tree differs from its committed pointer, so the
+    /// superproject snapshot cannot predict whether those contents conflict.
+    pub submodule_contents_uncomparable: bool,
 }
 
 impl ChangedPath {
@@ -111,6 +114,7 @@ impl ChangedPath {
             lines_added: 0,
             lines_removed: 0,
             is_rename_origin: false,
+            submodule_contents_uncomparable: false,
         }
     }
 

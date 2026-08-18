@@ -590,6 +590,14 @@ pub fn integration_ref(checkout: &Path, timeout: Duration) -> Result<Option<Stri
 // Change sets
 // ---------------------------------------------------------------------------
 
+/// The three flags carried by a submodule's `S<c><m><u>` status field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmoduleState {
+    pub commit_changed: bool,
+    pub modified_content: bool,
+    pub untracked_content: bool,
+}
+
 /// One parsed `status --porcelain=v2` record, before it is folded into a
 /// change set. Exposed so the parser can be tested against real git output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -597,6 +605,8 @@ pub struct StatusEntry {
     pub path: String,
     /// Populated only for rename/copy (`2`) records: the original path.
     pub origin: Option<String>,
+    /// Present for `S<c><m><u>` records and absent for ordinary `N...` paths.
+    pub submodule: Option<SubmoduleState>,
     pub kind: ChangeKind,
     pub is_rename: bool,
 }
@@ -631,12 +641,14 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                         path: lossy(path),
                         origin: None,
                         kind: kind_from_xy(xy),
+                        submodule: submodule_state_of(line),
                         is_rename: false,
                     });
                 }
                 i += 1;
             }
-            // rename/copy: `2 <XY> ... <Xscore> <path>` NUL `<origPath>`
+            // rename/copy: `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <Xscore> <path>`
+            // NUL `<origPath>`
             b'2' => {
                 if let (Some(path), Some(xy)) = (field_after_space(line, 9), xy_of(line)) {
                     let origin = fields.get(i + 1).map(|f| lossy(f));
@@ -644,6 +656,7 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                         path: lossy(path),
                         origin,
                         kind: kind_from_xy(xy),
+                        submodule: submodule_state_of(line),
                         is_rename: true,
                     });
                 }
@@ -657,6 +670,7 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                         path: lossy(path),
                         origin: None,
                         kind: ChangeKind::Conflicted,
+                        submodule: None,
                         is_rename: false,
                     });
                 }
@@ -669,6 +683,7 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                         path: lossy(path),
                         origin: None,
                         kind: ChangeKind::Untracked,
+                        submodule: None,
                         is_rename: false,
                     });
                 }
@@ -707,6 +722,21 @@ fn xy_of(line: &[u8]) -> Option<(u8, u8)> {
         Some((line[2], line[3]))
     } else {
         None
+    }
+}
+
+/// Parses the fixed-position `<sub>` field. `N...` means an ordinary path;
+/// `S<c><m><u>` carries the recorded-commit, modified-content and
+/// untracked-content flags in that order.
+fn submodule_state_of(line: &[u8]) -> Option<SubmoduleState> {
+    let field = line.split(|b| *b == b' ').nth(2)?;
+    match field {
+        [b'S', commit, modified, untracked] => Some(SubmoduleState {
+            commit_changed: *commit == b'C',
+            modified_content: *modified == b'M',
+            untracked_content: *untracked == b'U',
+        }),
+        _ => None,
     }
 }
 
@@ -882,6 +912,7 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
     // sibling editing the old name really does collide — but one rename is one
     // changed file, so this half must not count twice toward `runaway_files`.
     let mut rename_origins: BTreeSet<String> = BTreeSet::new();
+    let mut uncomparable_submodules: BTreeSet<String> = BTreeSet::new();
     let mut set = ChangeSet::default();
     let mut reasons: Vec<String> = Vec::new();
 
@@ -908,6 +939,14 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
         }
         if entry.is_rename {
             set.has_rename = true;
+        }
+        if entry
+            .submodule
+            .is_some_and(|sub| sub.modified_content || sub.untracked_content)
+        {
+            // The snapshot records only the committed gitlink, so content that
+            // exists below it never reaches merge-tree and cannot be judged.
+            uncomparable_submodules.insert(entry.path.clone());
         }
         note(&mut kinds, entry.path.clone(), entry.kind);
         if let Some(origin) = &entry.origin {
@@ -1068,6 +1107,7 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
             let (added, removed) = volume.get(&path).copied().unwrap_or((0, 0));
             ChangedPath {
                 is_rename_origin: rename_origins.contains(&path),
+                submodule_contents_uncomparable: uncomparable_submodules.contains(&path),
                 path,
                 kind,
                 lines_added: added,
