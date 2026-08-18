@@ -22,6 +22,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is scheduled and manual only, it is not a required check, and a red canary is
   a signal to read herdr's recent changes rather than a reason to hold a pull
   request.
+- A submodule's contents are now compared, so two agents editing the same file inside one
+  submodule get a real verdict instead of `? unknown`. Each direct submodule is treated as
+  the repository it is: its own common directory, its own index copied into scratch, its own
+  HEAD and snapshot, and its own scratch object store whose alternate is the *submodule's*
+  object store rather than the superproject's. Depth is one — a submodule's own submodules
+  are not entered.
+- Every failure still falls back to `? unknown` with the note explaining why: a submodule
+  that is absent or uninitialised on either side, an unborn or unreadable nested HEAD, a
+  nested merge already in progress, no common ancestor, or any timeout. The fallback is the
+  point: a nested comparison that could not run must not report a clean merge. A nested
+  merge that had to force one of several merge bases says so too, in its own wording,
+  because the existing caveat describes the outer histories rather than the nested ones.
+- A shared file's path stays superproject-relative. Nested conflicting paths are named in the
+  pane note instead, because a path in that field is superproject-relative everywhere else
+  and mixing the two scopes would corrupt every consumer of it.
+- The read-only guarantee now covers the second repository a submodule introduces: the
+  nested index, refs, reflogs and complete object path set are fingerprinted before and after
+  a run that exercises nested prediction, for both worktrees. One dirty submodule shared by
+  two worktrees — one pair — measured 616 ms per cycle. The nested snapshot is per worktree
+  and the nested merge is per pair, so that figure does not scale by submodule count alone.
 - A conflict git attributes to a rename now says so. `merge-tree` reports a
   machine-stable conflict type per message record, and the parser discarded which
   paths each type applied to, so the only evidence available was a flat per-pair set
@@ -78,18 +98,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- A dirty submodule is no longer reported as a harmless overlap. `status`
-  reports it as one changed path, but the snapshot records the submodule's
-  committed gitlink rather than its contents, so `merge-tree` compared two
-  identical gitlinks and found nothing — and the pair was reported `⧉ overlap`,
-  whose legend reads *"same file, merges clean"*. It now reports `? unknown`,
-  and the detail pane says the contents were never compared. Contents are still
-  not compared; that remains a separate, larger change.
-- A submodule whose *recorded commit* changed keeps its real verdict. Those two
-  gitlinks are genuinely comparable, so answering "I do not know" there would
-  discard a fact the plugin already has. Only modified or untracked content
-  inside the submodule is uncomparable, and a path git flags as conflicting is
-  still a conflict whatever its contents are doing.
+- A dirty submodule is no longer reported as a harmless overlap merely because
+  the snapshot records its committed gitlink rather than its contents.
+  `merge-tree` used to compare two identical pointers, find nothing, and report
+  `⧉ overlap`, whose legend reads *"same file, merges clean"*. The safety fix
+  changed that unsupported conclusion to `? unknown`, preventing committed
+  pointer equality from standing in for a contents verdict.
+- A submodule whose *recorded commit* changed kept its real gitlink verdict in
+  that safety fix. The guard was limited to dirty contents the gitlink snapshot
+  could not represent; a path git flagged as conflicting remained a conflict
+  regardless of what those unrepresented contents were doing.
 - The runaway badge carries two different units and the legend named only one of
   them. `⚠ 4.2k` is a changed-line count and `⚠ 60f` is a file count, but the
   legend read `runaway change set (f = files)`, which explains the suffix and
