@@ -291,6 +291,179 @@ fn a_pair_with_no_shared_paths_is_still_checked_when_either_side_renamed() {
 }
 
 #[test]
+fn a_directory_rename_conflict_is_attributed_without_approximation() {
+    let fixture = Fixture::new("directory-rename-attribution");
+    let (a, b) = fixture.committed_directory_rename_pair();
+    let left = git::change_set(&a, "main", TIMEOUT).expect("left change set");
+    let right = git::change_set(&b, "main", TIMEOUT).expect("right change set");
+    assert!(
+        left.path_set().is_disjoint(&right.path_set()),
+        "fixture must reach prediction with no shared path"
+    );
+    let cycle = collide::collide::gather_for(
+        vec![checkout("a", &a, "unused"), checkout("b", &b, "unused")],
+        &config(),
+    )
+    .expect("cycle");
+
+    assert_eq!(cycle.report.pairings.len(), 1, "{:?}", cycle.notes);
+    let pairing = &cycle.report.pairings[0];
+    let moved = pairing
+        .shared
+        .iter()
+        .find(|file| file.path == "guide/notes-c.md")
+        .expect("merged destination path");
+    assert_eq!(moved.verdict, FileVerdict::Conflict);
+    assert_eq!(
+        moved.conflict_type.as_deref(),
+        Some(git::CONFLICT_DIRECTORY_RENAME_SUGGESTED)
+    );
+    assert!(
+        !pairing.approximate,
+        "git attached the rename record to this exact path"
+    );
+}
+
+#[test]
+fn an_uncommitted_rename_edit_conflict_names_the_destination_path() {
+    let fixture = Fixture::new("uncommitted-rename-edit-attribution");
+    let (a, b) = fixture.uncommitted_rename_edit_pair();
+    let cycle = collide::collide::gather_for(
+        vec![checkout("a", &a, "unused"), checkout("b", &b, "unused")],
+        &config(),
+    )
+    .expect("cycle");
+    assert!(
+        cycle.notes.is_empty(),
+        "unexpected notes: {:?}",
+        cycle.notes
+    );
+
+    let pairing = &cycle.report.pairings[0];
+    let moved = pairing
+        .shared
+        .iter()
+        .find(|file| file.path == "moved-shared.txt")
+        .expect("git carries the content conflict onto the rename destination");
+    assert_eq!(moved.verdict, FileVerdict::Conflict);
+    assert_eq!(
+        moved.conflict_type, None,
+        "git reports CONFLICT (contents), not a rename-shaped token"
+    );
+    assert!(
+        !pairing.approximate,
+        "the destination is listed by the renaming change set"
+    );
+}
+
+#[test]
+fn a_rename_rename_conflict_carries_the_rename_annotation() {
+    let fixture = Fixture::new("rename-rename-attribution");
+    let (a, b) = fixture.rename_rename_pair();
+    let cycle = collide::collide::gather_for(
+        vec![checkout("a", &a, "unused"), checkout("b", &b, "unused")],
+        &config(),
+    )
+    .expect("cycle");
+
+    let source = cycle.report.pairings[0]
+        .shared
+        .iter()
+        .find(|file| file.path == "renamed.txt")
+        .expect("rename source path");
+    assert_eq!(source.verdict, FileVerdict::Conflict);
+    assert_eq!(
+        source.conflict_type.as_deref(),
+        Some(git::CONFLICT_RENAME_RENAME)
+    );
+
+    let other_destination = cycle.report.pairings[0]
+        .shared
+        .iter()
+        .find(|file| file.path == "renamed-b.txt")
+        .expect("second rename destination path");
+    assert_eq!(other_destination.verdict, FileVerdict::Conflict);
+    assert_eq!(
+        other_destination.conflict_type.as_deref(),
+        Some(git::CONFLICT_RENAME_RENAME)
+    );
+}
+
+#[test]
+fn a_rename_delete_conflict_carries_the_rename_annotation_without_approximation() {
+    let fixture = Fixture::new("rename-delete-attribution");
+    let renamed = fixture.worktree("rename-delete-a", "rename-delete-a");
+    fixture.git(&renamed, &["mv", "renamed.txt", "renamed-a.txt"]);
+    fixture.commit(&renamed, "rename");
+    let deleted = fixture.worktree("rename-delete-b", "rename-delete-b");
+    fixture.git(&deleted, &["rm", "renamed.txt"]);
+    fixture.commit(&deleted, "delete");
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("a", &renamed, "unused"),
+            checkout("b", &deleted, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+
+    let pairing = &cycle.report.pairings[0];
+    let destination = pairing
+        .shared
+        .iter()
+        .find(|file| file.path == "renamed-a.txt")
+        .expect("rename destination path");
+    assert_eq!(destination.verdict, FileVerdict::Conflict);
+    assert_eq!(
+        destination.conflict_type.as_deref(),
+        Some(git::CONFLICT_RENAME_DELETE)
+    );
+    assert!(
+        !pairing.approximate,
+        "git attached the rename/delete record to this exact path"
+    );
+    assert_eq!(
+        git::conflict_type_annotation("CONFLICT (modify/delete)"),
+        None,
+        "modify/delete is not a rename shape"
+    );
+}
+
+#[test]
+fn a_plain_content_conflict_has_no_conflict_type_annotation() {
+    let fixture = Fixture::new("content-has-no-annotation");
+    let (a, b) = fixture.committed_conflict_pair();
+    let cycle = collide::collide::gather_for(
+        vec![checkout("a", &a, "unused"), checkout("b", &b, "unused")],
+        &config(),
+    )
+    .expect("cycle");
+
+    let shared = &cycle.report.pairings[0].shared[0];
+    assert_eq!(shared.verdict, FileVerdict::Conflict);
+    assert_eq!(shared.conflict_type, None);
+}
+
+#[test]
+fn a_dirty_criss_cross_prediction_remains_approximate() {
+    let fixture = Fixture::new("criss-cross-attribution");
+    let (a, b) = fixture.criss_cross_pair();
+    let bases = fixture.git(&a, &["merge-base", "--all", "criss-a", "criss-b"]);
+    assert_eq!(bases.lines().count(), 2, "fixture must have two best bases");
+
+    let cycle = collide::collide::gather_for(
+        vec![checkout("a", &a, "unused"), checkout("b", &b, "unused")],
+        &config(),
+    )
+    .expect("cycle");
+    assert!(
+        cycle.report.pairings[0].approximate,
+        "forcing one merge base for a dirty tree must remain visible"
+    );
+}
+
+#[test]
 fn checkouts_from_different_repositories_are_refused() {
     let fixture = Fixture::new("foreign");
     let wt = fixture.worktree("wt", "wt");
@@ -490,6 +663,7 @@ fn triaged_report() -> (Report, Vec<(String, ChangeSet)>) {
                 left_workspace_id: "overlap-a".to_string(),
                 right_workspace_id: "overlap-b".to_string(),
                 verdicts: vec![("overlap-only.txt".to_string(), false)],
+                conflict_types_by_path: Default::default(),
                 failed: false,
                 approximate: false,
             },
@@ -497,6 +671,7 @@ fn triaged_report() -> (Report, Vec<(String, ChangeSet)>) {
                 left_workspace_id: "unknown-a".to_string(),
                 right_workspace_id: "unknown-b".to_string(),
                 verdicts: Vec::new(),
+                conflict_types_by_path: Default::default(),
                 failed: true,
                 approximate: false,
             },
@@ -504,6 +679,7 @@ fn triaged_report() -> (Report, Vec<(String, ChangeSet)>) {
                 left_workspace_id: "conflict-a".to_string(),
                 right_workspace_id: "conflict-b".to_string(),
                 verdicts: vec![("conflict-only.txt".to_string(), true)],
+                conflict_types_by_path: Default::default(),
                 failed: false,
                 approximate: false,
             },
@@ -663,6 +839,7 @@ fn conflict_outranks_runaway_and_overlap() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), true)],
+            conflict_types_by_path: Default::default(),
             failed: false,
             approximate: false,
         }],
@@ -697,6 +874,7 @@ fn a_clean_prediction_downgrades_unknown_to_overlap() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), false)],
+            conflict_types_by_path: Default::default(),
             failed: false,
             approximate: false,
         }],
@@ -727,6 +905,7 @@ fn a_failed_prediction_leaves_the_verdict_unknown() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: Vec::new(),
+            conflict_types_by_path: Default::default(),
             failed: true,
             approximate: false,
         }],
@@ -911,6 +1090,7 @@ fn json_report_is_stable_and_documented() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: vec![("shared.txt".to_string(), true)],
+            conflict_types_by_path: Default::default(),
             failed: false,
             approximate: false,
         }],
@@ -991,6 +1171,7 @@ fn json_reports_the_unknown_severity_the_schema_was_bumped_for() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: Vec::new(),
+            conflict_types_by_path: Default::default(),
             failed: true,
             approximate: true,
         }],
@@ -1311,6 +1492,7 @@ fn a_pair_whose_prediction_failed_is_unknown_and_never_an_overlap() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: Vec::new(),
+        conflict_types_by_path: Default::default(),
         failed: true,
         approximate: false,
     }];
@@ -1347,6 +1529,7 @@ fn a_pair_whose_prediction_succeeded_and_found_nothing_is_a_real_overlap() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("shared.txt".to_string(), false)],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -1373,6 +1556,7 @@ fn a_clean_prediction_cannot_turn_changed_submodule_contents_into_overlap() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("embedded".to_string(), false)],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -1432,6 +1616,7 @@ fn a_git_flagged_submodule_conflict_still_reports_conflict() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("embedded".to_string(), true)],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -1738,6 +1923,7 @@ fn a_rename_probe_that_finds_nothing_leaves_no_pairing_behind() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: Vec::new(),
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -1764,6 +1950,7 @@ fn an_approximate_prediction_is_carried_through_to_the_pairing() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("shared.txt".to_string(), true)],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: true,
     }];
@@ -1872,6 +2059,7 @@ fn a_conflicting_path_in_neither_change_set_is_only_believed_when_a_rename_expla
             ("shared.txt".to_string(), false),
             ("media.bin".to_string(), true),
         ],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -1936,6 +2124,7 @@ fn an_ignored_path_cannot_return_as_an_unlisted_conflict() {
             ("src/a.rs".to_string(), false),
             ("Cargo.lock".to_string(), true),
         ],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -1986,6 +2175,7 @@ fn a_listed_unignored_path_still_returns_as_a_conflict() {
             ("src/a.rs".to_string(), false),
             ("vendor/notes.md".to_string(), true),
         ],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -2028,6 +2218,7 @@ fn a_path_admitted_only_by_a_rename_marks_the_pairing_approximate() {
             ("shared.txt".to_string(), false),
             ("moved.rs".to_string(), true),
         ],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -2058,6 +2249,7 @@ fn a_path_admitted_only_by_a_rename_marks_the_pairing_approximate() {
         left_workspace_id: "one".to_string(),
         right_workspace_id: "two".to_string(),
         verdicts: vec![("shared.txt".to_string(), true)],
+        conflict_types_by_path: Default::default(),
         failed: false,
         approximate: false,
     }];
@@ -2200,6 +2392,7 @@ fn the_severity_ladder_is_total_and_ordered_as_documented() {
                                 left_workspace_id: "one".to_string(),
                                 right_workspace_id: "two".to_string(),
                                 verdicts,
+                                conflict_types_by_path: Default::default(),
                                 failed: false,
                                 approximate: false,
                             },
@@ -2208,6 +2401,7 @@ fn the_severity_ladder_is_total_and_ordered_as_documented() {
                                 left_workspace_id: "one".to_string(),
                                 right_workspace_id: "three".to_string(),
                                 verdicts: Vec::new(),
+                                conflict_types_by_path: Default::default(),
                                 failed: true,
                                 approximate: false,
                             },
@@ -2288,6 +2482,7 @@ fn an_unknown_verdict_outranks_a_runaway() {
             left_workspace_id: "one".to_string(),
             right_workspace_id: "two".to_string(),
             verdicts: Vec::new(),
+            conflict_types_by_path: Default::default(),
             failed: true,
             approximate: false,
         }],

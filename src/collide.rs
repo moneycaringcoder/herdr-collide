@@ -124,6 +124,7 @@ pub fn analyse(
                         } else {
                             unresolved
                         },
+                        conflict_type: None,
                     })
                     .collect();
                 // An empty intersection normally means the pair cannot
@@ -178,6 +179,9 @@ pub struct PairVerdicts {
     /// a rename can conflict on a path that appears under a different name in
     /// each change set.
     pub verdicts: Vec<(String, bool)>,
+    /// Machine-stable merge-tree conflict tokens keyed by the paths in the
+    /// records that reported them.
+    pub conflict_types_by_path: BTreeMap<String, Vec<String>>,
     /// Prediction could not run for this pair; the shared files stay `Unknown`.
     pub failed: bool,
     /// A single merge base had to be forced although the histories offer more
@@ -227,6 +231,17 @@ pub fn apply_predictions(
             .iter()
             .map(|(path, hit)| (path.as_str(), *hit))
             .collect();
+        let attributed_conflict_type = |path: &str| {
+            prediction
+                .conflict_types_by_path
+                .get(path)
+                .and_then(|types| {
+                    types
+                        .iter()
+                        .find(|token| git::conflict_type_annotation(token).is_some())
+                })
+                .cloned()
+        };
         for shared in &mut pairing.shared {
             let uncomparable_submodule = [key.0, key.1].iter().any(|id| {
                 filtered
@@ -234,12 +249,18 @@ pub fn apply_predictions(
                     .is_some_and(|change| change.uncomparable_submodules.contains(&shared.path))
             });
             shared.verdict = match verdicts.get(shared.path.as_str()) {
-                Some(true) => FileVerdict::Conflict,
+                Some(true) => {
+                    shared.conflict_type = attributed_conflict_type(&shared.path);
+                    FileVerdict::Conflict
+                }
                 _ if uncomparable_submodule => FileVerdict::Unknown,
                 // A path git did not flag merges cleanly, even though both
                 // sides touched it. That discrimination is the whole point of
                 // this plugin: a shared file is not a collision.
-                Some(false) | None => FileVerdict::Overlap,
+                Some(false) | None => {
+                    shared.conflict_type = None;
+                    FileVerdict::Overlap
+                }
             };
         }
         let known: BTreeSet<&str> = pairing.shared.iter().map(|s| s.path.as_str()).collect();
@@ -260,12 +281,11 @@ pub fn apply_predictions(
         // avoid raising. So an unlisted path is only believed when a rename
         // could explain it, or when a change set lists it after all.
         //
-        // `renamed` is per *pair*, not per path — nothing in the prediction says
-        // which conflict a rename explains — so admitting a path on that
-        // strength alone is a guess. It is a guess worth making, because the
-        // alternative is losing the rename conflicts this pair was predicted
-        // for, but the pairing is marked `approximate` so the pane says the
-        // verdict is not firm rather than presenting it as flat fact.
+        // Pair-level rename evidence still cannot say which conflict a rename
+        // explains. An unlisted path is therefore a guess unless merge-tree
+        // attached a rename-type record to that exact path. The former remains
+        // approximate; the latter is git's precise attribution and should not
+        // be weakened.
         let renamed = pair_changes
             .get(key.0)
             .is_some_and(|c: &&ChangeSet| c.has_rename)
@@ -280,7 +300,7 @@ pub fn apply_predictions(
             })
         };
         let mut guessed = false;
-        let mut extra: Vec<String> = Vec::new();
+        let mut extra: Vec<(String, Option<String>)> = Vec::new();
         for (path, hit) in &prediction.verdicts {
             if !*hit || known.contains(path.as_str()) {
                 continue;
@@ -292,20 +312,22 @@ pub fn apply_predictions(
             if is_ignored(path, config) {
                 continue;
             }
+            let conflict_type = attributed_conflict_type(path);
             if listed(path) {
-                extra.push(path.clone());
+                extra.push((path.clone(), conflict_type));
             } else if renamed {
-                guessed = true;
-                extra.push(path.clone());
+                guessed |= conflict_type.is_none();
+                extra.push((path.clone(), conflict_type));
             }
         }
         if guessed {
             pairing.approximate = true;
         }
-        for path in extra {
+        for (path, conflict_type) in extra {
             pairing.shared.push(SharedFile {
                 path,
                 verdict: FileVerdict::Conflict,
+                conflict_type,
             });
         }
         pairing.shared.sort_by(|a, b| a.path.cmp(&b.path));
@@ -838,6 +860,7 @@ fn predict_all(
                                     left_workspace_id: pairing.left_workspace_id.clone(),
                                     right_workspace_id: pairing.right_workspace_id.clone(),
                                     verdicts: prediction.verdicts,
+                                    conflict_types_by_path: prediction.conflict_types_by_path,
                                     failed: false,
                                     approximate: prediction.approximate,
                                 },
@@ -848,6 +871,7 @@ fn predict_all(
                                     left_workspace_id: pairing.left_workspace_id.clone(),
                                     right_workspace_id: pairing.right_workspace_id.clone(),
                                     verdicts: Vec::new(),
+                                    conflict_types_by_path: BTreeMap::new(),
                                     failed: true,
                                     approximate: false,
                                 },
