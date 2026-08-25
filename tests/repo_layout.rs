@@ -167,20 +167,14 @@ fn separate_git_dir_checkouts_agree_on_the_main_root_when_it_is_present() {
     let (main, _store, linked) = fixture.separate_git_dir_repo("separate");
     let key = repo_key(&main);
 
-    // What this pins is a property of the layout, not of our code: under
-    // `--separate-git-dir` the worktree's `.git` is a *gitfile* naming the
-    // store, so canonicalizing that path can never equal the repository key.
-    // `agree_on_repo_root`'s exact rule 1 compares exactly those two
-    // (src/collide.rs:390-392), so it cannot fire for this layout and the root
-    // below is reached by the deterministic member fallback instead. Both are
-    // the same answer here, which is why the suite stayed green without this
-    // fixture. Fixing rule 1 to resolve the gitfile leaves this assertion true,
-    // so treat the sentence above as the record of why, not as a tripwire.
-    let dot_git = std::fs::canonicalize(main.join(".git")).expect("canonical .git gitfile");
-    assert_ne!(
-        dot_git,
+    // Under `--separate-git-dir` the main worktree's `.git` is a gitfile naming
+    // the common store. Resolving the gitfile therefore yields the repository
+    // key, which is the exact premise rule 1 uses to identify the main worktree.
+    let git_dir = git::worktree_git_dir(&main).expect("resolve .git gitfile");
+    assert_eq!(
+        git_dir,
         PathBuf::from(&key.0),
-        "the observed .git gitfile at {} unexpectedly resolved as the common store",
+        "the observed .git gitfile at {} did not resolve as the common store",
         main.display()
     );
 
@@ -217,6 +211,56 @@ fn separate_git_dir_checkouts_agree_on_the_main_root_when_it_is_present() {
         std::fs::canonicalize(&observed).expect("canonical agreed root"),
         std::fs::canonicalize(&main).expect("canonical main worktree"),
         "separate-git-dir checkouts agreed on {}, not observed main worktree {}",
+        observed.display(),
+        main.display()
+    );
+}
+
+#[test]
+fn dot_git_named_separate_store_uses_the_main_worktree_as_repo_root() {
+    let fixture = Fixture::new("dot-git-store-root");
+    let (main, store, linked) = fixture.separate_git_dir_dot_git_store_repo("dot-git-store");
+    let key = repo_key(&main);
+    assert_eq!(
+        PathBuf::from(&key.0),
+        std::fs::canonicalize(&store).expect("canonical .git-named separate store"),
+        "fixture repository key did not name separate store {}",
+        store.display()
+    );
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            observed_checkout("main", &main, false),
+            observed_checkout("linked", &linked, true),
+        ],
+        &Config::default(),
+    )
+    .expect("gather .git-named separate-git-dir repository");
+    assert!(
+        cycle.notes.is_empty() && cycle.report.checkouts.len() == 2,
+        "git did not yield both separate-git-dir checkouts {} and {}: notes={:?}",
+        main.display(),
+        linked.display(),
+        cycle.notes
+    );
+    let roots: BTreeSet<PathBuf> = cycle
+        .report
+        .checkouts
+        .iter()
+        .map(|found| found.repo_root.clone())
+        .collect();
+    assert_eq!(
+        roots.len(),
+        1,
+        "checkouts {} and {} reported different repository roots: {roots:?}",
+        main.display(),
+        linked.display()
+    );
+    let observed = roots.into_iter().next().expect("one agreed root");
+    assert_eq!(
+        std::fs::canonicalize(&observed).expect("canonical agreed root"),
+        std::fs::canonicalize(&main).expect("canonical main worktree"),
+        ".git-named separate store made checkouts agree on {}, not main worktree {}",
         observed.display(),
         main.display()
     );

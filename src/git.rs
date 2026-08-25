@@ -414,6 +414,38 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 // Repo identity and HEAD state
 // ---------------------------------------------------------------------------
 
+/// Resolves a worktree top level's `.git` entry to its canonical git directory
+/// without invoking git.
+///
+/// This deliberately does not follow `commondir`. The repository-root agreement
+/// rule compares this per-worktree git directory with the canonical common-dir
+/// key: a main worktree's directory or gitfile names the common store itself,
+/// while a linked worktree's gitfile names `<store>/worktrees/<name>`. Preserving
+/// that asymmetry is what makes identification of the main worktree exact.
+pub fn worktree_git_dir(top: &Path) -> Option<PathBuf> {
+    let dot_git = top.join(".git");
+    if dot_git.is_dir() {
+        return fs::canonicalize(dot_git).ok();
+    }
+    if !dot_git.is_file() {
+        return None;
+    }
+
+    let marker = fs::read_to_string(dot_git).ok()?;
+    let raw = marker
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let path = PathBuf::from(raw);
+    let git_dir = if path.is_absolute() {
+        path
+    } else {
+        top.join(path)
+    };
+    fs::canonicalize(git_dir).ok()
+}
+
 /// Canonicalized `--git-common-dir`: the only safe answer to "are these the
 /// same repository?". Every worktree of one repo shares it, while each has its
 /// own `--git-dir`. Canonicalizing matters because a symlinked or bind-mounted

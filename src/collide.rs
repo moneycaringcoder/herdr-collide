@@ -442,11 +442,12 @@ fn has_reason_code(set: &ChangeSet, code: &str) -> bool {
 ///
 /// Three rules, in order, and only the first is exact:
 ///
-/// 1. **The main worktree, when it is open.** Its top level holds the
-///    `--git-common-dir` itself, so `<top level>/.git == repo_key` identifies it
-///    with no guessing, and its top level *is* the repository root. This covers
-///    every layout, including `--separate-git-dir` and a repository whose root is
-///    not named after its git directory.
+/// 1. **The main worktree, when it is open.** Resolving its `<top level>/.git`
+///    entry gives the `repo_key` itself with no guessing, and its top level *is*
+///    the repository root. This fires for the ordinary layout, for
+///    `--separate-git-dir`, and for a submodule whose git directory lives under
+///    its superproject. A linked worktree cannot satisfy it because its gitfile
+///    names `<store>/worktrees/<name>` rather than the common store.
 /// 2. **The parent of the key, when the key is named `.git`.** Right for the
 ///    ordinary layout, and a guess: a `--separate-git-dir` store that happens to
 ///    be named `.git` passes this test and yields the store rather than the
@@ -468,9 +469,8 @@ fn agree_on_repo_root(checkouts: &mut [Checkout], trees: &WorkTrees) {
         // 1. The member whose own top level owns the common dir.
         let from_main = members.iter().find_map(|c| {
             let top = trees.get(&c.workspace_id)?;
-            let dot_git = top.join(".git");
-            let canonical = std::fs::canonicalize(&dot_git).unwrap_or(dot_git);
-            (canonical.to_string_lossy() == key).then(|| top.to_path_buf())
+            let git_dir = git::worktree_git_dir(top)?;
+            (git_dir == std::path::Path::new(key)).then(|| top.to_path_buf())
         });
 
         // 2. The parent of a key named `.git`.
