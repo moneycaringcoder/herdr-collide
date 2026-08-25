@@ -11,7 +11,7 @@
 
 id = "moneycaringcoder.collide"
 name = "Collide"
-version = "0.1.1"
+version = "0.1.2"
 # Oldest herdr this plugin has actually been run against. The `tokens` metadata
 # API on workspace.report_metadata landed in 0.7.5 and this used to claim that
 # version — but the setup action now reloads herdr's config over the socket
