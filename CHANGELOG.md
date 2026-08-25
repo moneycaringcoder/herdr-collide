@@ -19,6 +19,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   worktree still cannot satisfy the rule, because its gitfile names
   `worktrees/<name>` and the rule deliberately does not follow `commondir`. The
   0.1.1 "Known issues" entry for this is now closed.
+- A snapshot no longer trusts the copied index's stat cache for a path git
+  itself reported as changed. The temporary index is still seeded from the real
+  one — that is what keeps sparse-checkout and skip-worktree entries out of a
+  one-sided deletion — but a same-size edit whose mtime did not move was
+  invisible to `add -A`, so the prediction compared content the snapshot never
+  saw and could report a real conflict as a clean overlap: the one failure
+  direction this plugin treats as unacceptable. A status-reported path whose
+  worktree entry is still a file is now re-read by a path-limited renormalizing
+  add before the general one, which re-hashes exactly the paths the prediction
+  depends on and leaves every other entry, and its index flags, untouched. A
+  path status did not name cannot be affected, and neither a file that is gone
+  nor one replaced by a directory can be hidden by a stat cache at all.
 
 ## [0.1.1] - 2026-08-18
 

@@ -12,7 +12,7 @@ mod fixtures;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use collide::collide::{
     analyse, apply_predictions, json_report, work_tree_root, Cycle, PairVerdicts,
@@ -96,6 +96,171 @@ fn uncommitted_edits_to_the_same_line_are_a_conflict() {
     // temp-index snapshot.
     let result = verdicts(&a, &b, &["conflict.txt"]);
     assert_eq!(result, vec![("conflict.txt".to_string(), true)]);
+}
+
+#[test]
+fn same_size_edit_with_unchanged_mtime_is_a_conflict() {
+    let fixture = Fixture::new("same-size-unchanged-mtime");
+    fixture.write(
+        &fixture.repo,
+        "shared.txt",
+        "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+    );
+    fixture.commit_all(&fixture.repo, "six-line shared file");
+    fixture.git(&fixture.repo, &["config", "core.trustctime", "false"]);
+    let a = fixture.worktree("stat-cache-a", "stat-cache-a");
+    let b = fixture.worktree("stat-cache-b", "stat-cache-b");
+
+    // The staged last-line edit puts this path in status, while the copied
+    // index can still hide the later first-line edit behind its stat cache.
+    fixture.write(
+        &a,
+        "shared.txt",
+        "line 1\nline 2\nline 3\nline 4\nline 5\nCHANGED\n",
+    );
+    fixture.git(&a, &["add", "--", "shared.txt"]);
+    let indexed_time = SystemTime::now()
+        .checked_sub(Duration::from_secs(100))
+        .expect("time before now");
+    let shared_a = a.join("shared.txt");
+    std::fs::File::open(&shared_a)
+        .expect("open shared file")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(indexed_time)
+                .set_modified(indexed_time),
+        )
+        .expect("set old file times");
+    fixture.git(&a, &["update-index", "--refresh"]);
+
+    // An in-place rewrite always moves ctime and no API can set it back.
+    // Ignoring ctime recreates a rewrite inside one filesystem timestamp tick.
+    fixture.write(
+        &a,
+        "shared.txt",
+        "FROM-A\nline 2\nline 3\nline 4\nline 5\nCHANGED\n",
+    );
+    std::fs::File::open(&shared_a)
+        .expect("open rewritten shared file")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(indexed_time)
+                .set_modified(indexed_time),
+        )
+        .expect("restore indexed file times");
+    fixture.write(
+        &b,
+        "shared.txt",
+        "FROM-B\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+    );
+
+    // A stat-clean edit with nothing staged is invisible to status itself;
+    // covering that would require rehashing every tracked file on each snapshot.
+    let result = verdicts(&a, &b, &["shared.txt"]);
+    assert_eq!(
+        result,
+        vec![("shared.txt".to_string(), true)],
+        "same-size edits to the same line must not be reported as a clean overlap"
+    );
+}
+
+#[test]
+fn tracked_ignored_file_stays_in_the_snapshot_tree() {
+    let fixture = Fixture::new("tracked-ignored-snapshot");
+    fixture.write(
+        &fixture.repo,
+        "app.log",
+        "line 1\nline 2\nline 3\nline 4\nline 5\n",
+    );
+    fixture.git(&fixture.repo, &["add", "-f", "--", "app.log"]);
+    fixture.commit(&fixture.repo, "track ignored log");
+    let a = fixture.worktree("tracked-ignored-a", "tracked-ignored-a");
+    let b = fixture.worktree("tracked-ignored-b", "tracked-ignored-b");
+
+    fixture.write(&a, "app.log", "FROM-A\nline 2\nline 3\nline 4\nline 5\n");
+    fixture.write(&b, "app.log", "line 1\nline 2\nline 3\nline 4\nFROM-B\n");
+    fixture.commit_all(&b, "edit ignored log at the end");
+
+    let result = verdicts(&a, &b, &["app.log"]);
+    assert_eq!(
+        result,
+        vec![("app.log".to_string(), false)],
+        "a tracked ignored file must not disappear from the snapshot as a deletion"
+    );
+}
+
+#[test]
+fn tracked_file_replaced_by_directory_still_yields_a_verdict() {
+    let fixture = Fixture::new("file-to-directory-snapshot");
+    fixture.write(&fixture.repo, "typechange.txt", "base\n");
+    fixture.commit_all(&fixture.repo, "track typechange file");
+    let a = fixture.worktree("file-to-directory-a", "file-to-directory-a");
+    let b = fixture.worktree("file-to-directory-b", "file-to-directory-b");
+
+    std::fs::remove_file(a.join("typechange.txt")).expect("remove tracked file");
+    std::fs::create_dir(a.join("typechange.txt")).expect("replace file with directory");
+    fixture.write(&b, "typechange.txt", "changed on b\n");
+    fixture.commit_all(&b, "edit typechange file");
+
+    let result = verdicts(&a, &b, &["typechange.txt"]);
+    assert_eq!(result, vec![("typechange.txt".to_string(), true)]);
+}
+
+#[test]
+fn status_path_with_glob_characters_does_not_refresh_its_sibling() {
+    let fixture = Fixture::new("literal-status-path");
+    fixture.write(&fixture.repo, "star*.txt", "literal base\n");
+    fixture.write(
+        &fixture.repo,
+        "star-one.txt",
+        "line 1\nline 2\nline 3\nline 4\nline 5\n",
+    );
+    fixture.commit_all(&fixture.repo, "track glob-shaped path and sibling");
+    fixture.git(&fixture.repo, &["config", "core.trustctime", "false"]);
+    let a = fixture.worktree("literal-path-a", "literal-path-a");
+    let b = fixture.worktree("literal-path-b", "literal-path-b");
+
+    let indexed_time = SystemTime::now()
+        .checked_sub(Duration::from_secs(100))
+        .expect("time before now");
+    let sibling_a = a.join("star-one.txt");
+    std::fs::File::open(&sibling_a)
+        .expect("open sibling")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(indexed_time)
+                .set_modified(indexed_time),
+        )
+        .expect("set old sibling times");
+    fixture.git(&a, &["update-index", "--refresh"]);
+    fixture.write(
+        &a,
+        "star-one.txt",
+        "FROM-A\nline 2\nline 3\nline 4\nline 5\n",
+    );
+    std::fs::File::open(&sibling_a)
+        .expect("open rewritten sibling")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(indexed_time)
+                .set_modified(indexed_time),
+        )
+        .expect("restore sibling times");
+    fixture.write(&a, "star*.txt", "literal changed\n");
+
+    fixture.write(
+        &b,
+        "star-one.txt",
+        "FROM-B\nline 2\nline 3\nline 4\nline 5\n",
+    );
+    fixture.commit_all(&b, "edit sibling");
+
+    let result = verdicts(&a, &b, &["star-one.txt"]);
+    assert_eq!(
+        result,
+        vec![("star-one.txt".to_string(), false)],
+        "a glob-shaped status path must not re-read an unrelated sibling"
+    );
 }
 
 #[test]
