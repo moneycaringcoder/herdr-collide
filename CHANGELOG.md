@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A snapshot no longer trusts the copied index's stat cache for a path git
+  itself reported as changed. The temporary index is still seeded from the real
+  one — that is what keeps sparse-checkout and skip-worktree entries out of a
+  one-sided deletion — but a same-size edit whose mtime did not move was
+  invisible to `add -A`, so the prediction compared content the snapshot never
+  saw and could report a real conflict as a clean overlap: the one failure
+  direction this plugin treats as unacceptable. Status-reported paths that still
+  exist are now re-read with a renormalizing forced add before the general one,
+  which re-hashes exactly the paths the prediction depends on and leaves every
+  other entry, and its index flags, untouched. A path status did not name cannot
+  be affected, and a path that no longer exists cannot be hidden by a stat cache
+  at all.
+- A tracked file that the repository also ignores stays in the snapshot tree.
+  Forcing the re-read is what keeps it there; without the force it would leave
+  the tree and the pair would report a deletion nobody made.
+
 ## [0.1.1] - 2026-08-18
 
 ### Added

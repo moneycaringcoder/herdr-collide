@@ -729,6 +729,23 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
     entries
 }
 
+fn changed_index_paths(entries: &[StatusEntry]) -> Vec<&str> {
+    let mut paths = BTreeSet::new();
+    for entry in entries {
+        // The forced content pass has nothing to do for an untracked path, and
+        // a gitlink has no worktree file content to hash; the latter must stay
+        // seeded for uninitialised and unborn submodules.
+        if entry.kind == ChangeKind::Untracked || entry.submodule.is_some() {
+            continue;
+        }
+        paths.insert(entry.path.as_str());
+        if let Some(origin) = entry.origin.as_deref() {
+            paths.insert(origin);
+        }
+    }
+    paths.into_iter().collect()
+}
+
 /// Returns everything after the `n`th ASCII space, so a path containing spaces
 /// survives intact.
 fn field_after_space(line: &[u8], n: usize) -> Option<&[u8]> {
@@ -1625,12 +1642,14 @@ impl Predictor {
             .iter()
             .any(|entry| entry.kind == ChangeKind::Conflicted);
         let tree = if dirty {
+            let changed = changed_index_paths(&entries);
             Some(self.snapshot_tree_from_git_dir(
                 checkout,
                 &git_dir,
                 &odb,
                 "submodule-index",
                 &env,
+                &changed,
             )?)
         } else {
             None
@@ -1708,7 +1727,8 @@ impl Predictor {
         let unmerged = entries.iter().any(|e| e.kind == ChangeKind::Conflicted);
 
         let tree = if dirty {
-            Some(self.snapshot_tree(checkout, &common_dir)?)
+            let changed = changed_index_paths(&entries);
+            Some(self.snapshot_tree(checkout, &common_dir, &changed)?)
         } else {
             None
         };
@@ -1728,9 +1748,16 @@ impl Predictor {
     /// Seeding the temp index by copying the real one is not an optimisation
     /// detail, it is the difference between 29 ms and 123 ms: `read-tree HEAD`
     /// into an empty index discards the stat cache, so `add -A` then rehashes
-    /// every file in the worktree. The copy keeps the stat cache, so `add -A`
-    /// only hashes what actually changed.
-    fn snapshot_tree(&self, checkout: &Path, common_dir: &Path) -> Result<String> {
+    /// every file in the worktree. The copy keeps the stat cache so untouched
+    /// files are not rehashed. Status-reported files are forcibly re-read
+    /// first, because the copied cache can otherwise hide a same-size edit
+    /// whose mtime did not move and report a real conflict as a clean overlap.
+    fn snapshot_tree(
+        &self,
+        checkout: &Path,
+        common_dir: &Path,
+        changed: &[&str],
+    ) -> Result<String> {
         let out = git_ok(
             checkout,
             &["rev-parse", "--path-format=absolute", "--git-dir"],
@@ -1738,7 +1765,7 @@ impl Predictor {
         )?;
         let git_dir = PathBuf::from(out.stdout_trimmed());
         let env = self.odb_env(common_dir);
-        self.snapshot_tree_from_git_dir(checkout, &git_dir, &self.odb, "index", &env)
+        self.snapshot_tree_from_git_dir(checkout, &git_dir, &self.odb, "index", &env, changed)
     }
 
     fn snapshot_tree_from_git_dir(
@@ -1748,6 +1775,7 @@ impl Predictor {
         odb: &Path,
         index_prefix: &str,
         base_env: &[(&str, OsString)],
+        changed: &[&str],
     ) -> Result<String> {
         let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
         let index = TempIndex::new(self.scratch.join(format!("{index_prefix}-{seq}")))?;
@@ -1777,6 +1805,49 @@ impl Predictor {
         env.push(("GIT_INDEX_FILE", index.path.clone().into_os_string()));
 
         let overrides = filter_overrides_with_env(checkout, base_env, self.timeout);
+        // `--renormalize` re-reads pathspec'd tracked files instead of trusting
+        // their stat cache, while `-f` keeps a tracked-but-ignored file in the
+        // tree. Retaining each copied entry also preserves its index flags.
+        // Missing files cannot be hidden by a stat cache and are skipped because
+        // renormalizing them is a hard failure; the general add records their
+        // deletion below.
+        let existing: Vec<&str> = changed
+            .iter()
+            .copied()
+            .filter(|path| fs::symlink_metadata(checkout.join(path)).is_ok())
+            .collect();
+
+        // Status paths are user-controlled, so bound both their count and bytes
+        // before one snapshot can grow past the operating system's exec limit.
+        const MAX_PATH_BYTES: usize = 32 * 1024;
+        const MAX_PATHS: usize = 256;
+        let mut first = 0;
+        while first < existing.len() {
+            let mut end = first;
+            let mut path_bytes = 0;
+            while end < existing.len() && end - first < MAX_PATHS {
+                let next_bytes = existing[end].len();
+                if end > first && path_bytes + next_bytes > MAX_PATH_BYTES {
+                    break;
+                }
+                path_bytes += next_bytes;
+                end += 1;
+            }
+
+            let mut refresh_args: Vec<&str> = overrides.iter().map(String::as_str).collect();
+            refresh_args.extend(["add", "-A", "-f", "--renormalize", "--"]);
+            refresh_args.extend_from_slice(&existing[first..end]);
+            let refresh = run_git(checkout, &refresh_args, &env, self.timeout)?;
+            if !refresh.ok() {
+                return Err(format!(
+                    "{}: could not prepare snapshot index: {}",
+                    checkout.display(),
+                    refresh.stderr_text()
+                )
+                .into());
+            }
+            first = end;
+        }
         let mut add_args: Vec<&str> = overrides.iter().map(String::as_str).collect();
         add_args.extend(["add", "-A", "--"]);
         let add = run_git(checkout, &add_args, &env, self.timeout)?;
