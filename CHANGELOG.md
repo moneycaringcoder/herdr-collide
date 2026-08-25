@@ -8,18 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The exact rule that identifies a repository's main worktree now resolves a
+  `.git` gitfile instead of only canonicalizing the path, so it fires for
+  `--separate-git-dir` and for a submodule whose git directory lives under its
+  superproject. It could not fire for those layouts before, because a gitfile is
+  a regular file naming the store rather than the store itself, and the root was
+  decided by fallback — right by luck for the layouts under test, and wrong when
+  the external store happens to be named `.git`: the parent-of-the-key rule then
+  claimed the store's parent, a directory that is not the working tree. A linked
+  worktree still cannot satisfy the rule, because its gitfile names
+  `worktrees/<name>` and the rule deliberately does not follow `commondir`. The
+  0.1.1 "Known issues" entry for this is now closed.
 - A snapshot no longer trusts the copied index's stat cache for a path git
   itself reported as changed. The temporary index is still seeded from the real
   one — that is what keeps sparse-checkout and skip-worktree entries out of a
   one-sided deletion — but a same-size edit whose mtime did not move was
   invisible to `add -A`, so the prediction compared content the snapshot never
   saw and could report a real conflict as a clean overlap: the one failure
-  direction this plugin treats as unacceptable. Status-reported paths that
-  still exist are now re-read with a path-limited renormalizing add before the
-  general one, which re-hashes exactly the paths the prediction depends on and
-  leaves every other entry, and its index flags, untouched. A path status did
-  not name cannot be affected, and a path that no longer exists cannot be
-  hidden by a stat cache at all.
+  direction this plugin treats as unacceptable. A status-reported path whose
+  worktree entry is still a file is now re-read by a path-limited renormalizing
+  add before the general one, which re-hashes exactly the paths the prediction
+  depends on and leaves every other entry, and its index flags, untouched. A
+  path status did not name cannot be affected, and neither a file that is gone
+  nor one replaced by a directory can be hidden by a stat cache at all.
 
 ## [0.1.1] - 2026-08-18
 

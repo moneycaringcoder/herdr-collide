@@ -369,9 +369,29 @@ impl Fixture {
     /// A repository whose working tree and common git directory are siblings,
     /// plus one linked worktree of that repository.
     pub fn separate_git_dir_repo(&self, name: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let repo = self.root.join(name);
         let store = self.root.join(format!("{name}-store"));
+        self.separate_git_dir_repo_with_store(name, &store)
+    }
+
+    /// The same layout, except the external store is itself named `.git`. That
+    /// is the case the repository-root agreement answers wrongly when its exact
+    /// rule cannot fire: the key ends in `.git`, so the parent-of-the-key rule
+    /// claims a directory that is not the working tree at all.
+    pub fn separate_git_dir_dot_git_store_repo(&self, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let store = self.root.join(format!("{name}-store/.git"));
+        self.separate_git_dir_repo_with_store(name, &store)
+    }
+
+    fn separate_git_dir_repo_with_store(
+        &self,
+        name: &str,
+        store: &Path,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let repo = self.root.join(name);
         std::fs::create_dir_all(&repo).expect("create separate-git-dir worktree");
+        if let Some(parent) = store.parent() {
+            std::fs::create_dir_all(parent).expect("create separate git store parent");
+        }
         let separate_git_dir = format!("--separate-git-dir={}", store.display());
         self.git(
             &repo,
@@ -395,7 +415,7 @@ impl Fixture {
                 "main",
             ],
         );
-        (repo, store, linked)
+        (repo, store.to_path_buf(), linked)
     }
 
     /// The primary repository as a superproject, with two linked worktrees and
