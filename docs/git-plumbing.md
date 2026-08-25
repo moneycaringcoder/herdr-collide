@@ -360,6 +360,8 @@ tree. Snapshot it through a throwaway index:
 GD=$(git -C "$WT" rev-parse --path-format=absolute --git-dir)
 IDX=$(mktemp)
 cp "$GD/index" "$IDX"                         # seeding keeps the stat cache
+GIT_INDEX_FILE="$IDX" git -C "$WT" $FILTER_OVERRIDES --literal-pathspecs \
+  add -A --renormalize -- $CHANGED_FILES      # the stat cache lies; see below
 GIT_INDEX_FILE="$IDX" git -C "$WT" $FILTER_OVERRIDES add -A --
 GIT_INDEX_FILE="$IDX" git -C "$WT" $FILTER_OVERRIDES write-tree
 rm -f "$IDX" "$IDX.lock"
@@ -374,6 +376,49 @@ out-of-cone paths.
 
 Seeding with `cp` costs 29 ms; `read-tree HEAD` instead costs 123 ms because it
 discards the stat cache and rehashes every file.
+
+**The seeded stat cache can hide an edit, and that is the dangerous direction.**
+`add` skips re-hashing a path whose cached size and mtime still match, so a
+same-size rewrite that lands inside one filesystem timestamp tick is invisible
+and the prediction compares content the snapshot never saw — a real conflict
+reported as a clean overlap. Reproduce it deterministically with
+`core.trustctime=false` (an in-place rewrite always moves ctime and nothing can
+set it back, which is what the tick race hides): stage a change to a distant
+line so `status` names the path at all, push the file's mtime into the past and
+`update-index --refresh` so the entry is not racily clean, then rewrite one line
+to the same byte length and restore that mtime. The plain recipe yields the
+stale blob; the `--renormalize` pass yields the new one.
+
+`$CHANGED_FILES` is what `status` already reported, and the pass has four
+bounds, each measured:
+
+- **Only paths `status` named.** A path it did not name cannot have moved, and
+  re-reading everything is the 123 ms the `cp` exists to avoid. A rewrite with
+  *nothing* staged is invisible to `status` itself, so no consumer of this
+  recipe can see it either; that is a limit of the approach, not a bug in it.
+- **`--literal-pathspecs`.** These paths come from the user's worktree and reach
+  `add` as pathspecs otherwise: `star*.txt` re-reads unrelated siblings, and a
+  name beginning `:` is fatal.
+- **Regular files and symlinks only.** A tracked file replaced by a directory
+  still passes an `lstat` guard and then fails the pass outright — `error: 'f'
+  does not have a commit checked out`, exit 255 — and a deleted path fails with
+  `fatal: unable to stat`, exit 128. Neither can be hidden by a stat cache
+  anyway; the general `add -A` below records the deletion or type change.
+- **Retry only on a shrinking set.** A worktree an agent is editing can delete a
+  path between the guard and the pass. Re-stat and retry once when the eligible
+  set actually shrank; a set that did not shrink is a systematic failure and has
+  to stay loud, because swallowing it restores the stale-content bug silently.
+
+Do not close the hole by evicting the entries instead
+(`update-index --force-remove` then `add -A`): a *tracked but ignored* file then
+leaves the index, `add -A` refuses to put an ignored path back, and the snapshot
+tree loses it — measured, `['.gitignore','app.log','shared.txt']` becomes
+`['.gitignore','shared.txt']`, which is the one-sided deletion the seeding
+exists to prevent. Eviction also drops each entry's index flags. Re-reading in
+place keeps both, at the cost of one honest caveat: the filter overrides
+neutralise custom drivers only, so `text` and `eol` attributes still apply and a
+stat-clean *staged* entry can come back normalized (measured, a staged CRLF blob
+`d5a6cc6` becomes LF `7be73ce`). Both sides of a pair go through the same path.
 
 The seeding `cp` must not be best-effort. A missing index is the one benign
 failure — a worktree that has none legitimately starts from empty — but every
