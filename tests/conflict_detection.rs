@@ -190,6 +190,80 @@ fn tracked_ignored_file_stays_in_the_snapshot_tree() {
 }
 
 #[test]
+fn tracked_file_replaced_by_directory_still_yields_a_verdict() {
+    let fixture = Fixture::new("file-to-directory-snapshot");
+    fixture.write(&fixture.repo, "typechange.txt", "base\n");
+    fixture.commit_all(&fixture.repo, "track typechange file");
+    let a = fixture.worktree("file-to-directory-a", "file-to-directory-a");
+    let b = fixture.worktree("file-to-directory-b", "file-to-directory-b");
+
+    std::fs::remove_file(a.join("typechange.txt")).expect("remove tracked file");
+    std::fs::create_dir(a.join("typechange.txt")).expect("replace file with directory");
+    fixture.write(&b, "typechange.txt", "changed on b\n");
+    fixture.commit_all(&b, "edit typechange file");
+
+    let result = verdicts(&a, &b, &["typechange.txt"]);
+    assert_eq!(result, vec![("typechange.txt".to_string(), true)]);
+}
+
+#[test]
+fn status_path_with_glob_characters_does_not_refresh_its_sibling() {
+    let fixture = Fixture::new("literal-status-path");
+    fixture.write(&fixture.repo, "star*.txt", "literal base\n");
+    fixture.write(
+        &fixture.repo,
+        "star-one.txt",
+        "line 1\nline 2\nline 3\nline 4\nline 5\n",
+    );
+    fixture.commit_all(&fixture.repo, "track glob-shaped path and sibling");
+    fixture.git(&fixture.repo, &["config", "core.trustctime", "false"]);
+    let a = fixture.worktree("literal-path-a", "literal-path-a");
+    let b = fixture.worktree("literal-path-b", "literal-path-b");
+
+    let indexed_time = SystemTime::now()
+        .checked_sub(Duration::from_secs(100))
+        .expect("time before now");
+    let sibling_a = a.join("star-one.txt");
+    std::fs::File::open(&sibling_a)
+        .expect("open sibling")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(indexed_time)
+                .set_modified(indexed_time),
+        )
+        .expect("set old sibling times");
+    fixture.git(&a, &["update-index", "--refresh"]);
+    fixture.write(
+        &a,
+        "star-one.txt",
+        "FROM-A\nline 2\nline 3\nline 4\nline 5\n",
+    );
+    std::fs::File::open(&sibling_a)
+        .expect("open rewritten sibling")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(indexed_time)
+                .set_modified(indexed_time),
+        )
+        .expect("restore sibling times");
+    fixture.write(&a, "star*.txt", "literal changed\n");
+
+    fixture.write(
+        &b,
+        "star-one.txt",
+        "FROM-B\nline 2\nline 3\nline 4\nline 5\n",
+    );
+    fixture.commit_all(&b, "edit sibling");
+
+    let result = verdicts(&a, &b, &["star-one.txt"]);
+    assert_eq!(
+        result,
+        vec![("star-one.txt".to_string(), false)],
+        "a glob-shaped status path must not re-read an unrelated sibling"
+    );
+}
+
+#[test]
 fn same_line_edits_inside_a_submodule_are_a_conflict() {
     let fixture = Fixture::new("dirty-submodule-conflict");
     let (_superproject, first, second, first_submodule) =
