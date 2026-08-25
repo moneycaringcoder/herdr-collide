@@ -7,19 +7,6 @@ Anything that lands here is measured against the rule the plugin exists for:
 **overlap is not conflict**, and a prediction that cannot be made must say so
 rather than be downgraded into a quieter answer that looks the same as good news.
 
-## Closing the blind spots
-
-### Decide the repository root by rule rather than by fallback
-
-Rule 1 of the repository-root agreement joins `.git` to a worktree's top level and
-compares the result against the repository key. Under `--separate-git-dir` that
-path is a gitfile naming the store rather than the store itself, so the rule cannot
-fire and the root is settled by the deterministic fallback instead. The fixtures in
-`tests/repo_layout.rs` pin the current answer, which is right for every layout
-tested — but right by fallback, not by the rule written to decide it. The doc
-comment on `agree_on_repo_root` still claims rule 1 covers that layout, and is
-wrong in the same place.
-
 ## Platforms
 
 ### Windows
