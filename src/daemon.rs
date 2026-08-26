@@ -39,18 +39,13 @@ pub const MAX_LOG_BYTES: u64 = 1 << 20;
 /// attempts are exempt because no toast appeared and the edge is still pending.
 pub const NOTIFICATION_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Which token names this plugin believes herdr is currently rendering, per
-/// workspace.
+/// Workspaces on which this daemon successfully lit a badge.
 ///
-/// A *set* per workspace, not one name, because a clear that herdr did not
-/// confirm has to stay on the list. One name per workspace could not express
-/// that: on a severity flip whose clear failed and whose set succeeded, the new
-/// name overwrote the old one, and the old token — which herdr was still
-/// rendering — was never cleared again. Two collide badges on one workspace,
-/// which is precisely what the one-token-per-workspace design exists to prevent.
-/// With a set, the unconfirmed name stays and `badge_plan` reissues its clear on
-/// the next cycle.
-pub type LitTokens = BTreeMap<String, BTreeSet<String>>;
+/// The token name no longer belongs in cross-cycle state. Every update sends
+/// all collide token names in one atomic merge patch, clearing the inactive
+/// names and setting the selected one. Tracking only workspace ids is enough to
+/// clear a badge when its workspace drops out of the next report.
+pub type ActiveBadges = BTreeSet<String>;
 
 /// Last handled severity per workspace. `BTreeMap` makes edge planning stable
 /// even if a caller hands in statuses in a different order.
@@ -242,10 +237,10 @@ pub fn restore() -> Result<()> {
 pub fn run(config: &Config) -> Result<()> {
     write_pid(std::process::id());
 
-    // Which token names are currently lit per workspace. A severity flip has to
-    // clear the old name before setting the new one, or herdr renders two
-    // badges at once — the merge patch only touches names we mention.
-    let active: Arc<Mutex<LitTokens>> = Arc::new(Mutex::new(LitTokens::new()));
+    // Workspaces on which this daemon successfully lit a badge. Each refresh
+    // atomically patches every collide token name, so no per-token recovery
+    // state is needed.
+    let active: Arc<Mutex<ActiveBadges>> = Arc::new(Mutex::new(ActiveBadges::new()));
     let stopping = Arc::new(AtomicBool::new(false));
     spawn_signal_thread(Arc::clone(&active), Arc::clone(&stopping))?;
 
@@ -401,7 +396,7 @@ fn cap_log() {
 fn refresh(
     client: &mut Herdr,
     config: &Config,
-    active: &Mutex<LitTokens>,
+    active: &Mutex<ActiveBadges>,
     reported_notes: &mut Vec<String>,
     conflict_history: &mut crate::history::EpisodeTracker,
     notification_state: &mut NotificationState,
@@ -667,222 +662,160 @@ fn checkout_line(checkout: &crate::model::Checkout, prefix: &str) -> String {
     )
 }
 
-/// One badge call to make.
+/// One atomic workspace metadata patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BadgeOp {
-    Clear {
-        workspace_id: String,
-        token: String,
-    },
-    Set {
-        workspace_id: String,
-        token: &'static str,
-        text: String,
-    },
+pub struct BadgePatch {
+    pub workspace_id: String,
+    pub tokens: BTreeMap<String, Option<String>>,
+    pub ttl_ms: Option<u64>,
 }
 
-/// Turns "what is lit now" plus "what this cycle found" into the calls that
-/// close the gap. Pure, so the ordering rules below are testable without a
-/// socket:
+impl BadgePatch {
+    fn lights_badge(&self) -> bool {
+        self.tokens.values().any(Option::is_some)
+    }
+}
+
+fn cleared_badges() -> BTreeMap<String, Option<String>> {
+    Severity::ALL_TOKENS
+        .into_iter()
+        .map(|token| (token.to_string(), None))
+        .collect()
+}
+
+/// Turns the workspaces previously lit plus this cycle's statuses into one
+/// atomic metadata patch per workspace.
 ///
-/// * A severity flip clears the old token name *before* setting the new one.
-///   Tokens are a merge patch, so an unmentioned name stays lit and herdr would
-///   render two badges for one workspace.
-/// * `render::badge` is the single author of badge text, and it renders a clean
-///   workspace as the empty string. An empty value is a clear, never a draw:
-///   setting it would occupy the row with nothing.
-/// * A workspace that dropped out of the report — closed, or no longer a repo —
-///   is cleared rather than left to expire.
-pub fn badge_plan(active: &LitTokens, statuses: &[crate::model::WorkspaceStatus]) -> Vec<BadgeOp> {
-    let mut ops = Vec::new();
+/// Every non-clean workspace is re-patched each cycle so its TTL never lapses.
+/// A clean workspace is patched only when a previous cycle lit it. A workspace
+/// that left the report receives the same all-clear patch.
+pub fn badge_plan(
+    active: &ActiveBadges,
+    statuses: &[crate::model::WorkspaceStatus],
+    ttl_ms: u64,
+) -> Vec<BadgePatch> {
+    let mut patches = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
 
     for status in statuses {
         let text = crate::render::badge(status);
-        let token = status.severity.token_name();
-        let next = if text.is_empty() { None } else { Some(token) };
         seen.insert(status.workspace_id.as_str());
-
-        // Every name believed lit that is not the one we want now. Usually zero
-        // or one; more than one only when a previous cycle's clear was not
-        // confirmed, which is exactly the case that must not be forgotten.
-        if let Some(lit) = active.get(&status.workspace_id) {
-            for token in lit.iter().filter(|lit| Some(lit.as_str()) != next) {
-                ops.push(BadgeOp::Clear {
-                    workspace_id: status.workspace_id.clone(),
-                    token: token.clone(),
-                });
-            }
-        }
-        if let Some(token) = next {
-            ops.push(BadgeOp::Set {
-                workspace_id: status.workspace_id.clone(),
-                token,
-                // Re-sent every cycle even when unchanged: the TTL is what makes
-                // the badge self-heal, and it only refreshes on a write.
-                text,
-            });
-        }
-    }
-
-    // Workspaces that dropped out of the report entirely. `LitTokens` is a
-    // `BTreeMap` of `BTreeSet`s, so this order is already deterministic for both
-    // tests and logs.
-    for (workspace_id, lit) in active {
-        if seen.contains(workspace_id.as_str()) {
+        if text.is_empty() && !active.contains(&status.workspace_id) {
             continue;
         }
-        for token in lit {
-            ops.push(BadgeOp::Clear {
+
+        let mut tokens = cleared_badges();
+        let patch_ttl = if text.is_empty() {
+            None
+        } else {
+            tokens.insert(status.severity.token_name().to_string(), Some(text));
+            Some(ttl_ms)
+        };
+        patches.push(BadgePatch {
+            workspace_id: status.workspace_id.clone(),
+            tokens,
+            ttl_ms: patch_ttl,
+        });
+    }
+
+    for workspace_id in active {
+        if !seen.contains(workspace_id.as_str()) {
+            patches.push(BadgePatch {
                 workspace_id: workspace_id.clone(),
-                token: token.clone(),
+                tokens: cleared_badges(),
+                ttl_ms: None,
             });
         }
     }
 
-    ops
+    patches
 }
 
-/// Executes a badge plan. Errors are reported per call and the cycle continues:
-/// a swallowed push failure renders as a blank badge with nothing to debug, and
-/// one bad workspace must not cost every other one its badge.
+/// Executes a badge plan. Errors are reported per workspace and the cycle
+/// continues, so one closed or broken workspace never costs every other badge.
 fn push(
     client: &mut Herdr,
     config: &Config,
     statuses: &[crate::model::WorkspaceStatus],
-    active: &Mutex<LitTokens>,
+    active: &Mutex<ActiveBadges>,
 ) {
-    let ttl_ms = config.ttl_ms();
     let previous = lock(active).clone();
-    let plan = badge_plan(&previous, statuses);
+    let plan = badge_plan(&previous, statuses, config.ttl_ms());
 
     let mut results = Vec::with_capacity(plan.len());
-    for op in plan {
-        let outcome = match &op {
-            BadgeOp::Clear {
-                workspace_id,
-                token,
-            } => report_error(
-                client.clear_badge(workspace_id, token),
-                workspace_id,
-                token,
-                "clear",
-            ),
-            BadgeOp::Set {
-                workspace_id,
-                token,
-                text,
-            } => report_error(
-                client.set_badge(workspace_id, token, text, ttl_ms),
-                workspace_id,
-                token,
-                "set",
-            ),
-        };
-        results.push((op, outcome));
+    for patch in plan {
+        let outcome = report_error(
+            client.patch_badges(&patch.workspace_id, &patch.tokens, patch.ttl_ms),
+            &patch.workspace_id,
+            "patch badges",
+        );
+        results.push((patch, outcome));
     }
 
     *lock(active) = next_active(&previous, &results);
 }
 
-/// What is lit after a cycle's calls have been made.
+/// What remains lit after the server has answered each atomic patch.
 ///
-/// Pure, because the rule it encodes is the one that keeps being got wrong.
-/// Twice, now. The first version rebuilt the map from the successful sets alone,
-/// so a set that *failed* erased the record of a token herdr was still rendering
-/// under its TTL. The second kept one name per workspace, so a set that
-/// *succeeded* overwrote the name of a token whose clear had failed — same two
-/// badges on one workspace, reached from the other side.
-///
-/// The rule, and now the data structure agrees with it: a name leaves a
-/// workspace's set only when herdr confirms its clear, or when the workspace has
-/// gone away and taken its badges with it. A successful set adds a name; it
-/// never removes one. A call that merely failed changes nothing at all, so the
-/// next cycle still knows what is lit and [`badge_plan`] reissues the clear.
-pub fn next_active(previous: &LitTokens, results: &[(BadgeOp, PushOutcome)]) -> LitTokens {
-    let mut lit = previous.clone();
-    for (op, outcome) in results {
-        match op {
-            BadgeOp::Clear {
-                workspace_id,
-                token,
-            } => {
-                if *outcome == PushOutcome::Failed {
-                    continue;
-                }
-                if let Some(names) = lit.get_mut(workspace_id) {
-                    names.remove(token);
-                    if names.is_empty() {
-                        lit.remove(workspace_id);
-                    }
-                }
+/// A successful patch has one complete answer: either it lit the selected
+/// token or cleared them all. A failed patch changes nothing, because Herdr may
+/// still be rendering the preceding cycle's value under its TTL.
+pub fn next_active(previous: &ActiveBadges, results: &[(BadgePatch, PushOutcome)]) -> ActiveBadges {
+    let mut active = previous.clone();
+    for (patch, outcome) in results {
+        match outcome {
+            PushOutcome::Done if patch.lights_badge() => {
+                active.insert(patch.workspace_id.clone());
             }
-            BadgeOp::Set {
-                workspace_id,
-                token,
-                ..
-            } => match outcome {
-                PushOutcome::Done => {
-                    lit.entry(workspace_id.clone())
-                        .or_default()
-                        .insert((*token).to_string());
-                }
-                // Nothing is lit on a workspace that no longer exists.
-                PushOutcome::Gone => {
-                    lit.remove(workspace_id);
-                }
-                // Leave whatever was already lit in place: herdr is still
-                // rendering it.
-                PushOutcome::Failed => {}
-            },
+            PushOutcome::Done | PushOutcome::Gone => {
+                active.remove(&patch.workspace_id);
+            }
+            PushOutcome::Failed => {}
         }
     }
-    lit
+    active
 }
 
-/// What one badge call did.
+/// What one badge patch did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushOutcome {
-    /// herdr accepted it.
+    /// Herdr accepted it.
     Done,
-    /// The workspace is gone, so whatever it was rendering is gone with it.
+    /// The workspace is gone, so whatever it rendered is gone too.
     Gone,
-    /// It failed and the token may well still be lit.
+    /// It failed and the previous badge may still be lit.
     Failed,
 }
 
-/// Logs a failed push. A workspace that closed under us is expected churn, not
-/// something to shout about — but it is still distinguished from a real
-/// failure, because "the badge is gone" and "the badge may still be lit" call
-/// for different bookkeeping.
-fn report_error(result: Result<()>, workspace_id: &str, token: &str, what: &str) -> PushOutcome {
+/// Logs a failed patch while treating a workspace that closed under us as
+/// expected churn.
+fn report_error(result: Result<()>, workspace_id: &str, what: &str) -> PushOutcome {
     match result {
         Ok(()) => PushOutcome::Done,
         Err(err) => {
             if herdr::error_code(&*err) == Some("workspace_not_found") {
                 return PushOutcome::Gone;
             }
-            eprintln!("collide: {what} {token} on {workspace_id} failed: {err}");
+            eprintln!("collide: {what} on {workspace_id} failed: {err}");
             PushOutcome::Failed
         }
     }
 }
 
-/// Clears every token this plugin owns on every current workspace.
+/// Clears every token this plugin owns on every current workspace, one atomic
+/// patch per workspace.
 fn sweep(client: &mut Herdr) -> Result<()> {
     let checkouts = client.checkouts()?;
+    let tokens = cleared_badges();
     let mut failures = 0usize;
     for checkout in &checkouts {
-        for token in Severity::ALL_TOKENS {
-            if report_error(
-                client.clear_badge(&checkout.workspace_id, token),
-                &checkout.workspace_id,
-                token,
-                "clear",
-            ) == PushOutcome::Failed
-            {
-                failures += 1;
-            }
+        if report_error(
+            client.patch_badges(&checkout.workspace_id, &tokens, None),
+            &checkout.workspace_id,
+            "clear badges",
+        ) == PushOutcome::Failed
+        {
+            failures += 1;
         }
     }
     if failures > 0 {
@@ -891,7 +824,7 @@ fn sweep(client: &mut Herdr) -> Result<()> {
     Ok(())
 }
 
-fn spawn_signal_thread(active: Arc<Mutex<LitTokens>>, stopping: Arc<AtomicBool>) -> Result<()> {
+fn spawn_signal_thread(active: Arc<Mutex<ActiveBadges>>, stopping: Arc<AtomicBool>) -> Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
@@ -908,24 +841,16 @@ fn spawn_signal_thread(active: Arc<Mutex<LitTokens>>, stopping: Arc<AtomicBool>)
 
 /// Clears everything this daemon lit, over its **own** connection so it never
 /// waits on the main loop's sleep or its in-flight round trip.
-fn shutdown(active: &Mutex<LitTokens>) {
-    let tracked: Vec<(String, String)> = lock(active)
-        .iter()
-        .flat_map(|(workspace_id, tokens)| {
-            tokens
-                .iter()
-                .map(|token| (workspace_id.clone(), token.clone()))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+fn shutdown(active: &Mutex<ActiveBadges>) {
+    let tracked: Vec<String> = lock(active).iter().cloned().collect();
+    let tokens = cleared_badges();
     match Herdr::connect() {
         Ok(mut client) => {
-            for (workspace_id, token) in tracked {
+            for workspace_id in tracked {
                 let _ = report_error(
-                    client.clear_badge(&workspace_id, &token),
+                    client.patch_badges(&workspace_id, &tokens, None),
                     &workspace_id,
-                    &token,
-                    "clear",
+                    "clear badges",
                 );
             }
         }
