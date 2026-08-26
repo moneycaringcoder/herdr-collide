@@ -29,6 +29,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Terminal width and truncation now use maintained Unicode width tables and
+  extended grapheme boundaries instead of a hand-written scalar-range table.
+  Skin-tone emoji, ZWJ families, regional-indicator flags, Hebrew points, Thai
+  marks, and future Unicode table updates can no longer be split or
+  under-counted into a line that wraps the redraw-in-place detail pane.
 - Herdr-invoked reports, JSON snapshots, `--why`, and the live detail pane now
   honor `HERDR_WORKSPACE_ID` and show only sibling worktrees from that
   workspace's verified repository, matching their manifest descriptions.

@@ -14,7 +14,8 @@ use collide::model::{
     SharedFile, TargetPrediction, TargetVerdict, WorkspaceStatus,
 };
 use collide::render::{
-    abbreviate, abbreviate_files, badge, detail, detail_at, detail_with_notes, BADGE_COLUMNS,
+    abbreviate, abbreviate_files, badge, detail, detail_at, detail_with_notes, display_width,
+    truncate_left, truncate_right, BADGE_COLUMNS,
 };
 // Only the degradation reason codes: the tests build the strings git would
 // write, so that a renamed code fails here rather than silently rendering raw.
@@ -28,10 +29,11 @@ use collide::git;
 // set. That distinction is the whole point of it.
 //
 // The previous oracle was a range algorithm, written from the same reading of
-// the same blocks as `render::char_columns` — and so it inherited exactly the
-// same gaps. `🚀` measured one column in both, and a line that occupied 41
-// columns in a real terminal sailed through an assertion that it fit in 40. Two
-// implementations that share an assumption test the assumption once, not twice.
+// the same blocks as the renderer's former hand-maintained width table — and so
+// it inherited exactly the same gaps. `🚀` measured one column in both, and a
+// line that occupied 41 columns in a real terminal sailed through an assertion
+// that it fit in 40. Two implementations that share an assumption test the
+// assumption once, not twice.
 //
 // A table cannot share a gap. Every non-ASCII scalar the fixtures produce has to
 // be declared here with a hand-checked width, and a scalar nobody has declared
@@ -42,8 +44,14 @@ use collide::git;
 /// first. A base scalar followed by U+FE0F takes *emoji* presentation, which is
 /// two columns even where the bare scalar is one.
 const SEQUENCE_WIDTHS: &[(&str, usize)] = &[
-    ("\u{26a0}\u{fe0f}", 2), // ⚠️ warning sign, emoji presentation
-    ("\u{2764}\u{fe0f}", 2), // ❤️ heavy black heart, emoji presentation
+    (
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+        2,
+    ), // 👨‍👩‍👧‍👦
+    ("\u{1f44d}\u{1f3fd}", 2), // 👍🏽 thumbs up + skin tone
+    ("\u{1f1fa}\u{1f1f8}", 2), // 🇺🇸 regional-indicator pair
+    ("\u{26a0}\u{fe0f}", 2),   // ⚠️ warning sign, emoji presentation
+    ("\u{2764}\u{fe0f}", 2),   // ❤️ heavy black heart, emoji presentation
 ];
 
 /// Width of every non-ASCII scalar these fixtures can produce, hand-checked
@@ -63,6 +71,11 @@ const WIDTHS: &[(char, usize)] = &[
     ('\u{ef}', 1),  // ï
     ('\u{301}', 0), // COMBINING ACUTE ACCENT
     ('\u{308}', 0), // COMBINING DIAERESIS
+    // --- combining scripts outside the former four hand-maintained blocks ---
+    ('\u{5e9}', 1), // ש HEBREW LETTER SHIN
+    ('\u{5b8}', 0), // HEBREW POINT QAMATS
+    ('\u{e01}', 1), // ก THAI CHARACTER KO KAI
+    ('\u{e34}', 0), // THAI CHARACTER SARA I
     // --- emoji that are wide with no selector ---
     ('\u{1f680}', 2), // 🚀 ROCKET — Wide
     ('\u{2b50}', 2),  // ⭐ WHITE MEDIUM STAR — Wide
@@ -963,6 +976,37 @@ fn a_variation_selector_is_measured_as_the_emoji_it_selects() {
             columns(line)
         );
     }
+}
+
+#[test]
+fn maintained_widths_cover_complex_emoji_and_combining_scripts() {
+    for (text, expected) in [
+        ("\u{1f44d}\u{1f3fd}", 2), // 👍🏽
+        (
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+            2,
+        ), // 👨‍👩‍👧‍👦
+        ("\u{1f1fa}\u{1f1f8}", 2), // 🇺🇸
+        ("\u{5e9}\u{5b8}", 1),     // שָ
+        ("\u{e01}\u{e34}", 1),     // กิ
+    ] {
+        assert_eq!(display_width(text), expected, "{text:?}");
+        assert_eq!(columns(text), expected, "independent oracle: {text:?}");
+    }
+}
+
+#[test]
+fn truncation_never_splits_a_grapheme_cluster() {
+    let toned = "ab\u{1f44d}\u{1f3fd}cd";
+    assert_eq!(truncate_right(toned, 5), "ab\u{1f44d}\u{1f3fd}\u{2026}");
+    assert_eq!(truncate_left(toned, 5), "\u{2026}\u{1f44d}\u{1f3fd}cd");
+
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}yz";
+    assert_eq!(
+        truncate_right(family, 3),
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}\u{2026}"
+    );
+    assert_eq!(truncate_right(family, 2), "\u{2026}");
 }
 
 #[test]
