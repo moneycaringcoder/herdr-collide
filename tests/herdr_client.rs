@@ -1020,6 +1020,8 @@ fn a_failed_refresh_is_written_to_the_daemon_diagnostic_stream() {
     let _guard = env_lock();
     let server = TestServer::start(vec![Reply::Eof, Reply::Eof]);
     let dirs = scratch_dir("refresh-diagnostic");
+    let stderr_path = dirs.join("daemon.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create diagnostic file");
     let mut child = Command::new(env!("CARGO_BIN_EXE_collide"))
         .args(["--daemon", "--interval", "1"])
         .env("HERDR_SOCKET_PATH", &server.path)
@@ -1028,18 +1030,28 @@ fn a_failed_refresh_is_written_to_the_daemon_diagnostic_stream() {
         .env("HERDR_PLUGIN_STATE_DIR", &dirs)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .expect("start foreground daemon");
 
-    let deadline = Instant::now() + Duration::from_secs(4);
-    while server.requests().len() < 2 && Instant::now() < deadline {
+    // Synchronise on the contract this test defends, not on the server seeing
+    // the request. TestServer records a request before it closes the socket, so
+    // killing at request count two can race the daemon between receiving EOF
+    // and writing its diagnostic.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stderr = loop {
+        let current = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if current.contains("collide: refresh failed:") || Instant::now() >= deadline {
+            break current;
+        }
         std::thread::sleep(Duration::from_millis(10));
-    }
+    };
     let _ = child.kill();
-    let output = child.wait_with_output().expect("collect daemon output");
+    let _ = child.wait();
+    if !stderr.contains("collide: refresh failed:") {
+        stderr = std::fs::read_to_string(&stderr_path).expect("read diagnostic file");
+    }
     let _ = std::fs::remove_dir_all(&dirs);
-    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
 
     assert!(
         server.requests().len() >= 2,
