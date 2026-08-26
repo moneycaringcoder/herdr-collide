@@ -460,6 +460,23 @@ pub fn repo_key(checkout: &Path, timeout: Duration) -> Result<RepoKey> {
     let canonical = fs::canonicalize(&raw).unwrap_or(raw);
     Ok(RepoKey(canonical.to_string_lossy().into_owned()))
 }
+/// Resolves the checkout's working-tree root through the same bounded process
+/// boundary as every other Git query.
+///
+/// A filesystem walk using `canonicalize` and `Path::exists` has no deadline:
+/// on a stalled mount it can freeze the refresh loop after every Git child has
+/// otherwise been bounded correctly. Git already owns top-level discovery, so
+/// keep the answer and the timeout in one place.
+pub fn work_tree_root(checkout: &Path, timeout: Duration) -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        git_ok(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+            timeout,
+        )?
+        .stdout_trimmed(),
+    ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadState {
@@ -1000,7 +1017,22 @@ fn filter_overrides_with_env(
 /// Pass [`NO_INTEGRATION_REF`] as `base` when there is no integration ref to
 /// measure against; the result is a visibly degraded change set rather than a
 /// silently empty one.
+/// One checkout read, including the top level Git resolved while assembling
+/// untracked-file volume. The gathering layer reuses this answer for same-tree
+/// suppression instead of walking the filesystem a second time without a
+/// deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSetRead {
+    pub change_set: ChangeSet,
+    pub top_level: PathBuf,
+}
+
+/// Compatibility wrapper for callers that only need the change set.
 pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<ChangeSet> {
+    Ok(read_change_set(checkout, base, timeout)?.change_set)
+}
+
+pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<ChangeSetRead> {
     let mut kinds: BTreeMap<String, ChangeKind> = BTreeMap::new();
     // Line volume is attributed per path so an ignored path takes its lines
     // with it rather than leaving them to trip the runaway threshold alone.
@@ -1171,14 +1203,7 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
     // *root*, never to git's working directory, so a `checkout` that points at a
     // subdirectory would turn every disk read into `<root>/pkg/pkg/file` and
     // silently count zero lines. Resolve the top level once and join against it.
-    let top_level = PathBuf::from(
-        git_ok(
-            checkout,
-            &["rev-parse", "--path-format=absolute", "--show-toplevel"],
-            timeout,
-        )?
-        .stdout_trimmed(),
-    );
+    let top_level = work_tree_root(checkout, timeout)?;
 
     // Untracked files are invisible to every `diff`, so count them from disk.
     for entry in &entries {
@@ -1220,7 +1245,10 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
         set.degraded = true;
         set.degraded_reason = Some(reasons.join("; "));
     }
-    Ok(set)
+    Ok(ChangeSetRead {
+        change_set: set,
+        top_level,
+    })
 }
 
 /// Attributes one `--numstat` record's line counts to the path it describes.
