@@ -35,6 +35,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ordinary return and by a panic hook because the release profile aborts
   without running destructors; a process-level regression sends a real SIGHUP
   and asserts the emitted terminal cleanup bytes.
+- The daemon diagnostic integration test now waits for the failure text in its
+  dedicated stderr file instead of killing the process as soon as the fake
+  server records the second request. The server records before closing the
+  socket, so the old synchronization could kill the daemon between receiving
+  EOF and writing the diagnostic, intermittently failing slower macOS CI.
 - Terminal width and truncation now use maintained Unicode width tables and
   extended grapheme boundaries instead of a hand-written scalar-range table.
   Skin-tone emoji, ZWJ families, regional-indicator flags, Hebrew points, Thai
