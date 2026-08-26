@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Badge refreshes now send one atomic `workspace.report_metadata` patch per
+  workspace, clearing every inactive collide token and setting the selected
+  token together. Severity flips can no longer fail between a clear and a set
+  and briefly render two badges; unchanged badges still refresh their TTL, and
+  disable/shutdown sweeps now clear all owned names in one call per workspace.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed

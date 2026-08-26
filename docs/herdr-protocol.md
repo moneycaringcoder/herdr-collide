@@ -167,10 +167,17 @@ state labels, no display agent.
 ```json
 {"id":"collide:7","method":"workspace.report_metadata","params":{
   "workspace_id":"w6","source":"moneycaringcoder.collide",
-  "tokens":{"collide_conflict":"✘ 2"},"ttl_ms":15000}}
+  "tokens":{
+    "collide_conflict":"✘ 2",
+    "collide_overlap":null,
+    "collide_runaway":null,
+    "collide_unknown":null
+  },"ttl_ms":15000}}
 ```
 
-Clearing: send the token name with a `null` value, and **omit `ttl_ms`**.
+Every update names all collide tokens in one merge patch. A non-clean update
+clears the inactive names and sets one value with `ttl_ms`; an all-clear patch
+sets every name to `null` and omits `ttl_ms`.
 
 Semantics:
 
@@ -206,9 +213,9 @@ and the daemon treats that as "clear" rather than as an empty badge, so there is
 no `collide_clean` row for the user to configure. The disable sweep still clears
 that name defensively, which costs nothing.
 
-Each gets its own `fg` in the user's config. Track which name is currently
-active per workspace so a severity flip clears the previous name first —
-otherwise two badges light at once.
+Each gets its own `fg` in the user's config. Clear every inactive name and set
+the selected one in the same metadata patch. Herdr applies that mutation
+atomically, so a severity flip cannot fail halfway through and light two names.
 
 ### `pane.report_agent` / `pane.release_agent` — opt-in mode only
 
@@ -425,27 +432,21 @@ fall out of that test for free.
 
 ### What is lit, and what a failed push means
 
-The daemon tracks the token names it believes herdr is rendering, **as a set per
-workspace**. A name may only leave that set when herdr *confirms* its clear, or
-when the workspace is gone (`workspace_not_found`). A successful set adds a
-name; it never removes one.
+The daemon tracks only the workspace ids on which a patch successfully lit a
+badge. Token names need no cross-cycle state: every successful patch is a
+complete statement of this plugin's state for that workspace, clearing all
+inactive names and setting at most one active name.
 
-One name per workspace is not enough to express the rule, and this took two
-attempts to get right — both failing the same way, from opposite sides:
+A failed patch changes nothing in the daemon's record because Herdr may still
+be rendering the preceding cycle's badge under its TTL. The next cycle retries
+the complete patch. A successful all-clear, or `workspace_not_found`, removes
+the workspace id. A workspace that drops out of the report receives one
+all-clear patch rather than one request per token.
 
-- Rebuilding the record from the successful **sets** alone loses the record of a
-  token herdr is still rendering under its TTL, so the next severity flip emits
-  no clear for it.
-- Keeping one name and overwriting it on a successful set loses the record of a
-  token whose **clear** failed. On a flip the plan is `[Clear(old), Set(new)]`;
-  if the clear does not take and the set does, herdr is rendering both, and
-  overwriting means nothing ever clears the old one.
-
-Either way: two collide tokens lit on one workspace, which is the exact failure
-the one-token-per-workspace design exists to prevent. With a set, an unconfirmed
-name stays on the list and the next plan reissues its clear. A workspace that
-drops out of the report has *every* name it holds cleared, not just the last one
-recorded.
+This atomic shape replaces the earlier clear-then-set protocol. That protocol
+needed a set of possibly lit names per workspace because the clear could fail
+while the set succeeded, leaving two names live. One metadata patch has no such
+partial state and removes that recovery machinery entirely.
 
 ## Plugin execution environment
 
