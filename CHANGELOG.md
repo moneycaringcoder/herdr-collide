@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `cargo bench --bench gather_cost`, a dependency-free manual benchmark for
+  complete collision cycles over 2, 4, 8, and 16 dirty worktrees, a predicted
+  conflict, and dirty direct-submodule contents. Every case asserts its verdict
+  before timing and reports its worktree, pair, and sample counts; timings stay
+  advisory rather than becoming a noisy shared-runner gate.
+
+### Changed
+
+- Repository-identity and branch probes now fan out across at most eight
+  checkout-verification workers, then restore Herdr snapshot order before
+  analysis. The later `status` pass remains sequential; only the lock-free
+  probes run concurrently, so sessions with many worktrees spend less wall time
+  before change-set collection without adding index contention.
+- Badge refreshes now send one atomic `workspace.report_metadata` patch per
+  workspace, clearing every inactive collide token and setting the selected
+  token together. Severity flips can no longer fail between a clear and a set
+  and briefly render two badges; unchanged badges still refresh their TTL, and
+  disable/shutdown sweeps now clear all owned names in one call per workspace.
+
 ### Fixed
 
 - Closing the live detail overlay with `SIGHUP` now follows the same
@@ -14,6 +35,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ordinary return and by a panic hook because the release profile aborts
   without running destructors; a process-level regression sends a real SIGHUP
   and asserts the emitted terminal cleanup bytes.
+- Terminal width and truncation now use maintained Unicode width tables and
+  extended grapheme boundaries instead of a hand-written scalar-range table.
+  Skin-tone emoji, ZWJ families, regional-indicator flags, Hebrew points, Thai
+  marks, and future Unicode table updates can no longer be split or
+  under-counted into a line that wraps the redraw-in-place detail pane.
+- Herdr-invoked reports, JSON snapshots, `--why`, and the live detail pane now
+  honor `HERDR_WORKSPACE_ID` and show only sibling worktrees from that
+  workspace's verified repository, matching their manifest descriptions.
+  Direct shell invocations without workspace context remain session-wide. A
+  stale or non-repository invocation id fails visibly instead of selecting an
+  unrelated repository.
+- Worktree-root discovery now reuses Git's timed `--show-toplevel` result from
+  change-set collection instead of performing a second, unbounded
+  `canonicalize` and ancestor walk in the daemon thread. A slow filesystem can
+  therefore fail through the configured Git deadline and become a visible
+  unreadable checkout rather than freezing every badge refresh.
 
 ## [0.1.2] - 2026-08-25
 

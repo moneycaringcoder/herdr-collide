@@ -523,6 +523,13 @@ it fails loudly one step earlier.
 
 ## Cost, and the resulting pipeline
 
+Run `cargo bench --bench gather_cost` to rebuild the representative outer
+worktree, predicted-conflict, and dirty-submodule fixtures and measure complete
+`gather_for` cycles. Every case asserts its verdict before timing, reports the
+worktree/pair/sample counts, and uses the shipped size-optimised profile. The
+numbers are diagnostic rather than a CI gate: shared runners and filesystem
+caches are too noisy for a stable threshold.
+
 | command | ms |
 |---|---|
 | `worktree list --porcelain` | 1 |

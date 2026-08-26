@@ -223,6 +223,12 @@ There is one pane, **Collide: shared files**, placed as an overlay. It runs the 
 above and refreshes on the configured interval. Close it the way you close any herdr overlay; it exits
 cleanly on `SIGINT`, `SIGTERM`, and `SIGHUP`, and restores the cursor on every return and panic path.
 
+Herdr supplies the invoking workspace to the report, JSON action, and detail
+pane. Those surfaces include every sibling worktree of that workspace's
+verified repository and no other repository. Running the binary from a shell
+with no `HERDR_WORKSPACE_ID` keeps the session-wide view, which is useful for
+scripts that intentionally inspect everything.
+
 The badge updater is off until you enable it. Once enabled it survives a herdr restart and a
 `herdr update --handoff`: a startup hook re-spawns it, but only if you had it enabled when herdr went
 away. Disabling it stops the updater, waits for it to finish, and then sweeps every current workspace
