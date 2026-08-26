@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Terminal width and truncation now use maintained Unicode width tables and
+  extended grapheme boundaries instead of a hand-written scalar-range table.
+  Skin-tone emoji, ZWJ families, regional-indicator flags, Hebrew points, Thai
+  marks, and future Unicode table updates can no longer be split or
+  under-counted into a line that wraps the redraw-in-place detail pane.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed
