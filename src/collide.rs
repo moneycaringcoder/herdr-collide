@@ -293,29 +293,29 @@ pub fn apply_predictions(
         //   though `status` — which is what the change set is built from —
         //   correctly reports the worktree clean.
         //
-        // The second would report a conflict on a file neither agent touched,
-        // which is a false alarm of exactly the kind this plugin exists to
-        // avoid raising. So an unlisted path is only believed when a rename
-        // could explain it, or when a change set lists it after all.
+        // The second would report a conflict on a file only one agent touched,
+        // which is impossible without a rename: Git can take that side directly.
+        // So an unlisted path is believed only when both change sets list it,
+        // or when a rename can explain why their names differ.
         //
-        // Pair-level rename evidence still cannot say which conflict a rename
-        // explains. An unlisted path is therefore a guess unless merge-tree
-        // attached a rename-type record to that exact path. The former remains
-        // approximate; the latter is git's precise attribution and should not
-        // be weakened.
+        // Pair-level rename evidence still cannot say which wholly unlisted
+        // conflict a rename explains. Such a path remains a guess unless
+        // merge-tree attached a rename-type record to that exact path. A path
+        // one rename change set names is not guessed; its destination is a
+        // recorded fact even when the other side still names the source.
         let renamed = pair_changes
             .get(key.0)
             .is_some_and(|c: &&ChangeSet| c.has_rename)
             || pair_changes
                 .get(key.1)
                 .is_some_and(|c: &&ChangeSet| c.has_rename);
-        let listed = |path: &str| {
-            [key.0, key.1].iter().any(|id| {
-                pair_changes
-                    .get(id)
-                    .is_some_and(|c| c.paths.iter().any(|p| p.path == path))
-            })
+        let listed_by = |id: &str, path: &str| {
+            pair_changes
+                .get(id)
+                .is_some_and(|change| change.paths.iter().any(|changed| changed.path == path))
         };
+        let listed_by_both = |path: &str| [key.0, key.1].iter().all(|id| listed_by(id, path));
+        let listed_by_either = |path: &str| [key.0, key.1].iter().any(|id| listed_by(id, path));
         let mut guessed = false;
         let mut extra: Vec<(String, Option<String>)> = Vec::new();
         for (path, hit) in &prediction.verdicts {
@@ -330,10 +330,10 @@ pub fn apply_predictions(
                 continue;
             }
             let conflict_type = attributed_conflict_type(path);
-            if listed(path) {
+            if listed_by_both(path) {
                 extra.push((path.clone(), conflict_type));
             } else if renamed {
-                guessed |= conflict_type.is_none();
+                guessed |= conflict_type.is_none() && !listed_by_either(path);
                 extra.push((path.clone(), conflict_type));
             }
         }

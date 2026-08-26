@@ -29,6 +29,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A scratch-only content-filter artifact can no longer become a conflict on a
+  path only one agent changed. Conflict paths outside the initial intersection
+  are now admitted only when both authoritative change sets list them or a
+  rename explains the name mismatch. This contains the documented
+  stat-dirty/content-identical filtered-file false positive while retaining
+  exact rename conflicts and the no-filter read-only guarantee.
 - Closing the live detail overlay with `SIGHUP` now follows the same
   signal-flag shutdown path as `SIGINT` and `SIGTERM`, so the process restores
   the hidden cursor before exiting. Cursor restoration is guarded on every

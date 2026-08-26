@@ -2985,18 +2985,20 @@ fn an_ignored_path_cannot_return_as_an_unlisted_conflict() {
     }
 }
 
-/// The other direction, so the test above is measuring the ignore filter and not
-/// a broken unlisted-path rule: a path that is *not* ignored and that a change
-/// set does list is believed.
+/// A conflict path listed by only one side is impossible without a rename: the
+/// other side is unchanged from the merge base and Git can take the changed
+/// side directly. The scratch snapshot can nevertheless manufacture this shape
+/// when a stat-dirty, content-identical filtered file is re-hashed with filters
+/// disabled. It must not become a user-visible conflict.
 #[test]
-fn a_listed_unignored_path_still_returns_as_a_conflict() {
+fn a_path_listed_by_only_one_side_is_not_admitted_without_a_rename() {
     let checkouts = vec![
         checkout("one", Path::new("/tmp/one"), "/repo/.git"),
         checkout("two", Path::new("/tmp/two"), "/repo/.git"),
     ];
     // `vendor/notes.md` is listed by one side only, so it is not in the
-    // intersection and not in the pairing — but it is a real path, not an
-    // ignored one.
+    // intersection. The synthetic prediction is the exact filtered-snapshot
+    // artifact documented in `docs/git-plumbing.md`.
     let changes = vec![
         (
             "one".to_string(),
@@ -3025,9 +3027,8 @@ fn a_listed_unignored_path_still_returns_as_a_conflict() {
         .iter()
         .map(|s| s.path.as_str())
         .collect();
-    assert_eq!(paths, vec!["src/a.rs", "vendor/notes.md"]);
-    assert_eq!(status_of(&report, "one").severity, Severity::Conflict);
-    // Listed is a fact, not a guess, so nothing about this is approximate.
+    assert_eq!(paths, vec!["src/a.rs"]);
+    assert_eq!(status_of(&report, "one").severity, Severity::Overlap);
     assert!(!report.pairings[0].approximate);
 }
 

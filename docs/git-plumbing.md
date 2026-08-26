@@ -108,7 +108,7 @@ git config --name-only --get-regexp '^filter\.'   # exit 1 when there are none
 Strip `filter.` and the trailing `.clean`/`.smudge`/`.process`/`.required`; a
 driver name may itself contain dots, so strip from the right.
 
-### What that costs, and the one case it gets wrong
+### What that costs, and how the false-conflict shape is contained
 
 The snapshot tree then holds raw bytes for any filtered path `add` had to
 re-hash — for LFS the media rather than a pointer — while anything the seeded
@@ -122,14 +122,18 @@ changes nothing: the diff is binary either way and `--numstat` reports `-`, whic
 counts zero. For a text-transforming filter it overstates that path's volume,
 which the runaway thresholds treat as an order-of-magnitude signal anyway.
 
-**Known limitation.** A filtered path that is stat-dirty but content-identical is
-re-hashed to raw bytes and therefore looks modified against a base holding the
-filtered blob. Demonstrated with an LFS-shaped filter and a `touch`: `status`
-reports the worktree clean, the snapshot tree differs from HEAD for that path.
-If the sibling worktree genuinely changed the same file, the pair is reported as
-conflicting on a file one side never touched. Closing this needs the `add`
-scoped to the paths `status` reported, which needs the raw path bytes the change
-set does not keep — it renders paths as `String`.
+A filtered path that is stat-dirty but content-identical is still re-hashed to
+raw bytes and therefore looks modified inside the scratch tree against a base
+holding the filtered blob. Demonstrated with an LFS-shaped filter and a `touch`:
+`status` reports the worktree clean while the scratch tree differs from HEAD.
+
+That artifact is contained at the report boundary. A conflict path absent from
+the initial intersection is admitted only when **both** change sets list it, or
+when a rename explains why the names differ. If only the sibling lists the
+filtered path, the other side is unchanged by the authoritative status pass and
+Git could take the sibling directly; the scratch-only conflict is discarded.
+This closes the false alarm without retaining raw path bytes in the public
+change-set model or running repository content filters.
 
 ## Repo identity
 
@@ -631,8 +635,6 @@ every one of these commands.
   inside the direct submodule remain gitlinks and are not recursively opened.
   Work below a submodule still line-counts as zero, so it remains invisible to
   the runaway thresholds.
-- **A stat-dirty but content-identical filtered path can be reported as
-  conflicting.** See "What that costs, and the one case it gets wrong".
 
 ## Filename encoding differs by platform
 
