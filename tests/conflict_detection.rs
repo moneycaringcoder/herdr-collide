@@ -1725,6 +1725,43 @@ fn end_to_end_separates_the_conflicting_pair_from_the_clean_one() {
 }
 
 #[test]
+fn invocation_workspace_scopes_the_report_to_its_verified_repository() {
+    let fixture = Fixture::new("focused-repository");
+    let (left, right) = fixture.committed_conflict_pair();
+    let foreign = fixture.foreign_repo("foreign");
+    let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let foreign_key = git::repo_key(&foreign, TIMEOUT).unwrap();
+    let checkouts = vec![
+        checkout("left", &left, &key.0),
+        checkout("right", &right, &key.0),
+        checkout("foreign", &foreign, &foreign_key.0),
+    ];
+
+    let cycle = collide::collide::gather_for_workspace(checkouts.clone(), &config(), "left")
+        .expect("scoped gather");
+    assert_eq!(
+        cycle
+            .report
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.workspace_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["left", "right"])
+    );
+    assert_eq!(cycle.report.pairings.len(), 1);
+    assert_eq!(cycle.report.pairings[0].conflicts(), 1);
+
+    let err = collide::collide::gather_for_workspace(checkouts, &config(), "missing")
+        .err()
+        .expect("a stale invocation id must not select another repository");
+    assert!(
+        err.to_string()
+            .contains("invocation workspace `missing` is not a readable git-backed workspace"),
+        "{err}"
+    );
+}
+
+#[test]
 fn end_to_end_tolerates_degenerate_worktrees() {
     let fixture = Fixture::new("degenerate");
     let (ca, cb) = fixture.committed_conflict_pair();

@@ -16,6 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Herdr-invoked reports, JSON snapshots, `--why`, and the live detail pane now
+  honor `HERDR_WORKSPACE_ID` and show only sibling worktrees from that
+  workspace's verified repository, matching their manifest descriptions.
+  Direct shell invocations without workspace context remain session-wide. A
+  stale or non-repository invocation id fails visibly instead of selecting an
+  unrelated repository.
 - Worktree-root discovery now reuses Git's timed `--show-toplevel` result from
   change-set collection instead of performing a second, unbounded
   `canonicalize` and ancestor walk in the daemon thread. A slow filesystem can

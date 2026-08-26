@@ -679,7 +679,8 @@ fn gather_retained(config: &Config) -> Result<RetainedGather> {
     let mut herdr = crate::herdr::Herdr::connect()?;
     let checkouts = herdr.checkouts()?;
     let skipped = herdr.skipped_worktrees();
-    let mut gathered = gather_for_retained(checkouts, config)?;
+    let scope = crate::config::non_empty_env("HERDR_WORKSPACE_ID");
+    let mut gathered = gather_for_retained_scoped(checkouts, config, scope.as_deref())?;
     // A workspace herdr calls a repository but whose worktree object this client
     // could not read is dropped, which makes the session look smaller than it
     // is. The daemon reports that; so must the one-shot commands, which are what
@@ -721,7 +722,28 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
     Ok(gather_for_retained(checkouts, config)?.cycle)
 }
 
+/// Gathers only the verified repository containing `workspace_id`.
+///
+/// Herdr actions and pane entrypoints provide this id in their invocation
+/// environment. The daemon deliberately uses [`gather_for`] instead so its
+/// badges remain session-wide.
+pub fn gather_for_workspace(
+    checkouts: Vec<Checkout>,
+    config: &Config,
+    workspace_id: &str,
+) -> Result<Cycle> {
+    Ok(gather_for_retained_scoped(checkouts, config, Some(workspace_id))?.cycle)
+}
+
 fn gather_for_retained(checkouts: Vec<Checkout>, config: &Config) -> Result<RetainedGather> {
+    gather_for_retained_scoped(checkouts, config, None)
+}
+
+fn gather_for_retained_scoped(
+    checkouts: Vec<Checkout>,
+    config: &Config,
+    workspace_id: Option<&str>,
+) -> Result<RetainedGather> {
     let mut notes = Vec::new();
 
     // Repo identity is re-derived from git rather than trusted from herdr: two
@@ -749,6 +771,18 @@ fn gather_for_retained(checkouts: Vec<Checkout>, config: &Config) -> Result<Reta
                 checkout.checkout_path.display()
             )),
         }
+    }
+    if let Some(workspace_id) = workspace_id {
+        let repo_key = verified
+            .iter()
+            .find(|checkout| checkout.workspace_id == workspace_id)
+            .map(|checkout| checkout.repo_key.clone())
+            .ok_or_else(|| {
+                format!(
+                    "invocation workspace `{workspace_id}` is not a readable git-backed workspace"
+                )
+            })?;
+        verified.retain(|checkout| checkout.repo_key == repo_key);
     }
 
     // Filled from the top-level answer `read_change_set` already needs for
