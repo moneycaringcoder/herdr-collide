@@ -6,13 +6,68 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `cargo bench --bench gather_cost`, a dependency-free manual benchmark for
+  complete collision cycles over 2, 4, 8, and 16 dirty worktrees, a predicted
+  conflict, and dirty direct-submodule contents. Every case asserts its verdict
+  before timing and reports its worktree, pair, and sample counts; timings stay
+  advisory rather than becoming a noisy shared-runner gate.
+
 ### Changed
 
 - Rust 1.80 is now the declared and tested minimum toolchain while the existing
-  Linux/macOS jobs continue to test current stable. Every third-party GitHub
+  Linux/macOS jobs continue to test current stable; `unicode-segmentation` is
+  pinned to its Rust-1.80-compatible 1.12 release. Every third-party GitHub
   Action is pinned to the exact commit behind its reviewed major tag, checkout
   credentials are never persisted, and ordinary CI now declares read-only
   contents permission explicitly.
+- Repository-identity and branch probes now fan out across at most eight
+  checkout-verification workers, then restore Herdr snapshot order before
+  analysis. The later `status` pass remains sequential; only the lock-free
+  probes run concurrently, so sessions with many worktrees spend less wall time
+  before change-set collection without adding index contention.
+- Badge refreshes now send one atomic `workspace.report_metadata` patch per
+  workspace, clearing every inactive collide token and setting the selected
+  token together. Severity flips can no longer fail between a clear and a set
+  and briefly render two badges; unchanged badges still refresh their TTL, and
+  disable/shutdown sweeps now clear all owned names in one call per workspace.
+
+### Fixed
+
+- A scratch-only content-filter artifact can no longer become a conflict on a
+  path only one agent changed. Conflict paths outside the initial intersection
+  are now admitted only when both authoritative change sets list them or a
+  rename explains the name mismatch. This contains the documented
+  stat-dirty/content-identical filtered-file false positive while retaining
+  exact rename conflicts and the no-filter read-only guarantee.
+- Closing the live detail overlay with `SIGHUP` now follows the same
+  signal-flag shutdown path as `SIGINT` and `SIGTERM`, so the process restores
+  the hidden cursor before exiting. Cursor restoration is guarded on every
+  ordinary return and by a panic hook because the release profile aborts
+  without running destructors; a process-level regression sends a real SIGHUP
+  and asserts the emitted terminal cleanup bytes.
+- The daemon diagnostic integration test now waits for the failure text in its
+  dedicated stderr file instead of killing the process as soon as the fake
+  server records the second request. The server records before closing the
+  socket, so the old synchronization could kill the daemon between receiving
+  EOF and writing the diagnostic, intermittently failing slower macOS CI.
+- Terminal width and truncation now use maintained Unicode width tables and
+  extended grapheme boundaries instead of a hand-written scalar-range table.
+  Skin-tone emoji, ZWJ families, regional-indicator flags, Hebrew points, Thai
+  marks, and future Unicode table updates can no longer be split or
+  under-counted into a line that wraps the redraw-in-place detail pane.
+- Herdr-invoked reports, JSON snapshots, `--why`, and the live detail pane now
+  honor `HERDR_WORKSPACE_ID` and show only sibling worktrees from that
+  workspace's verified repository, matching their manifest descriptions.
+  Direct shell invocations without workspace context remain session-wide. A
+  stale or non-repository invocation id fails visibly instead of selecting an
+  unrelated repository.
+- Worktree-root discovery now reuses Git's timed `--show-toplevel` result from
+  change-set collection instead of performing a second, unbounded
+  `canonicalize` and ancestor walk in the daemon thread. A slow filesystem can
+  therefore fail through the configured Git deadline and become a visible
+  unreadable checkout rather than freezing every badge refresh.
 
 ## [0.1.2] - 2026-08-25
 

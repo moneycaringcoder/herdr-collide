@@ -293,29 +293,29 @@ pub fn apply_predictions(
         //   though `status` — which is what the change set is built from —
         //   correctly reports the worktree clean.
         //
-        // The second would report a conflict on a file neither agent touched,
-        // which is a false alarm of exactly the kind this plugin exists to
-        // avoid raising. So an unlisted path is only believed when a rename
-        // could explain it, or when a change set lists it after all.
+        // The second would report a conflict on a file only one agent touched,
+        // which is impossible without a rename: Git can take that side directly.
+        // So an unlisted path is believed only when both change sets list it,
+        // or when a rename can explain why their names differ.
         //
-        // Pair-level rename evidence still cannot say which conflict a rename
-        // explains. An unlisted path is therefore a guess unless merge-tree
-        // attached a rename-type record to that exact path. The former remains
-        // approximate; the latter is git's precise attribution and should not
-        // be weakened.
+        // Pair-level rename evidence still cannot say which wholly unlisted
+        // conflict a rename explains. Such a path remains a guess unless
+        // merge-tree attached a rename-type record to that exact path. A path
+        // one rename change set names is not guessed; its destination is a
+        // recorded fact even when the other side still names the source.
         let renamed = pair_changes
             .get(key.0)
             .is_some_and(|c: &&ChangeSet| c.has_rename)
             || pair_changes
                 .get(key.1)
                 .is_some_and(|c: &&ChangeSet| c.has_rename);
-        let listed = |path: &str| {
-            [key.0, key.1].iter().any(|id| {
-                pair_changes
-                    .get(id)
-                    .is_some_and(|c| c.paths.iter().any(|p| p.path == path))
-            })
+        let listed_by = |id: &str, path: &str| {
+            pair_changes
+                .get(id)
+                .is_some_and(|change| change.paths.iter().any(|changed| changed.path == path))
         };
+        let listed_by_both = |path: &str| [key.0, key.1].iter().all(|id| listed_by(id, path));
+        let listed_by_either = |path: &str| [key.0, key.1].iter().any(|id| listed_by(id, path));
         let mut guessed = false;
         let mut extra: Vec<(String, Option<String>)> = Vec::new();
         for (path, hit) in &prediction.verdicts {
@@ -330,10 +330,10 @@ pub fn apply_predictions(
                 continue;
             }
             let conflict_type = attributed_conflict_type(path);
-            if listed(path) {
+            if listed_by_both(path) {
                 extra.push((path.clone(), conflict_type));
             } else if renamed {
-                guessed |= conflict_type.is_none();
+                guessed |= conflict_type.is_none() && !listed_by_either(path);
                 extra.push((path.clone(), conflict_type));
             }
         }
@@ -513,35 +513,18 @@ fn agree_on_repo_root(checkouts: &mut [Checkout], trees: &WorkTrees) {
     }
 }
 
-/// Where a checkout's working tree starts: the nearest ancestor of `path`,
-/// itself included, that holds a `.git` entry.
+/// Where a checkout's working tree starts, resolved by Git through a bounded
+/// subprocess rather than by unbounded filesystem metadata calls.
 ///
-/// This is git's own top-level discovery for every layout this plugin meets. A
-/// linked worktree carries a `.git` *file*, so `<root>/.worktrees/api` resolves
-/// to itself; an ordinary subdirectory carries nothing, so `<root>/src` walks up
-/// to `<root>`. That difference is the whole point — it is what a path-prefix
-/// test cannot see, and getting it wrong stopped every worktree in a
-/// `.worktrees/` layout being compared with the repository it lives in.
-///
-/// It is a filesystem walk rather than `git rev-parse --show-toplevel` because
-/// `src/git.rs` exposes no helper for it and belongs to somebody else; the walk
-/// is pinned against git's own answer by
-/// `resolved_work_trees_match_git_rev_parse` in `tests/conflict_detection.rs`,
-/// so a divergence fails the suite rather than going quiet. A checkout with no
-/// `.git` anywhere above it resolves to itself, which pairs it with everything —
-/// the visible failure direction.
+/// The gathering path reuses the top level returned by
+/// [`git::read_change_set`]. This wrapper remains for embedders and fixtures
+/// that need the answer independently.
 pub fn work_tree_root(path: &std::path::Path) -> std::path::PathBuf {
-    let start = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut candidate: &std::path::Path = &start;
-    loop {
-        if candidate.join(".git").exists() {
-            return candidate.to_path_buf();
-        }
-        match candidate.parent() {
-            Some(parent) => candidate = parent,
-            None => return start,
-        }
-    }
+    git::work_tree_root(
+        path,
+        std::time::Duration::from_secs(crate::config::DEFAULT_GIT_TIMEOUT_SECONDS),
+    )
+    .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Match configured suffix and glob rules against a repository-relative path.
@@ -696,7 +679,8 @@ fn gather_retained(config: &Config) -> Result<RetainedGather> {
     let mut herdr = crate::herdr::Herdr::connect()?;
     let checkouts = herdr.checkouts()?;
     let skipped = herdr.skipped_worktrees();
-    let mut gathered = gather_for_retained(checkouts, config)?;
+    let scope = crate::config::non_empty_env("HERDR_WORKSPACE_ID");
+    let mut gathered = gather_for_retained_scoped(checkouts, config, scope.as_deref())?;
     // A workspace herdr calls a repository but whose worktree object this client
     // could not read is dropped, which makes the session look smaller than it
     // is. The daemon reports that; so must the one-shot commands, which are what
@@ -738,47 +722,128 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
     Ok(gather_for_retained(checkouts, config)?.cycle)
 }
 
+/// Re-derives repository identity and branch names in parallel.
+///
+/// These probes are read-only and lock-free; `status` remains in the later
+/// sequential change-set phase. Results are restored to snapshot order so
+/// diagnostics and every downstream deterministic sort remain unchanged.
+fn verify_checkouts(
+    checkouts: Vec<Checkout>,
+    timeout: std::time::Duration,
+) -> Result<(Vec<Checkout>, Vec<String>)> {
+    if checkouts.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(checkouts.len());
+    let indexed: Vec<(usize, Checkout)> = checkouts.into_iter().enumerate().collect();
+    let chunk_size = indexed.len().div_ceil(workers);
+    let mut results = Vec::with_capacity(indexed.len());
+
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = indexed
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(index, original)| {
+                            let mut checkout = original.clone();
+                            match git::repo_key(&checkout.checkout_path, timeout) {
+                                Ok(key) => {
+                                    checkout.repo_key = key;
+                                    if let Ok(branch) =
+                                        git::current_branch(&checkout.checkout_path, timeout)
+                                    {
+                                        checkout.branch = branch;
+                                    }
+                                    (*index, Ok(checkout))
+                                }
+                                Err(err) => (
+                                    *index,
+                                    Err(format!(
+                                        "skipping {}: {err}",
+                                        checkout.checkout_path.display()
+                                    )),
+                                ),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for handle in handles {
+            results.extend(
+                handle
+                    .join()
+                    .map_err(|_| "checkout-verification worker panicked")?,
+            );
+        }
+        Ok(())
+    })?;
+
+    results.sort_by_key(|(index, _)| *index);
+    let mut verified = Vec::new();
+    let mut notes = Vec::new();
+    for (_, result) in results {
+        match result {
+            Ok(checkout) => verified.push(checkout),
+            Err(note) => notes.push(note),
+        }
+    }
+    Ok((verified, notes))
+}
+
+/// Gathers only the verified repository containing `workspace_id`.
+///
+/// Herdr actions and pane entrypoints provide this id in their invocation
+/// environment. The daemon deliberately uses [`gather_for`] instead so its
+/// badges remain session-wide.
+pub fn gather_for_workspace(
+    checkouts: Vec<Checkout>,
+    config: &Config,
+    workspace_id: &str,
+) -> Result<Cycle> {
+    Ok(gather_for_retained_scoped(checkouts, config, Some(workspace_id))?.cycle)
+}
+
 fn gather_for_retained(checkouts: Vec<Checkout>, config: &Config) -> Result<RetainedGather> {
+    gather_for_retained_scoped(checkouts, config, None)
+}
+
+fn gather_for_retained_scoped(
+    checkouts: Vec<Checkout>,
+    config: &Config,
+    workspace_id: Option<&str>,
+) -> Result<RetainedGather> {
     let mut notes = Vec::new();
 
     // Repo identity is re-derived from git rather than trusted from herdr: two
     // checkouts are only ever compared when their canonicalized
     // `--git-common-dir` matches, and a symlinked or relocated worktree can
     // easily report a repo_key that no longer agrees with it.
-    let mut verified: Vec<Checkout> = Vec::new();
-    for mut checkout in checkouts {
-        match git::repo_key(&checkout.checkout_path, config.git_timeout) {
-            Ok(key) => {
-                checkout.repo_key = key;
-                // Ask git for the branch rather than herdr. We already have the
-                // checkout path, and `worktree.list` is per-repo and errors on
-                // workspaces that are not repos at all. A genuinely detached
-                // HEAD comes back as `None` so the view stays truthful; on a
-                // lookup failure whatever herdr supplied is left alone.
-                if let Ok(branch) = git::current_branch(&checkout.checkout_path, config.git_timeout)
-                {
-                    checkout.branch = branch;
-                }
-                verified.push(checkout);
-            }
-            Err(err) => notes.push(format!(
-                "skipping {}: {err}",
-                checkout.checkout_path.display()
-            )),
-        }
+    let (mut verified, verification_notes) = verify_checkouts(checkouts, config.git_timeout)?;
+    notes.extend(verification_notes);
+    if let Some(workspace_id) = workspace_id {
+        let repo_key = verified
+            .iter()
+            .find(|checkout| checkout.workspace_id == workspace_id)
+            .map(|checkout| checkout.repo_key.clone())
+            .ok_or_else(|| {
+                format!(
+                    "invocation workspace `{workspace_id}` is not a readable git-backed workspace"
+                )
+            })?;
+        verified.retain(|checkout| checkout.repo_key == repo_key);
     }
 
-    // Resolved here, with the other calls that touch the outside world, so the
-    // pure pass stays pure and one unresponsive mount cannot stall it silently.
+    // Filled from the top-level answer `read_change_set` already needs for
+    // untracked-file volume. The previous filesystem walk duplicated that
+    // discovery outside the configured Git deadline.
     let mut trees = WorkTrees::new();
-    for checkout in &verified {
-        trees.insert(
-            checkout.workspace_id.clone(),
-            work_tree_root(&checkout.checkout_path),
-        );
-    }
-
-    agree_on_repo_root(&mut verified, &trees);
 
     // The integration ref is a repository property. Resolve its name once from
     // one checkout and reuse that exact answer for every change set and target
@@ -795,8 +860,11 @@ fn gather_for_retained(checkouts: Vec<Checkout>, config: &Config) -> Result<Reta
         let base = integration_refs
             .get(&checkout.repo_key)
             .expect("every verified checkout has an integration-ref decision");
-        match git::change_set(&checkout.checkout_path, base, config.git_timeout) {
-            Ok(set) => changes.push((checkout.workspace_id.clone(), set)),
+        match git::read_change_set(&checkout.checkout_path, base, config.git_timeout) {
+            Ok(read) => {
+                trees.insert(checkout.workspace_id.clone(), read.top_level);
+                changes.push((checkout.workspace_id.clone(), read.change_set));
+            }
             Err(err) => {
                 notes.push(format!("{}: {err}", checkout.checkout_path.display()));
                 // Not `ChangeSet::default()`. An empty, healthy-looking change
@@ -817,6 +885,7 @@ fn gather_for_retained(checkouts: Vec<Checkout>, config: &Config) -> Result<Reta
             }
         }
     }
+    agree_on_repo_root(&mut verified, &trees);
 
     let mut report = analyse(&verified, &changes, &trees, config);
 

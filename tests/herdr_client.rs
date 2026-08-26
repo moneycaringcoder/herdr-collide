@@ -1,9 +1,9 @@
 //! Wire-level tests for the socket client.
 //!
 //! Every test stands up a real Unix socket server in a temp directory and
-//! asserts the bytes the client puts on the wire, because the parts of this
-//! protocol that bite (mandatory `{}` params, one request per connection, the
-//! merge-patch clear with no TTL) are invisible from the Rust API alone.
+//! asserts the bytes the client puts on the wire. Mandatory `{}` params,
+//! one-request-per-connection framing, atomic mixed set/clear patches, and an
+//! omitted TTL for all-clear patches are invisible from the Rust API alone.
 //!
 //! The fixtures below are shaped from `herdr api snapshot` captured against a
 //! live 0.8.0 server and from the bundled schema (`herdr api schema --json`),
@@ -598,14 +598,19 @@ fn connect_survives_the_socket_being_unlinked_and_rebound() {
 }
 
 #[test]
-fn set_badge_sends_source_tokens_and_ttl() {
+fn badge_patch_sends_mixed_tokens_and_ttl_atomically() {
     let _guard = env_lock();
     let server = TestServer::start(vec![ok_reply()]);
     let mut client = server.client();
+    let tokens = std::collections::BTreeMap::from([
+        ("collide_conflict".to_string(), Some("✘ 2".to_string())),
+        ("collide_overlap".to_string(), None),
+        ("collide_unknown".to_string(), None),
+    ]);
 
     client
-        .set_badge("w6", "collide_conflict", "✘ 2", 15_000)
-        .expect("set");
+        .patch_badges("w6", &tokens, Some(15_000))
+        .expect("patch");
 
     let params = server.only_request()["params"].clone();
     assert_eq!(
@@ -613,11 +618,14 @@ fn set_badge_sends_source_tokens_and_ttl() {
         json!({
             "workspace_id": "w6",
             "source": SOURCE,
-            "tokens": {"collide_conflict": "✘ 2"},
+            "tokens": {
+                "collide_conflict": "✘ 2",
+                "collide_overlap": null,
+                "collide_unknown": null
+            },
             "ttl_ms": 15_000
         })
     );
-    // No `$` prefix on the wire: that syntax belongs to herdr's config.toml.
     assert!(!params["tokens"]
         .as_object()
         .unwrap()
@@ -626,16 +634,16 @@ fn set_badge_sends_source_tokens_and_ttl() {
 }
 
 #[test]
-fn set_badge_clamps_ttl_into_the_protocol_range() {
+fn badge_patch_clamps_ttl_into_the_protocol_range() {
     let _guard = env_lock();
     let server = TestServer::start(vec![ok_reply(), ok_reply()]);
     let mut client = server.client();
+    let tokens =
+        std::collections::BTreeMap::from([("collide_clean".to_string(), Some("ok".to_string()))]);
 
+    client.patch_badges("w6", &tokens, Some(0)).expect("low");
     client
-        .set_badge("w6", "collide_clean", "ok", 0)
-        .expect("low");
-    client
-        .set_badge("w6", "collide_clean", "ok", u64::MAX)
+        .patch_badges("w6", &tokens, Some(u64::MAX))
         .expect("high");
 
     let requests = server.requests();
@@ -647,20 +655,23 @@ fn set_badge_clamps_ttl_into_the_protocol_range() {
 }
 
 #[test]
-fn clear_badge_sends_a_null_token_and_no_ttl() {
+fn all_clear_patch_sends_null_tokens_and_no_ttl() {
     let _guard = env_lock();
     let server = TestServer::start(vec![ok_reply()]);
     let mut client = server.client();
+    let tokens = std::collections::BTreeMap::from([
+        ("collide_conflict".to_string(), None),
+        ("collide_overlap".to_string(), None),
+    ]);
 
-    client.clear_badge("w6", "collide_overlap").expect("clear");
+    client.patch_badges("w6", &tokens, None).expect("clear");
 
     let params = server.only_request()["params"].clone();
-    // Tokens are a merge patch: null deletes the name, and a TTL alongside a
-    // delete is rejected.
+    assert!(params["tokens"]["collide_conflict"].is_null());
     assert!(params["tokens"]["collide_overlap"].is_null());
     assert!(
         params.get("ttl_ms").is_none(),
-        "a clear must omit ttl_ms entirely, got {params}"
+        "an all-clear patch must omit ttl_ms, got {params}"
     );
     assert_eq!(params["source"], SOURCE);
 }
@@ -676,14 +687,15 @@ fn error_envelopes_surface_as_a_typed_error() {
         .to_string(),
     )]);
     let mut client = server.client();
+    let tokens =
+        std::collections::BTreeMap::from([("collide_clean".to_string(), Some("ok".to_string()))]);
 
     let err = client
-        .set_badge("gone", "collide_clean", "ok", 15_000)
+        .patch_badges("gone", &tokens, Some(15_000))
         .expect_err("an error envelope is a failure");
 
     assert_eq!(error_code(&*err), Some("workspace_not_found"));
     assert!(err.to_string().contains("no such workspace"));
-    // A rejected request is not a transport failure, so it must not be retried.
     assert_eq!(server.requests().len(), 1);
 }
 
@@ -1008,6 +1020,8 @@ fn a_failed_refresh_is_written_to_the_daemon_diagnostic_stream() {
     let _guard = env_lock();
     let server = TestServer::start(vec![Reply::Eof, Reply::Eof]);
     let dirs = scratch_dir("refresh-diagnostic");
+    let stderr_path = dirs.join("daemon.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create diagnostic file");
     let mut child = Command::new(env!("CARGO_BIN_EXE_collide"))
         .args(["--daemon", "--interval", "1"])
         .env("HERDR_SOCKET_PATH", &server.path)
@@ -1016,18 +1030,28 @@ fn a_failed_refresh_is_written_to_the_daemon_diagnostic_stream() {
         .env("HERDR_PLUGIN_STATE_DIR", &dirs)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .expect("start foreground daemon");
 
-    let deadline = Instant::now() + Duration::from_secs(4);
-    while server.requests().len() < 2 && Instant::now() < deadline {
+    // Synchronise on the contract this test defends, not on the server seeing
+    // the request. TestServer records a request before it closes the socket, so
+    // killing at request count two can race the daemon between receiving EOF
+    // and writing its diagnostic.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stderr = loop {
+        let current = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if current.contains("collide: refresh failed:") || Instant::now() >= deadline {
+            break current;
+        }
         std::thread::sleep(Duration::from_millis(10));
-    }
+    };
     let _ = child.kill();
-    let output = child.wait_with_output().expect("collect daemon output");
+    let _ = child.wait();
+    if !stderr.contains("collide: refresh failed:") {
+        stderr = std::fs::read_to_string(&stderr_path).expect("read diagnostic file");
+    }
     let _ = std::fs::remove_dir_all(&dirs);
-    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
 
     assert!(
         server.requests().len() >= 2,

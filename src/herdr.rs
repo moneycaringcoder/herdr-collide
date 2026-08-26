@@ -254,41 +254,28 @@ impl Herdr {
         }
     }
 
-    /// Sets one badge token on a workspace, with a TTL so it self-clears if
-    /// this process dies.
-    pub fn set_badge(
+    /// Atomically replaces this plugin's badge state for one workspace.
+    ///
+    /// `tokens` is one merge patch: `Some` sets a value and `None` clears it.
+    /// A severity transition therefore clears every inactive collide token and
+    /// lights the selected one in one server mutation, so a partial two-call
+    /// failure can never render two badges. Herdr 0.8.0 applies `ttl_ms` only to
+    /// values set by the patch; cleared names disappear immediately.
+    pub fn patch_badges(
         &mut self,
         workspace_id: &str,
-        token: &str,
-        value: &str,
-        ttl_ms: u64,
+        tokens: &std::collections::BTreeMap<String, Option<String>>,
+        ttl_ms: Option<u64>,
     ) -> Result<()> {
-        // `tokens` is a merge patch: only the named token is touched, which is
-        // why a severity flip has to clear the previous name explicitly.
-        self.call(
-            "workspace.report_metadata",
-            json!({
-                "workspace_id": workspace_id,
-                "source": config::plugin_id(),
-                "tokens": { token: value },
-                "ttl_ms": ttl_ms.clamp(MIN_TTL_MS, MAX_TTL_MS),
-            }),
-        )?;
-        Ok(())
-    }
-
-    /// Clears one badge token. Sends a null value and no TTL.
-    pub fn clear_badge(&mut self, workspace_id: &str, token: &str) -> Result<()> {
-        // A null value is the delete in the merge patch, and `ttl_ms` must be
-        // omitted entirely — sending one alongside a delete is rejected.
-        self.call(
-            "workspace.report_metadata",
-            json!({
-                "workspace_id": workspace_id,
-                "source": config::plugin_id(),
-                "tokens": { token: Value::Null },
-            }),
-        )?;
+        let mut params = json!({
+            "workspace_id": workspace_id,
+            "source": config::plugin_id(),
+            "tokens": tokens,
+        });
+        if let Some(ttl_ms) = ttl_ms {
+            params["ttl_ms"] = Value::from(ttl_ms.clamp(MIN_TTL_MS, MAX_TTL_MS));
+        }
+        self.call("workspace.report_metadata", params)?;
         Ok(())
     }
 
