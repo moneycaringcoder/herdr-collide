@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Repository-identity and branch probes now fan out across at most eight
+  checkout-verification workers, then restore Herdr snapshot order before
+  analysis. The later `status` pass remains sequential; only the lock-free
+  probes run concurrently, so sessions with many worktrees spend less wall time
+  before change-set collection without adding index contention.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed
