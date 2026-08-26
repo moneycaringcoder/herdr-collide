@@ -95,6 +95,7 @@ fn run_cli_why(fixture: &Fixture, pair: &(PathBuf, PathBuf), path: &str) -> std:
         .args(["--why", path, "--base-ref", "main"])
         .env("HERDR_SOCKET_PATH", &socket)
         .env("HERDR_PLUGIN_ID", "herdr.collide")
+        .env("HERDR_WORKSPACE_ID", "left-worktree")
         .env(
             "HERDR_PLUGIN_STATE_DIR",
             fixture.repo.parent().expect("fixture root").join("state"),

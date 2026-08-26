@@ -23,8 +23,10 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::Config;
 use crate::git;
@@ -55,9 +57,6 @@ const OVERLAP_MARK: &str = "\u{29c9}"; // ⧉
 const RUNAWAY_MARK: &str = "\u{26a0}"; // ⚠
 const UNKNOWN_MARK: &str = "?";
 const ELLIPSIS: char = '\u{2026}'; // …
-/// Variation selector 16. A scalar followed by this one takes emoji
-/// presentation, which is two columns wide even when the scalar alone is one.
-const VS16: char = '\u{fe0f}';
 
 const TITLE: &str = "collide \u{b7} shared files";
 const NO_BRANCH: &str = "no branch";
@@ -726,15 +725,12 @@ fn verdict_marks(verdict: FileVerdict) -> (&'static str, &'static str) {
 // Text helpers
 // ---------------------------------------------------------------------------
 
-/// One indivisible piece of a string, and the display columns it occupies.
+/// One indivisible grapheme cluster, or one complete CSI escape sequence, and
+/// the display columns it occupies.
 ///
-/// A unit is a base scalar plus every zero-width scalar that follows it —
-/// combining marks, variation selectors, zero-width joiners — or a whole CSI
-/// escape sequence, which occupies nothing. Measuring and cutting in units
-/// rather than in `char`s is what makes the two agree: a `char`-wise cut can
-/// strand a combining mark on the ellipsis or split an escape sequence, and a
-/// `char`-wise measure cannot see that `⚠` followed by U+FE0F is two columns
-/// wide and not one.
+/// Grapheme boundaries keep truncation from stranding a combining mark,
+/// skin-tone modifier, regional indicator, or one half of a ZWJ emoji sequence.
+/// CSI sequences stay indivisible and occupy no columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Unit<'a> {
     text: &'a str,
@@ -742,6 +738,9 @@ struct Unit<'a> {
 }
 
 /// Splits `text` into measurable units, left to right.
+///
+/// `unicode-segmentation` supplies grapheme boundaries and `unicode-width`
+/// supplies the maintained terminal-width tables and emoji sequence rules.
 fn units(text: &str) -> Vec<Unit<'_>> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -771,124 +770,26 @@ fn units(text: &str) -> Vec<Unit<'_>> {
             continue;
         }
 
-        // Absorb the trailing zero-width scalars, noting whether one of them
-        // switches the base scalar into emoji presentation.
-        let mut end = first.len_utf8();
-        let mut emoji = false;
-        for (i, ch) in rest.char_indices().skip(1) {
-            if ch != VS16 && !is_zero_width(ch) {
-                break;
-            }
-            emoji |= ch == VS16;
-            end = i + ch.len_utf8();
+        let end = rest.find('\u{1b}').unwrap_or(rest.len());
+        let visible = &rest[..end];
+        for grapheme in visible.graphemes(true) {
+            out.push(Unit {
+                text: grapheme,
+                columns: UnicodeWidthStr::width(grapheme),
+            });
         }
-
-        out.push(Unit {
-            text: &rest[..end],
-            columns: char_columns(first, emoji),
-        });
         rest = &rest[end..];
     }
     out
 }
 
-/// Width of `text` in terminal display columns. Hand-rolled because the crate
-/// takes no width dependency: control characters and CSI escape sequences count
-/// zero, combining marks count zero, and the East Asian wide blocks — plus
-/// anything wearing an emoji presentation selector — count two.
+/// Width of `text` in terminal display columns.
+///
+/// CSI escape sequences and controls count zero. Every visible grapheme is
+/// measured with `unicode-width`, whose default treats East Asian Ambiguous
+/// characters as narrow, matching the renderer's established policy.
 pub fn display_width(text: &str) -> usize {
     units(text).iter().map(|unit| unit.columns).sum()
-}
-
-fn is_zero_width(ch: char) -> bool {
-    if ch.is_control() {
-        return true;
-    }
-    matches!(ch as u32,
-        0x0300..=0x036f      // combining diacriticals
-        | 0x1ab0..=0x1aff    // combining diacriticals extended
-        | 0x20d0..=0x20ff    // combining marks for symbols
-        | 0x200b..=0x200f    // zero width space .. RLM
-        | 0xfe00..=0xfe0f    // variation selectors
-        | 0xfe20..=0xfe2f    // combining half marks
-        | 0xfeff)
-}
-
-/// Columns for one base scalar. `emoji_presentation` is set when a variation
-/// selector U+FE0F followed it, which promotes an otherwise one-column scalar
-/// such as `⚠` to the two columns its emoji glyph actually takes.
-fn char_columns(ch: char, emoji_presentation: bool) -> usize {
-    if is_zero_width(ch) {
-        return 0;
-    }
-    if emoji_presentation || is_wide(ch as u32) {
-        2
-    } else {
-        1
-    }
-}
-
-/// East Asian Wide and Fullwidth, plus the emoji blocks that render two columns
-/// wide without any selector.
-///
-/// The emoji ranges are deliberately over-inclusive: `0x1f300..=0x1faff` sweeps
-/// in a handful of genuinely narrow scalars (ornamental dingbats, chess
-/// symbols) along with everything wide. Over-counting costs a column of unused
-/// room at the end of a line; under-counting overflows the pane and wraps the
-/// frame, so the error is taken in the safe direction. Two earlier versions of
-/// this table had gaps at `0x1f650..=0x1f8ff` and `0x1fa00..=0x1faff`, which is
-/// how `🚀` came to measure one column and push a 40-column pane to 41.
-fn is_wide(code: u32) -> bool {
-    matches!(code,
-        0x1100..=0x115f
-        | 0x231a..=0x231b    // ⌚⌛
-        | 0x23e9..=0x23ec
-        | 0x23f0
-        | 0x23f3
-        | 0x25fd..=0x25fe
-        | 0x2614..=0x2615
-        | 0x2648..=0x2653
-        | 0x267f
-        | 0x2693
-        | 0x26a1
-        | 0x26aa..=0x26ab
-        | 0x26bd..=0x26be
-        | 0x26c4..=0x26c5
-        | 0x26ce
-        | 0x26d4
-        | 0x26ea
-        | 0x26f2..=0x26f3
-        | 0x26f5
-        | 0x26fa
-        | 0x26fd
-        | 0x2705
-        | 0x270a..=0x270b
-        | 0x2728
-        | 0x274c
-        | 0x274e
-        | 0x2753..=0x2755
-        | 0x2757
-        | 0x2795..=0x2797
-        | 0x27b0
-        | 0x27bf
-        | 0x2b1b..=0x2b1c
-        | 0x2b50
-        | 0x2b55
-        | 0x2e80..=0x303e
-        | 0x3041..=0x33ff
-        | 0x3400..=0x4dbf
-        | 0x4e00..=0x9fff
-        | 0xa000..=0xa4cf
-        | 0xa960..=0xa97c    // Hangul Jamo Extended-A
-        | 0xac00..=0xd7a3
-        | 0xf900..=0xfaff
-        | 0xfe10..=0xfe19
-        | 0xfe30..=0xfe6f
-        | 0xff00..=0xff60
-        | 0xffe0..=0xffe6
-        | 0x1f300..=0x1faff
-        | 0x20000..=0x2fffd
-        | 0x30000..=0x3fffd)
 }
 
 /// Trims `text` to `max` display columns, dropping characters from the LEFT and
@@ -1099,27 +1000,54 @@ const HIDE_CURSOR: &str = "\u{1b}[?25l";
 const SHOW_CURSOR: &str = "\u{1b}[?25h";
 const RESET_ATTRS: &str = "\u{1b}[0m";
 
+static CURSOR_PANIC_HOOK: Once = Once::new();
+
+fn restore_stdout() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{SHOW_CURSOR}{RESET_ATTRS}");
+    let _ = out.flush();
+}
+
+/// Restores terminal presentation on every ordinary return, including an I/O
+/// error or a signal-driven stop.
+struct CursorGuard;
+
+impl Drop for CursorGuard {
+    fn drop(&mut self) {
+        restore_stdout();
+    }
+}
+
+/// The release profile aborts on panic, so `Drop` cannot cover that path.
+/// Install one process-wide hook before hiding the cursor and restore it before
+/// the normal diagnostic hook runs.
+fn install_cursor_panic_hook() {
+    CURSOR_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_stdout();
+            previous(info);
+        }));
+    });
+}
+
 /// `--watch`: render the detail view on an interval until interrupted.
 ///
 /// This runs inside a herdr overlay pane, so it clears and redraws in place
 /// rather than scrolling, sizes itself from the real terminal every frame, and
-/// restores the cursor on the way out so SIGINT/SIGTERM never leave the pane
-/// mangled.
+/// restores the cursor on ordinary return, SIGINT, SIGTERM, SIGHUP, and the
+/// release profile's abort-on-panic path.
 pub fn run_watch(config: &Config) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     register_stop_signals(&stop)?;
+    install_cursor_panic_hook();
+    let _cursor = CursorGuard;
 
     let mut out = std::io::stdout();
     let _ = write!(out, "{HIDE_CURSOR}");
     let _ = out.flush();
 
-    let result = watch_loop(config, &stop, &mut out);
-
-    // Best effort, and deliberately unconditional: whatever went wrong, the
-    // terminal goes back the way we found it.
-    let _ = write!(out, "{SHOW_CURSOR}{RESET_ATTRS}");
-    let _ = out.flush();
-    result
+    watch_loop(config, &stop, &mut out)
 }
 
 fn watch_loop(config: &Config, stop: &AtomicBool, out: &mut impl Write) -> Result<()> {
@@ -1205,7 +1133,11 @@ fn sleep_interruptibly(interval: Duration, stop: &AtomicBool) -> bool {
 
 #[cfg(unix)]
 fn register_stop_signals(stop: &Arc<AtomicBool>) -> Result<()> {
-    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
         signal_hook::flag::register(signal, Arc::clone(stop))?;
     }
     Ok(())
