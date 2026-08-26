@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -1099,27 +1099,54 @@ const HIDE_CURSOR: &str = "\u{1b}[?25l";
 const SHOW_CURSOR: &str = "\u{1b}[?25h";
 const RESET_ATTRS: &str = "\u{1b}[0m";
 
+static CURSOR_PANIC_HOOK: Once = Once::new();
+
+fn restore_stdout() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{SHOW_CURSOR}{RESET_ATTRS}");
+    let _ = out.flush();
+}
+
+/// Restores terminal presentation on every ordinary return, including an I/O
+/// error or a signal-driven stop.
+struct CursorGuard;
+
+impl Drop for CursorGuard {
+    fn drop(&mut self) {
+        restore_stdout();
+    }
+}
+
+/// The release profile aborts on panic, so `Drop` cannot cover that path.
+/// Install one process-wide hook before hiding the cursor and restore it before
+/// the normal diagnostic hook runs.
+fn install_cursor_panic_hook() {
+    CURSOR_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_stdout();
+            previous(info);
+        }));
+    });
+}
+
 /// `--watch`: render the detail view on an interval until interrupted.
 ///
 /// This runs inside a herdr overlay pane, so it clears and redraws in place
 /// rather than scrolling, sizes itself from the real terminal every frame, and
-/// restores the cursor on the way out so SIGINT/SIGTERM never leave the pane
-/// mangled.
+/// restores the cursor on ordinary return, SIGINT, SIGTERM, SIGHUP, and the
+/// release profile's abort-on-panic path.
 pub fn run_watch(config: &Config) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     register_stop_signals(&stop)?;
+    install_cursor_panic_hook();
+    let _cursor = CursorGuard;
 
     let mut out = std::io::stdout();
     let _ = write!(out, "{HIDE_CURSOR}");
     let _ = out.flush();
 
-    let result = watch_loop(config, &stop, &mut out);
-
-    // Best effort, and deliberately unconditional: whatever went wrong, the
-    // terminal goes back the way we found it.
-    let _ = write!(out, "{SHOW_CURSOR}{RESET_ATTRS}");
-    let _ = out.flush();
-    result
+    watch_loop(config, &stop, &mut out)
 }
 
 fn watch_loop(config: &Config, stop: &AtomicBool, out: &mut impl Write) -> Result<()> {
@@ -1205,7 +1232,11 @@ fn sleep_interruptibly(interval: Duration, stop: &AtomicBool) -> bool {
 
 #[cfg(unix)]
 fn register_stop_signals(stop: &Arc<AtomicBool>) -> Result<()> {
-    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
         signal_hook::flag::register(signal, Arc::clone(stop))?;
     }
     Ok(())

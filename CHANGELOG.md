@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Closing the live detail overlay with `SIGHUP` now follows the same
+  signal-flag shutdown path as `SIGINT` and `SIGTERM`, so the process restores
+  the hidden cursor before exiting. Cursor restoration is guarded on every
+  ordinary return and by a panic hook because the release profile aborts
+  without running destructors; a process-level regression sends a real SIGHUP
+  and asserts the emitted terminal cleanup bytes.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed
