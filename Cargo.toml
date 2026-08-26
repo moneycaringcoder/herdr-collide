@@ -1,6 +1,6 @@
 [package]
 name = "collide"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.80"
 description = "Warns when agents in different git worktrees of one repo are about to collide."
