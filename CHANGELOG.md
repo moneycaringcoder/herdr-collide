@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Rust 1.80 is now the declared and tested minimum toolchain while the existing
+  Linux/macOS jobs continue to test current stable. Every third-party GitHub
+  Action is pinned to the exact commit behind its reviewed major tag, checkout
+  credentials are never persisted, and ordinary CI now declares read-only
+  contents permission explicitly.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed

@@ -50,9 +50,10 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all
 ```
 
-CI runs exactly these on Linux and macOS with the current stable toolchain. If
-your local Rust is older than CI's, clippy will pass locally and fail there —
-`rustup update stable` first if in doubt.
+CI runs these gates on Linux and macOS with current stable Rust, and runs the
+full suite once more on the declared minimum, Rust 1.80. If your local stable
+toolchain is older than CI's, clippy may still differ; `rustup update stable`
+before a pull request keeps the lint result reproducible.
 
 No test requires a running herdr. The fixtures build throwaway git repositories
 in a temp directory and clean up after themselves.
