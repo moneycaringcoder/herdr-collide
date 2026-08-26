@@ -16,6 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Rust 1.80 is now the declared and tested minimum toolchain while the existing
+  Linux/macOS jobs continue to test current stable; `unicode-segmentation` is
+  pinned to its Rust-1.80-compatible 1.12 release. Every third-party GitHub
+  Action is pinned to the exact commit behind its reviewed major tag, checkout
+  credentials are never persisted, and ordinary CI now declares read-only
+  contents permission explicitly.
 - Repository-identity and branch probes now fan out across at most eight
   checkout-verification workers, then restore Herdr snapshot order before
   analysis. The later `status` pass remains sequential; only the lock-free
