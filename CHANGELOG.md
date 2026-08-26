@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-26
+
 ### Added
 
 - `cargo bench --bench gather_cost`, a dependency-free manual benchmark for
@@ -450,7 +452,8 @@ was checked to fail without it.
   directions, and no discriminator exists, because the two are the same
   observable state.
 
-[Unreleased]: https://github.com/moneycaringcoder/herdr-collide/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/moneycaringcoder/herdr-collide/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/moneycaringcoder/herdr-collide/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/moneycaringcoder/herdr-collide/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/moneycaringcoder/herdr-collide/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/moneycaringcoder/herdr-collide/releases/tag/v0.1.0
