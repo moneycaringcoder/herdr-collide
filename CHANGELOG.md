@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Repository-identity and branch probes now fan out across at most eight
+  checkout-verification workers, then restore Herdr snapshot order before
+  analysis. The later `status` pass remains sequential; only the lock-free
+  probes run concurrently, so sessions with many worktrees spend less wall time
+  before change-set collection without adding index contention.
 - Badge refreshes now send one atomic `workspace.report_metadata` patch per
   workspace, clearing every inactive collide token and setting the selected
   token together. Severity flips can no longer fail between a clear and a set

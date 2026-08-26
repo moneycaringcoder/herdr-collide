@@ -722,6 +722,81 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
     Ok(gather_for_retained(checkouts, config)?.cycle)
 }
 
+/// Re-derives repository identity and branch names in parallel.
+///
+/// These probes are read-only and lock-free; `status` remains in the later
+/// sequential change-set phase. Results are restored to snapshot order so
+/// diagnostics and every downstream deterministic sort remain unchanged.
+fn verify_checkouts(
+    checkouts: Vec<Checkout>,
+    timeout: std::time::Duration,
+) -> Result<(Vec<Checkout>, Vec<String>)> {
+    if checkouts.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(checkouts.len());
+    let indexed: Vec<(usize, Checkout)> = checkouts.into_iter().enumerate().collect();
+    let chunk_size = indexed.len().div_ceil(workers);
+    let mut results = Vec::with_capacity(indexed.len());
+
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = indexed
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(index, original)| {
+                            let mut checkout = original.clone();
+                            match git::repo_key(&checkout.checkout_path, timeout) {
+                                Ok(key) => {
+                                    checkout.repo_key = key;
+                                    if let Ok(branch) =
+                                        git::current_branch(&checkout.checkout_path, timeout)
+                                    {
+                                        checkout.branch = branch;
+                                    }
+                                    (*index, Ok(checkout))
+                                }
+                                Err(err) => (
+                                    *index,
+                                    Err(format!(
+                                        "skipping {}: {err}",
+                                        checkout.checkout_path.display()
+                                    )),
+                                ),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for handle in handles {
+            results.extend(
+                handle
+                    .join()
+                    .map_err(|_| "checkout-verification worker panicked")?,
+            );
+        }
+        Ok(())
+    })?;
+
+    results.sort_by_key(|(index, _)| *index);
+    let mut verified = Vec::new();
+    let mut notes = Vec::new();
+    for (_, result) in results {
+        match result {
+            Ok(checkout) => verified.push(checkout),
+            Err(note) => notes.push(note),
+        }
+    }
+    Ok((verified, notes))
+}
+
 /// Gathers only the verified repository containing `workspace_id`.
 ///
 /// Herdr actions and pane entrypoints provide this id in their invocation
@@ -750,28 +825,8 @@ fn gather_for_retained_scoped(
     // checkouts are only ever compared when their canonicalized
     // `--git-common-dir` matches, and a symlinked or relocated worktree can
     // easily report a repo_key that no longer agrees with it.
-    let mut verified: Vec<Checkout> = Vec::new();
-    for mut checkout in checkouts {
-        match git::repo_key(&checkout.checkout_path, config.git_timeout) {
-            Ok(key) => {
-                checkout.repo_key = key;
-                // Ask git for the branch rather than herdr. We already have the
-                // checkout path, and `worktree.list` is per-repo and errors on
-                // workspaces that are not repos at all. A genuinely detached
-                // HEAD comes back as `None` so the view stays truthful; on a
-                // lookup failure whatever herdr supplied is left alone.
-                if let Ok(branch) = git::current_branch(&checkout.checkout_path, config.git_timeout)
-                {
-                    checkout.branch = branch;
-                }
-                verified.push(checkout);
-            }
-            Err(err) => notes.push(format!(
-                "skipping {}: {err}",
-                checkout.checkout_path.display()
-            )),
-        }
-    }
+    let (mut verified, verification_notes) = verify_checkouts(checkouts, config.git_timeout)?;
+    notes.extend(verification_notes);
     if let Some(workspace_id) = workspace_id {
         let repo_key = verified
             .iter()
