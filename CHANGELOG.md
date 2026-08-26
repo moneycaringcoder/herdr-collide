@@ -14,6 +14,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and briefly render two badges; unchanged badges still refresh their TTL, and
   disable/shutdown sweeps now clear all owned names in one call per workspace.
 
+### Fixed
+
+- Worktree-root discovery now reuses Git's timed `--show-toplevel` result from
+  change-set collection instead of performing a second, unbounded
+  `canonicalize` and ancestor walk in the daemon thread. A slow filesystem can
+  therefore fail through the configured Git deadline and become a visible
+  unreadable checkout rather than freezing every badge refresh.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed
