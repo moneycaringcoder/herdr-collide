@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `cargo bench --bench gather_cost`, a dependency-free manual benchmark for
+  complete collision cycles over 2, 4, 8, and 16 dirty worktrees, a predicted
+  conflict, and dirty direct-submodule contents. Every case asserts its verdict
+  before timing and reports its worktree, pair, and sample counts; timings stay
+  advisory rather than becoming a noisy shared-runner gate.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed
