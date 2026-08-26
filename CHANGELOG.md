@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A scratch-only content-filter artifact can no longer become a conflict on a
+  path only one agent changed. Conflict paths outside the initial intersection
+  are now admitted only when both authoritative change sets list them or a
+  rename explains the name mismatch. This contains the documented
+  stat-dirty/content-identical filtered-file false positive while retaining
+  exact rename conflicts and the no-filter read-only guarantee.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed
