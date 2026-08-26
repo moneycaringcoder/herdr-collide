@@ -14,16 +14,15 @@
 //!   * `cap_log` end to end (its decision is covered by
 //!     `should_truncate_log`, against real files, but nothing exercises the
 //!     `ftruncate` itself);
-//!   * `push`, the glue that threads one `previous` map through `badge_plan` and
-//!     `next_active`. Both halves are covered here; the wiring is not, and the
-//!     second bug in `next_active` lived in exactly that seam.
+//!   * `push`, the glue that threads one `previous` set through `badge_plan`
+//!     and `next_active`. Both pure halves are covered here.
 //!
 //! `SpawnLock` under contention *is* covered — see
 //! `enable_waits_for_a_held_spawn_lock` — because `flock` is per open file
 //! description, so two acquisitions in one process contend the way two processes
 //! would.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -34,7 +33,7 @@ use collide::config::{
     self, Config, DEFAULT_BASE_REF, MAX_GIT_TIMEOUT_SECONDS, MAX_INTERVAL_SECONDS,
     MIN_GIT_TIMEOUT_SECONDS, MIN_INTERVAL_SECONDS,
 };
-use collide::daemon::{self, BadgeOp, LitTokens, PushOutcome, SpawnLock};
+use collide::daemon::{self, ActiveBadges, BadgePatch, PushOutcome, SpawnLock};
 use collide::model::{Severity, WorkspaceStatus};
 
 fn owned(args: &[&str]) -> Vec<String> {
@@ -59,28 +58,11 @@ fn status(
     }
 }
 
-/// One token believed lit per workspace, the ordinary case.
-fn lit(pairs: &[(&str, &str)]) -> LitTokens {
-    pairs
-        .iter()
-        .map(|(id, token)| {
-            (
-                id.to_string(),
-                std::iter::once(token.to_string()).collect::<BTreeSet<String>>(),
-            )
-        })
-        .collect()
+fn active(workspace_ids: &[&str]) -> ActiveBadges {
+    workspace_ids.iter().map(|id| id.to_string()).collect()
 }
 
-/// Several tokens believed lit on one workspace, which is what an unconfirmed
-/// clear leaves behind.
-fn lit_many(workspace_id: &str, tokens: &[&str]) -> LitTokens {
-    std::iter::once((
-        workspace_id.to_string(),
-        tokens.iter().map(|t| t.to_string()).collect(),
-    ))
-    .collect()
-}
+const BADGE_TTL_MS: u64 = 15_000;
 
 /// The state and config dirs come from process-global env vars, so these tests
 /// have to run one at a time.
@@ -502,116 +484,90 @@ fn a_process_with_no_home_still_gets_a_usable_state_dir() {
 }
 
 #[test]
-fn a_severity_flip_clears_the_old_token_before_setting_the_new_one() {
-    // Tokens are a merge patch, so a name we do not mention stays lit. Without
-    // the clear, herdr renders two badges for one workspace.
+fn a_severity_flip_is_one_atomic_patch() {
     let plan = daemon::badge_plan(
-        &lit(&[("w6", "collide_overlap")]),
+        &active(&["w6"]),
         &[status("w6", Severity::Conflict, 2, 0)],
+        BADGE_TTL_MS,
     );
 
-    match plan.as_slice() {
-        [BadgeOp::Clear {
-            workspace_id,
-            token,
-        }, BadgeOp::Set {
-            workspace_id: set_id,
-            token: set_token,
-            text,
-        }] => {
-            assert_eq!(workspace_id, "w6");
-            assert_eq!(token, "collide_overlap");
-            assert_eq!(set_id, "w6");
-            assert_eq!(*set_token, "collide_conflict");
-            // Text is render::badge's to author; the daemon only carries it.
-            assert_eq!(text, "\u{2718} 2");
-        }
-        other => panic!("expected clear-then-set, got {other:?}"),
+    assert_eq!(plan.len(), 1, "one workspace must cost one call: {plan:?}");
+    let patch = &plan[0];
+    assert_eq!(patch.workspace_id, "w6");
+    assert_eq!(patch.ttl_ms, Some(BADGE_TTL_MS));
+    assert_eq!(
+        patch.tokens.get("collide_conflict"),
+        Some(&Some("\u{2718} 2".to_string()))
+    );
+    for token in [
+        "collide_clean",
+        "collide_overlap",
+        "collide_runaway",
+        "collide_unknown",
+    ] {
+        assert_eq!(patch.tokens.get(token), Some(&None), "{token}");
     }
 }
 
 #[test]
-fn an_unchanged_severity_is_re_set_so_the_ttl_never_lapses() {
+fn an_unchanged_severity_is_repatched_so_the_ttl_never_lapses() {
     let plan = daemon::badge_plan(
-        &lit(&[("w6", "collide_conflict")]),
+        &active(&["w6"]),
         &[status("w6", Severity::Conflict, 2, 0)],
+        BADGE_TTL_MS,
     );
 
-    assert_eq!(
-        plan,
-        vec![BadgeOp::Set {
-            workspace_id: "w6".to_string(),
-            token: "collide_conflict",
-            text: "\u{2718} 2".to_string(),
-        }],
-        "no redundant clear, but the write still refreshes the TTL"
-    );
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].ttl_ms, Some(BADGE_TTL_MS));
 }
 
 #[test]
-fn a_clean_workspace_is_cleared_rather_than_given_an_empty_badge() {
-    // render::badge renders clean as the empty string, and an empty token value
-    // would occupy the sidebar row with nothing at all.
+fn a_clean_workspace_is_cleared_only_when_it_was_lit() {
     let plan = daemon::badge_plan(
-        &lit(&[("w6", "collide_conflict")]),
+        &active(&["w6"]),
         &[status("w6", Severity::Clean, 0, 0)],
+        BADGE_TTL_MS,
     );
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].workspace_id, "w6");
+    assert_eq!(plan[0].ttl_ms, None);
+    assert!(plan[0].tokens.values().all(Option::is_none));
 
-    assert_eq!(
-        plan,
-        vec![BadgeOp::Clear {
-            workspace_id: "w6".to_string(),
-            token: "collide_conflict".to_string(),
-        }]
-    );
-
-    // And a workspace that was never lit costs no calls at all.
-    assert!(
-        daemon::badge_plan(&LitTokens::new(), &[status("w6", Severity::Clean, 0, 0)]).is_empty()
-    );
+    assert!(daemon::badge_plan(
+        &ActiveBadges::new(),
+        &[status("w6", Severity::Clean, 0, 0)],
+        BADGE_TTL_MS,
+    )
+    .is_empty());
 }
 
 #[test]
-fn a_workspace_that_left_the_report_is_cleared() {
-    let plan = daemon::badge_plan(
-        &lit(&[("w6", "collide_conflict"), ("w7", "collide_overlap")]),
-        &[status("w6", Severity::Conflict, 1, 0)],
-    );
-
-    assert!(
-        plan.contains(&BadgeOp::Clear {
-            workspace_id: "w7".to_string(),
-            token: "collide_overlap".to_string(),
-        }),
-        "a closed workspace must not keep its badge until the TTL expires: {plan:?}"
-    );
-    // w6 is still reported, so it is refreshed rather than cleared.
-    assert!(!plan.contains(&BadgeOp::Clear {
-        workspace_id: "w6".to_string(),
-        token: "collide_conflict".to_string(),
-    }));
+fn a_workspace_that_left_the_report_gets_one_all_clear_patch() {
+    let plan = daemon::badge_plan(&active(&["w6"]), &[], BADGE_TTL_MS);
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].workspace_id, "w6");
+    assert_eq!(plan[0].ttl_ms, None);
+    assert!(plan[0].tokens.values().all(Option::is_none));
 }
 
 #[test]
 fn one_workspaces_severity_does_not_disturb_another() {
     let plan = daemon::badge_plan(
-        &lit(&[("w6", "collide_overlap")]),
+        &active(&["w6"]),
         &[
             status("w6", Severity::Conflict, 1, 0),
             status("w7", Severity::Overlap, 0, 3),
             status("w8", Severity::Clean, 0, 0),
         ],
+        BADGE_TTL_MS,
     );
 
-    let sets: Vec<&BadgeOp> = plan
-        .iter()
-        .filter(|op| matches!(op, BadgeOp::Set { .. }))
-        .collect();
-    assert_eq!(sets.len(), 2, "clean draws nothing, the other two draw");
-    assert!(!plan.iter().any(|op| matches!(
-        op,
-        BadgeOp::Clear { workspace_id, .. } if workspace_id == "w7" || workspace_id == "w8"
-    )));
+    assert_eq!(
+        plan.iter()
+            .map(|patch| patch.workspace_id.as_str())
+            .collect::<Vec<_>>(),
+        ["w6", "w7"]
+    );
 }
 
 fn severities(pairs: &[(&str, Severity)]) -> BTreeMap<String, Severity> {
@@ -1087,207 +1043,66 @@ fn an_empty_base_ref_on_the_command_line_is_fatal() {
         "main"
     );
 }
-
 // ---------------------------------------------------------------------------
 // What stays lit after a cycle
 // ---------------------------------------------------------------------------
 
-fn set(workspace_id: &str, token: &'static str) -> BadgeOp {
-    BadgeOp::Set {
-        workspace_id: workspace_id.to_string(),
-        token,
-        text: "x".to_string(),
-    }
-}
-
-fn clear(workspace_id: &str, token: &str) -> BadgeOp {
-    BadgeOp::Clear {
-        workspace_id: workspace_id.to_string(),
-        token: token.to_string(),
-    }
-}
-
-/// The bug this exists for, captured off the wire: a set that herdr rejects
-/// used to erase the daemon's record of the token herdr was still rendering, so
-/// the next severity flip emitted no clear for it and two collide tokens lit at
-/// once on one workspace.
-#[test]
-fn a_rejected_set_does_not_make_the_daemon_forget_what_is_lit() {
-    let before = lit(&[("w6", "collide_overlap")]);
-
-    let after = daemon::next_active(
-        &before,
-        &[(set("w6", "collide_overlap"), PushOutcome::Failed)],
-    );
-
-    assert_eq!(
-        after, before,
-        "herdr is still rendering collide_overlap under its TTL"
-    );
-
-    // …so the next cycle, with the severity flipped, still clears it first.
-    let plan = daemon::badge_plan(&after, &[status("w6", Severity::Runaway, 0, 0)]);
-    assert!(
-        plan.contains(&BadgeOp::Clear {
-            workspace_id: "w6".to_string(),
-            token: "collide_overlap".to_string(),
-        }),
-        "two badges would light at once: {plan:?}"
-    );
+fn planned_patch(previous: &ActiveBadges, workspace_id: &str, severity: Severity) -> BadgePatch {
+    daemon::badge_plan(
+        previous,
+        &[status(
+            workspace_id,
+            severity,
+            usize::from(severity == Severity::Conflict),
+            usize::from(severity == Severity::Overlap),
+        )],
+        BADGE_TTL_MS,
+    )
+    .into_iter()
+    .next()
+    .expect("one patch")
 }
 
 #[test]
-fn a_successful_set_replaces_what_was_lit() {
-    let after = daemon::next_active(
-        &lit(&[("w6", "collide_overlap")]),
-        &[
-            (clear("w6", "collide_overlap"), PushOutcome::Done),
-            (set("w6", "collide_conflict"), PushOutcome::Done),
-        ],
-    );
-    assert_eq!(after, lit(&[("w6", "collide_conflict")]));
+fn a_rejected_patch_does_not_forget_the_previous_badge() {
+    let before = active(&["w6"]);
+    let patch = planned_patch(&before, "w6", Severity::Conflict);
+    let after = daemon::next_active(&before, &[(patch, PushOutcome::Failed)]);
+    assert_eq!(after, before, "Herdr still holds the preceding TTL value");
 }
 
 #[test]
-fn a_failed_clear_is_remembered_so_it_can_be_reissued() {
-    let after = daemon::next_active(
-        &lit(&[("w6", "collide_conflict")]),
-        &[(clear("w6", "collide_conflict"), PushOutcome::Failed)],
-    );
-    assert_eq!(
-        after,
-        lit(&[("w6", "collide_conflict")]),
-        "the token is still lit, so forgetting it strands the badge"
-    );
+fn a_successful_lit_patch_records_the_workspace() {
+    let patch = planned_patch(&ActiveBadges::new(), "w6", Severity::Conflict);
+    let after = daemon::next_active(&ActiveBadges::new(), &[(patch, PushOutcome::Done)]);
+    assert_eq!(after, active(&["w6"]));
 }
 
-/// The same bug from the other side, and the reason a workspace holds a *set* of
-/// names rather than one.
-///
-/// On a severity flip the plan is `[Clear(old), Set(new)]`. When the clear fails
-/// and the set succeeds, herdr is rendering both: it never got the clear, and it
-/// did get the set. With one name per workspace the successful set overwrote the
-/// old one, the daemon forgot a token it was responsible for, and no later cycle
-/// ever cleared it — two collide badges on one workspace until the old one's TTL
-/// ran out.
 #[test]
-fn a_failed_clear_survives_a_successful_set_on_the_same_workspace() {
-    let previous = lit(&[("w6", "collide_overlap")]);
-    let plan = daemon::badge_plan(&previous, &[status("w6", Severity::Conflict, 1, 0)]);
-    assert_eq!(plan.len(), 2, "a flip clears before it sets: {plan:?}");
-
-    // Exactly the wire outcome: the clear did not take, the set did.
-    let results: Vec<(BadgeOp, PushOutcome)> = plan
-        .into_iter()
-        .map(|op| {
-            let outcome = match &op {
-                BadgeOp::Clear { .. } => PushOutcome::Failed,
-                BadgeOp::Set { .. } => PushOutcome::Done,
-            };
-            (op, outcome)
-        })
-        .collect();
-
-    let after = daemon::next_active(&previous, &results);
-    assert_eq!(
-        after,
-        lit_many("w6", &["collide_conflict", "collide_overlap"]),
-        "both are lit on herdr's side, so both have to be on ours"
-    );
-
-    // …and the next cycle, with the severity unchanged, still clears the one
-    // that never went out.
-    let next = daemon::badge_plan(&after, &[status("w6", Severity::Conflict, 1, 0)]);
-    assert!(
-        next.contains(&BadgeOp::Clear {
-            workspace_id: "w6".to_string(),
-            token: "collide_overlap".to_string(),
-        }),
-        "the stranded token is never cleared again: {next:?}"
-    );
-    assert!(
-        next.contains(&BadgeOp::Set {
-            workspace_id: "w6".to_string(),
-            token: "collide_conflict",
-            text: "✘ 1".to_string(),
-        }),
-        "and the badge the workspace should show is still refreshed: {next:?}"
-    );
+fn a_successful_clear_patch_settles_the_workspace() {
+    let before = active(&["w6"]);
+    let patch = planned_patch(&before, "w6", Severity::Clean);
+    let after = daemon::next_active(&before, &[(patch, PushOutcome::Done)]);
+    assert!(after.is_empty());
 }
 
-/// Once the clear does take, the extra name goes and the plan settles.
-#[test]
-fn a_reissued_clear_that_succeeds_settles_the_workspace() {
-    let stranded = lit_many("w6", &["collide_conflict", "collide_overlap"]);
-    let plan = daemon::badge_plan(&stranded, &[status("w6", Severity::Conflict, 1, 0)]);
-    let results: Vec<(BadgeOp, PushOutcome)> =
-        plan.into_iter().map(|op| (op, PushOutcome::Done)).collect();
-
-    let after = daemon::next_active(&stranded, &results);
-    assert_eq!(after, lit(&[("w6", "collide_conflict")]));
-
-    let settled = daemon::badge_plan(&after, &[status("w6", Severity::Conflict, 1, 0)]);
-    assert!(
-        !settled.iter().any(|op| matches!(op, BadgeOp::Clear { .. })),
-        "nothing left to clear: {settled:?}"
-    );
-}
-
-/// A workspace that drops out of the report has *all* of its names cleared, not
-/// just the last one recorded.
-#[test]
-fn a_workspace_that_left_the_report_clears_every_name_it_had() {
-    let plan = daemon::badge_plan(
-        &lit_many("w9", &["collide_conflict", "collide_overlap"]),
-        &[],
-    );
-    assert_eq!(
-        plan,
-        vec![
-            BadgeOp::Clear {
-                workspace_id: "w9".to_string(),
-                token: "collide_conflict".to_string(),
-            },
-            BadgeOp::Clear {
-                workspace_id: "w9".to_string(),
-                token: "collide_overlap".to_string(),
-            },
-        ]
-    );
-}
-
-/// A workspace that closed under us took its badge with it, so there is nothing
-/// left to clear and nothing to remember — otherwise the daemon would reissue a
-/// doomed clear on every cycle for the rest of its life.
 #[test]
 fn a_workspace_that_went_away_is_forgotten() {
-    assert!(daemon::next_active(
-        &lit(&[("w6", "collide_conflict")]),
-        &[(clear("w6", "collide_conflict"), PushOutcome::Gone)],
-    )
-    .is_empty());
-
-    assert!(daemon::next_active(
-        &lit(&[("w6", "collide_conflict")]),
-        &[(set("w6", "collide_overlap"), PushOutcome::Gone)],
-    )
-    .is_empty());
+    let before = active(&["w6"]);
+    let patch = planned_patch(&before, "w6", Severity::Conflict);
+    assert!(daemon::next_active(&before, &[(patch, PushOutcome::Gone)]).is_empty());
 }
 
 #[test]
 fn one_workspaces_failure_does_not_disturb_another() {
+    let before = active(&["w6", "w7"]);
+    let failed = planned_patch(&before, "w6", Severity::Conflict);
+    let cleared = planned_patch(&before, "w7", Severity::Clean);
     let after = daemon::next_active(
-        &lit(&[("w6", "collide_overlap"), ("w7", "collide_conflict")]),
-        &[
-            (set("w6", "collide_conflict"), PushOutcome::Failed),
-            (clear("w7", "collide_conflict"), PushOutcome::Done),
-            (set("w7", "collide_overlap"), PushOutcome::Done),
-        ],
+        &before,
+        &[(failed, PushOutcome::Failed), (cleared, PushOutcome::Done)],
     );
-    assert_eq!(
-        after,
-        lit(&[("w6", "collide_overlap"), ("w7", "collide_overlap")])
-    );
+    assert_eq!(after, active(&["w6"]));
 }
 
 // ---------------------------------------------------------------------------

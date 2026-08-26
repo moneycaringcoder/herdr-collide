@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Badge refreshes now send one atomic `workspace.report_metadata` patch per
+  workspace, clearing every inactive collide token and setting the selected
+  token together. Severity flips can no longer fail between a clear and a set
+  and briefly render two badges; unchanged badges still refresh their TTL, and
+  disable/shutdown sweeps now clear all owned names in one call per workspace.
+
 ### Fixed
 
 - Herdr-invoked reports, JSON snapshots, `--why`, and the live detail pane now
@@ -14,6 +22,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Direct shell invocations without workspace context remain session-wide. A
   stale or non-repository invocation id fails visibly instead of selecting an
   unrelated repository.
+- Worktree-root discovery now reuses Git's timed `--show-toplevel` result from
+  change-set collection instead of performing a second, unbounded
+  `canonicalize` and ancestor walk in the daemon thread. A slow filesystem can
+  therefore fail through the configured Git deadline and become a visible
+  unreadable checkout rather than freezing every badge refresh.
 
 ## [0.1.2] - 2026-08-25
 

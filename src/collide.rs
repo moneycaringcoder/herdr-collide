@@ -513,35 +513,18 @@ fn agree_on_repo_root(checkouts: &mut [Checkout], trees: &WorkTrees) {
     }
 }
 
-/// Where a checkout's working tree starts: the nearest ancestor of `path`,
-/// itself included, that holds a `.git` entry.
+/// Where a checkout's working tree starts, resolved by Git through a bounded
+/// subprocess rather than by unbounded filesystem metadata calls.
 ///
-/// This is git's own top-level discovery for every layout this plugin meets. A
-/// linked worktree carries a `.git` *file*, so `<root>/.worktrees/api` resolves
-/// to itself; an ordinary subdirectory carries nothing, so `<root>/src` walks up
-/// to `<root>`. That difference is the whole point — it is what a path-prefix
-/// test cannot see, and getting it wrong stopped every worktree in a
-/// `.worktrees/` layout being compared with the repository it lives in.
-///
-/// It is a filesystem walk rather than `git rev-parse --show-toplevel` because
-/// `src/git.rs` exposes no helper for it and belongs to somebody else; the walk
-/// is pinned against git's own answer by
-/// `resolved_work_trees_match_git_rev_parse` in `tests/conflict_detection.rs`,
-/// so a divergence fails the suite rather than going quiet. A checkout with no
-/// `.git` anywhere above it resolves to itself, which pairs it with everything —
-/// the visible failure direction.
+/// The gathering path reuses the top level returned by
+/// [`git::read_change_set`]. This wrapper remains for embedders and fixtures
+/// that need the answer independently.
 pub fn work_tree_root(path: &std::path::Path) -> std::path::PathBuf {
-    let start = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut candidate: &std::path::Path = &start;
-    loop {
-        if candidate.join(".git").exists() {
-            return candidate.to_path_buf();
-        }
-        match candidate.parent() {
-            Some(parent) => candidate = parent,
-            None => return start,
-        }
-    }
+    git::work_tree_root(
+        path,
+        std::time::Duration::from_secs(crate::config::DEFAULT_GIT_TIMEOUT_SECONDS),
+    )
+    .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Match configured suffix and glob rules against a repository-relative path.
@@ -802,17 +785,10 @@ fn gather_for_retained_scoped(
         verified.retain(|checkout| checkout.repo_key == repo_key);
     }
 
-    // Resolved here, with the other calls that touch the outside world, so the
-    // pure pass stays pure and one unresponsive mount cannot stall it silently.
+    // Filled from the top-level answer `read_change_set` already needs for
+    // untracked-file volume. The previous filesystem walk duplicated that
+    // discovery outside the configured Git deadline.
     let mut trees = WorkTrees::new();
-    for checkout in &verified {
-        trees.insert(
-            checkout.workspace_id.clone(),
-            work_tree_root(&checkout.checkout_path),
-        );
-    }
-
-    agree_on_repo_root(&mut verified, &trees);
 
     // The integration ref is a repository property. Resolve its name once from
     // one checkout and reuse that exact answer for every change set and target
@@ -829,8 +805,11 @@ fn gather_for_retained_scoped(
         let base = integration_refs
             .get(&checkout.repo_key)
             .expect("every verified checkout has an integration-ref decision");
-        match git::change_set(&checkout.checkout_path, base, config.git_timeout) {
-            Ok(set) => changes.push((checkout.workspace_id.clone(), set)),
+        match git::read_change_set(&checkout.checkout_path, base, config.git_timeout) {
+            Ok(read) => {
+                trees.insert(checkout.workspace_id.clone(), read.top_level);
+                changes.push((checkout.workspace_id.clone(), read.change_set));
+            }
             Err(err) => {
                 notes.push(format!("{}: {err}", checkout.checkout_path.display()));
                 // Not `ChangeSet::default()`. An empty, healthy-looking change
@@ -851,6 +830,7 @@ fn gather_for_retained_scoped(
             }
         }
     }
+    agree_on_repo_root(&mut verified, &trees);
 
     let mut report = analyse(&verified, &changes, &trees, config);
 
