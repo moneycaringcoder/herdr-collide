@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Herdr-invoked reports, JSON snapshots, `--why`, and the live detail pane now
+  honor `HERDR_WORKSPACE_ID` and show only sibling worktrees from that
+  workspace's verified repository, matching their manifest descriptions.
+  Direct shell invocations without workspace context remain session-wide. A
+  stale or non-repository invocation id fails visibly instead of selecting an
+  unrelated repository.
+
 ## [0.1.2] - 2026-08-25
 
 ### Fixed
