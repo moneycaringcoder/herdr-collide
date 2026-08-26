@@ -29,6 +29,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Closing the live detail overlay with `SIGHUP` now follows the same
+  signal-flag shutdown path as `SIGINT` and `SIGTERM`, so the process restores
+  the hidden cursor before exiting. Cursor restoration is guarded on every
+  ordinary return and by a panic hook because the release profile aborts
+  without running destructors; a process-level regression sends a real SIGHUP
+  and asserts the emitted terminal cleanup bytes.
 - Terminal width and truncation now use maintained Unicode width tables and
   extended grapheme boundaries instead of a hand-written scalar-range table.
   Skin-tone emoji, ZWJ families, regional-indicator flags, Hebrew points, Thai
