@@ -434,15 +434,19 @@ Worth knowing before you trust it:
   `ignore_suffixes`.
 - **Non-UTF-8 paths are rendered lossily.** Git reports raw bytes; anything that is not valid UTF-8,
   and anything that could take control of your terminal, is replaced before display — so such a path
-  renders differently from how it appears on disk. A short digest of the original bytes is appended
-  so that two files whose names differ only in the replaced part stay distinct, rather than being
-  reported as one file both worktrees changed.
+  renders differently from how it appears on disk. A short digest keeps distinct byte names distinct.
+  The raw bytes remain attached internally for line counting and snapshot pathspecs; only CLI `--why`
+  refuses such a display surrogate because it cannot safely name the tree path back to Git.
 - **Content filters are not run.** `git add` would otherwise execute whatever `filter.*.clean` or
   `filter.*.process` program your repository configures, on every refresh — and for git-lfs that
   writes into your own `.git/lfs`, which is not something a read-only tool may do. They are disabled
   for the snapshot instead. The consequence is that a filtered file is compared as its raw bytes: for
   git-lfs that changes nothing useful, and for a filter that rewrites text it makes that file's line
   count reflect the unfiltered content.
+- **Custom merge drivers are not executed.** A repository-configured `merge.<name>.driver` is an
+  arbitrary program. Any checkout configuring one makes its pair and target predictions `unknown`
+  rather than running repository code inside an unattended refresh. Built-in textual behavior remains
+  available.
 - **Dirty direct submodules are compared one repository deep.** When the same submodule path has
   modified or untracked content in two open superproject worktrees, collide snapshots each nested
   checkout through a scratch index and runs a nested merge. A clean nested merge earns
@@ -450,8 +454,8 @@ Worth knowing before you trust it:
   names the conflicting nested paths in the detail notes. If either nested checkout is not
   initialised, has no readable HEAD, times out, or otherwise cannot be compared, the path stays
   `? unknown` rather than being guessed clean. This does not recurse into submodules of the
-  submodule. A change to the recorded gitlink is still compared normally. Work below a submodule
-  remains invisible to the runaway thresholds.
+  submodule. A change to the recorded gitlink is still compared normally. Direct nested changed-file
+  and line volume contributes to runaway thresholds; work below a second-level submodule does not.
 - **A checkout can be readable only in part.** An unborn branch, a branch deleted underneath a
   worktree, a base ref that does not resolve, or two histories with no common ancestor all limit what
   can be compared. Rather than quietly reporting such a checkout as clean, the detail pane marks it
@@ -462,8 +466,6 @@ Worth knowing before you trust it:
   no merge to predict, so the answer is "cannot tell" and not "everything conflicts".
 - **Linux and macOS only.** The daemon relies on Unix process and signal behaviour, and the plugin
   declares those two platforms.
-- **Repository identity across linked worktrees is observed rather than specified.** It holds for
-  ordinary `git worktree` layouts; submodules and `--separate-git-dir` setups are less well tested.
 
 ## Contributing
 

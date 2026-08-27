@@ -394,10 +394,17 @@ impl FilteredChange {
         // Volume is filtered along with the paths. A `package-lock.json` the
         // plugin has decided to ignore must not still trip the runaway
         // threshold, and the origin half of a rename is one file, not two.
-        let lines_changed = kept
+        // A dirty direct submodule contributes its nested files in addition to
+        // the superproject-relative gitlink path.
+        let lines_changed = kept.iter().fold(0u64, |total, path| {
+            total.saturating_add(path.lines_changed())
+        });
+        let changed_files = kept
             .iter()
-            .fold(0u64, |total, p| total.saturating_add(p.lines_changed()));
-        let changed_files = kept.iter().filter(|p| !p.is_rename_origin).count();
+            .filter(|path| !path.is_rename_origin)
+            .fold(0usize, |total, path| {
+                total.saturating_add(1usize.saturating_add(path.nested_changed_files))
+            });
         Self {
             paths,
             uncomparable_submodules,

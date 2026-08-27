@@ -629,8 +629,8 @@ every one of these commands.
   leaves the verdict `unknown`. A changed recorded gitlink is still compared by
   the outer merge and any outer conflict remains authoritative. Submodules
   inside the direct submodule remain gitlinks and are not recursively opened.
-  Work below a submodule still line-counts as zero, so it remains invisible to
-  the runaway thresholds.
+  Direct nested file and line counts are folded onto the superproject-relative
+  path for runaway thresholds.
 
 ## Filename encoding differs by platform
 
@@ -646,6 +646,12 @@ the names, and the parser half is covered everywhere from captured bytes
 instead. Do not "fix" that skip by dropping the case: it is a real difference
 between the two supported platforms, and on macOS the bug it guards against
 cannot happen.
+
+Raw status bytes stay beside the safe display surrogate. Scratch pathspecs use
+NUL-delimited `--pathspec-from-file`, and no-index line counts pass the original
+`OsString`, so replacement never makes the underlying file unaddressable.
+`--why` remains the exception: it refuses a surrogate rather than guessing a
+tree path.
 
 ## Overall refresh deadline
 
@@ -663,9 +669,8 @@ filesystem I/O because it is plugin-owned rather than repository data.
 
 ## Unverified
 
-Cold-cache timings; `feature.manyFiles`, split index and untracked-cache
-interactions with the seeded temp index; Windows and case-insensitive or NFD
-filesystems; `.gitattributes` **merge** drivers (clean/smudge filters are
-covered above); worktrees relocated across mounts. `core.fsmonitor` is now
-exercised as a pipe-leak fixture in `tests/read_only.rs`, but its effect on the
-seeded temp index is still untested.
+Cold-cache timings; `feature.manyFiles`; Windows; and worktrees relocated
+across mount points. Split index, untracked cache, a live fsmonitor hook,
+case-insensitive filesystems, canonically equivalent Unicode filenames,
+Git-managed relocation, and custom merge-driver refusal are covered by
+observed-behavior fixtures on the platforms where each can be constructed.
