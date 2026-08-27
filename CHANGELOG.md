@@ -28,6 +28,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   untracked-file line reads now stay behind bounded Git subprocesses rather
   than performing unbounded repository filesystem reads in the daemon process.
   Content filters remain neutralised for the new no-index line-count path.
+- Raw Git status path bytes now remain attached to their safe display
+  surrogates. NUL-delimited pathspec files and raw `OsString` arguments let
+  snapshots and line counts address non-UTF-8/control-character filenames
+  without exposing them to the terminal.
+- Dirty direct-submodule file and line volume now contributes to runaway
+  thresholds at depth one. A nested volume failure marks the outer change set
+  partial rather than silently understating it.
+- Repository-configured custom merge drivers are never executed. Pair and
+  target predictions remain `unknown` when such a driver is configured, and
+  fixtures now cover split index, untracked cache, fsmonitor, Git-managed
+  relocation, case folding, and canonically equivalent Unicode filenames.
 
 
 ## [0.1.3] - 2026-08-26

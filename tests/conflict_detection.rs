@@ -164,6 +164,88 @@ fn same_size_edit_with_unchanged_mtime_is_a_conflict() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn non_utf8_status_paths_address_their_snapshot_content() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fixture = Fixture::new("raw-snapshot-path");
+    let Some((first, _second)) = fixture.distinct_invalid_utf8_untracked(&fixture.repo) else {
+        eprintln!("skipped: this filesystem refuses invalid UTF-8 filenames");
+        return;
+    };
+    fixture.commit_all(&fixture.repo, "track raw path");
+    let left = fixture.worktree("raw-left", "raw-left");
+    let right = fixture.worktree("raw-right", "raw-right");
+    std::fs::write(left.join(OsStr::from_bytes(&first)), "LEFT\n").expect("write left raw path");
+    std::fs::write(right.join(OsStr::from_bytes(&first)), "RIGHT\n").expect("write right raw path");
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("left", &left, "unused"),
+            checkout("right", &right, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+    assert!(cycle.notes.is_empty(), "{:?}", cycle.notes);
+    assert_eq!(cycle.report.pairings.len(), 1);
+    assert_eq!(cycle.report.pairings[0].conflicts(), 1);
+    assert!(
+        cycle.report.pairings[0].shared[0].path.contains('\u{fffd}'),
+        "{:?}",
+        cycle.report.pairings[0].shared
+    );
+}
+
+#[test]
+fn a_custom_merge_driver_is_never_executed_and_stays_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new("custom-merge-driver");
+    fixture.write(&fixture.repo, ".gitattributes", "special.txt merge=demo\n");
+    fixture.write(&fixture.repo, "special.txt", "base\n");
+    fixture.commit_all(&fixture.repo, "configure merge path");
+    let log = fixture.root().join("merge-driver-ran.log");
+    let driver = fixture.root().join("merge-driver.sh");
+    std::fs::write(
+        &driver,
+        format!(
+            "#!/bin/sh\necho ran >> '{}'\ncp \"$3\" \"$2\"\n",
+            log.display()
+        ),
+    )
+    .expect("write merge driver");
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod merge driver");
+    fixture.git(
+        &fixture.repo,
+        &[
+            "config",
+            "merge.demo.driver",
+            &format!("{} %O %A %B", driver.display()),
+        ],
+    );
+    let left = fixture.worktree("driver-left", "driver-left");
+    let right = fixture.worktree("driver-right", "driver-right");
+    fixture.write(&left, "special.txt", "left\n");
+    fixture.write(&right, "special.txt", "right\n");
+
+    let cycle = collide::collide::gather_for(
+        vec![
+            checkout("left", &left, "unused"),
+            checkout("right", &right, "unused"),
+        ],
+        &config(),
+    )
+    .expect("cycle");
+    assert!(!log.exists(), "custom merge driver executed");
+    assert_eq!(
+        cycle.report.pairings[0].shared[0].verdict,
+        FileVerdict::Unknown
+    );
+}
 #[test]
 fn tracked_ignored_file_stays_in_the_snapshot_tree() {
     let fixture = Fixture::new("tracked-ignored-snapshot");
@@ -330,6 +412,39 @@ fn different_line_edits_inside_a_submodule_are_an_overlap() {
     for id in ["one", "two"] {
         assert_eq!(status_of(&cycle.report, id).severity, Severity::Overlap);
     }
+}
+
+#[test]
+fn dirty_submodule_files_and_lines_count_toward_runaway_volume() {
+    let fixture = Fixture::new("dirty-submodule-volume");
+    let (_superproject, first, _second, first_submodule) =
+        fixture.superproject_with_submodule("embedded");
+    fixture.write(&first_submodule, "one.txt", "one\ntwo\n");
+    fixture.write(&first_submodule, "two.txt", "one\ntwo\nthree\n");
+    let config = Config {
+        predict_conflicts: false,
+        runaway_files: 2,
+        runaway_lines: 4,
+        base_ref: "main".to_string(),
+        ..config()
+    };
+
+    let cycle = collide::collide::gather_for(vec![checkout("one", &first, "unused")], &config)
+        .expect("cycle");
+    let status = status_of(&cycle.report, "one");
+    assert!(status.runaway, "{status:?}");
+    assert_eq!(status.lines_changed, 5);
+    assert_eq!(status.changed_files, 3, "gitlink plus two nested files");
+    let submodule = cycle
+        .report
+        .change_set("one")
+        .expect("change set")
+        .paths
+        .iter()
+        .find(|path| path.path == "embedded")
+        .expect("submodule path");
+    assert_eq!(submodule.lines_added, 5);
+    assert_eq!(submodule.nested_changed_files, 2);
 }
 
 #[test]

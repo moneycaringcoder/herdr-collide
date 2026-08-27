@@ -102,6 +102,9 @@ pub struct ChangedPath {
     /// The submodule's working tree differs from its committed pointer, so the
     /// superproject snapshot cannot predict whether those contents conflict.
     pub submodule_contents_uncomparable: bool,
+    /// Changed files observed directly inside this submodule checkout. Zero for
+    /// ordinary paths and when nested volume could not be read.
+    pub nested_changed_files: usize,
 }
 
 impl ChangedPath {
@@ -115,6 +118,7 @@ impl ChangedPath {
             lines_removed: 0,
             is_rename_origin: false,
             submodule_contents_uncomparable: false,
+            nested_changed_files: 0,
         }
     }
 

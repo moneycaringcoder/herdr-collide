@@ -350,6 +350,13 @@ fn two_different_non_utf8_paths_do_not_collapse_into_one() {
         "two distinct files must render as two distinct paths: {rendered:?}"
     );
     assert_ne!(rendered[0], rendered[1], "{rendered:?}");
+    let raw: Vec<&[u8]> = entries
+        .iter()
+        .filter(|entry| entry.path.contains('\u{FFFD}'))
+        .map(|entry| entry.raw_path.as_slice())
+        .collect();
+    assert!(raw.contains(&first.as_slice()), "{raw:?}");
+    assert!(raw.contains(&second.as_slice()), "{raw:?}");
 
     // Stability: parsing the same bytes twice must give the same strings, or
     // status output and merge-tree output would stop matching each other.
@@ -364,6 +371,18 @@ fn two_different_non_utf8_paths_do_not_collapse_into_one() {
         .filter(|p| p.contains('\u{FFFD}'))
         .collect();
     assert_eq!(in_set.len(), 2, "{in_set:?}");
+    let mut line_counts: Vec<u64> = set
+        .paths
+        .iter()
+        .filter(|path| path.path.contains('\u{FFFD}'))
+        .map(|path| path.lines_added)
+        .collect();
+    line_counts.sort_unstable();
+    assert_eq!(
+        line_counts,
+        [1, 2],
+        "raw names no longer addressed their files"
+    );
 }
 
 #[test]

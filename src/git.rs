@@ -41,6 +41,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -187,19 +189,9 @@ impl GitOut {
 ///
 /// A drain that does not finish is reported as `timed_out` with a `None` exit
 /// code, never as a successful command with short output.
-fn run_git(
-    dir: &Path,
-    args: &[&str],
-    envs: &[(&str, OsString)],
-    timeout: Duration,
-) -> Result<GitOut> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir);
-    cmd.args(args);
-
-    // Never inherit a caller's git environment: collide can be launched from a
-    // git hook, where GIT_DIR/GIT_INDEX_FILE would silently retarget every
-    // command at the wrong repository.
+fn git_command(dir: &Path, envs: &[(&str, OsString)]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir);
     for key in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -209,14 +201,25 @@ fn run_git(
         "GIT_COMMON_DIR",
         "GIT_NAMESPACE",
     ] {
-        cmd.env_remove(key);
+        command.env_remove(key);
     }
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
     for (key, value) in envs {
-        cmd.env(key, value);
+        command.env(key, value);
     }
-    run_command(cmd, timeout, format!("git in {}", dir.display()))
+    command
+}
+
+fn run_git(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, OsString)],
+    timeout: Duration,
+) -> Result<GitOut> {
+    let mut command = git_command(dir, envs);
+    command.args(args);
+    run_command(command, timeout, format!("git in {}", dir.display()))
 }
 
 fn run_command(mut cmd: Command, timeout: Duration, description: String) -> Result<GitOut> {
@@ -446,9 +449,9 @@ fn probe_with_env(
 /// `status` output and `merge-tree` output still match each other, while
 /// different bytes stop merging into one phantom shared path.
 ///
-/// The cost, unchanged: a path that had to be replaced no longer addresses its
-/// file on disk, so an untracked file named that way is line-counted as zero.
-/// That is a fair trade against a pane that a filename can hijack.
+/// Raw bytes stay beside this display value for status-driven snapshots and
+/// line counts. The surrogate itself still cannot be handed back to tree
+/// plumbing, so `--why` refuses it rather than guessing.
 pub(crate) fn lossy(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     // `from_utf8_lossy` borrows iff the input was already valid UTF-8.
@@ -470,7 +473,7 @@ pub(crate) fn lossy(bytes: &[u8]) -> String {
 }
 
 /// Whether a path is the safe display surrogate produced by [`lossy`] rather
-/// than an addressable tree path.
+/// than an addressable tree-plumbing path.
 fn is_lossy_display_path(path: &str) -> bool {
     let Some((prefix, digest)) = path.rsplit_once('~') else {
         return false;
@@ -784,8 +787,10 @@ pub struct SubmoduleState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
     pub path: String,
+    pub raw_path: Vec<u8>,
     /// Populated only for rename/copy (`2`) records: the original path.
     pub origin: Option<String>,
+    pub raw_origin: Option<Vec<u8>>,
     /// Present for `S<c><m><u>` records and absent for ordinary `N...` paths.
     pub submodule: Option<SubmoduleState>,
     pub kind: ChangeKind,
@@ -824,7 +829,9 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                 if let (Some(path), Some(xy)) = (field_after_space(line, 8), xy_of(line)) {
                     entries.push(StatusEntry {
                         path: lossy(path),
+                        raw_path: path.to_vec(),
                         origin: None,
+                        raw_origin: None,
                         kind: kind_from_xy(xy),
                         submodule: submodule_state_of(line),
                         is_rename: false,
@@ -837,10 +844,13 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
             // NUL `<origPath>`
             b'2' => {
                 if let (Some(path), Some(xy)) = (field_after_space(line, 9), xy_of(line)) {
-                    let origin = fields.get(i + 1).map(|f| lossy(f));
+                    let raw_origin = fields.get(i + 1).map(|field| field.to_vec());
+                    let origin = raw_origin.as_deref().map(lossy);
                     entries.push(StatusEntry {
                         path: lossy(path),
+                        raw_path: path.to_vec(),
                         origin,
+                        raw_origin,
                         kind: kind_from_xy(xy),
                         submodule: submodule_state_of(line),
                         is_rename: true,
@@ -855,7 +865,9 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                 if let Some(path) = field_after_space(line, 10) {
                     entries.push(StatusEntry {
                         path: lossy(path),
+                        raw_path: path.to_vec(),
                         origin: None,
+                        raw_origin: None,
                         kind: ChangeKind::Conflicted,
                         submodule: None,
                         is_rename: false,
@@ -869,7 +881,9 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                 if let Some(path) = field_after_space(line, 1) {
                     entries.push(StatusEntry {
                         path: lossy(path),
+                        raw_path: path.to_vec(),
                         origin: None,
+                        raw_origin: None,
                         kind: ChangeKind::Untracked,
                         submodule: None,
                         is_rename: false,
@@ -886,7 +900,7 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
     entries
 }
 
-fn changed_index_paths(entries: &[StatusEntry]) -> Vec<&str> {
+fn changed_index_paths(entries: &[StatusEntry]) -> Vec<&[u8]> {
     let mut paths = BTreeSet::new();
     for entry in entries {
         // The forced content pass has nothing to do for an untracked path or a
@@ -898,29 +912,43 @@ fn changed_index_paths(entries: &[StatusEntry]) -> Vec<&str> {
         {
             continue;
         }
-        paths.insert(entry.path.as_str());
+        paths.insert(entry.raw_path.as_slice());
     }
     paths.into_iter().collect()
 }
 
-fn snapshot_path_still_hashable(checkout: &Path, path: &str, timeout: Duration) -> Result<bool> {
-    let status = git_ok(
-        checkout,
-        &[
-            "--no-optional-locks",
-            "--literal-pathspecs",
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--untracked-files=no",
-            "--",
-            path,
-        ],
+fn snapshot_path_still_hashable(
+    checkout: &Path,
+    raw_path: &[u8],
+    timeout: Duration,
+) -> Result<bool> {
+    let mut command = git_command(checkout, &[]);
+    command.args([
+        "--no-optional-locks",
+        "--literal-pathspecs",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=no",
+        "--",
+    ]);
+    command.arg(OsString::from_vec(raw_path.to_vec()));
+    let status = run_command(
+        command,
         timeout,
+        format!("git status path probe in {}", checkout.display()),
     )?;
+    if status.timed_out || !status.ok() {
+        return Err(format!(
+            "git status path probe failed in {}: {}",
+            checkout.display(),
+            status.stderr_text()
+        )
+        .into());
+    }
     Ok(parse_status_v2(&status.stdout)
         .into_iter()
-        .any(|entry| entry.path == path && entry.worktree_content))
+        .any(|entry| entry.raw_path == raw_path && entry.worktree_content))
 }
 
 /// Returns everything after the `n`th ASCII space, so a path containing spaces
@@ -1083,8 +1111,67 @@ fn count_of(field: &[u8]) -> u64 {
 ///   changes nothing (binary diffs report `-` and count zero either way); for a
 ///   text-transforming filter it overstates that path's volume, which the
 ///   runaway thresholds treat as an order-of-magnitude signal anyway.
-fn filter_overrides(checkout: &Path, timeout: Duration) -> Vec<String> {
-    filter_overrides_with_env(checkout, &[], timeout)
+#[derive(Default)]
+struct RepositoryOverrides {
+    filter_args: Vec<String>,
+    custom_merge_drivers: Vec<String>,
+}
+
+fn repository_overrides_with_env(
+    checkout: &Path,
+    envs: &[(&str, OsString)],
+    timeout: Duration,
+) -> RepositoryOverrides {
+    let Ok(output) = run_git(
+        checkout,
+        &[
+            "config",
+            "--name-only",
+            "--get-regexp",
+            "^(filter\\.|merge\\..*\\.driver$)",
+        ],
+        envs,
+        timeout,
+    ) else {
+        return RepositoryOverrides::default();
+    };
+    if !output.ok() {
+        return RepositoryOverrides::default();
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut filter_drivers = BTreeSet::new();
+    let mut merge_drivers = BTreeSet::new();
+    for key in listing.lines().map(str::trim) {
+        if let Some(rest) = key.strip_prefix("filter.") {
+            for suffix in [".clean", ".smudge", ".process", ".required"] {
+                if let Some(name) = rest.strip_suffix(suffix) {
+                    if !name.is_empty() {
+                        filter_drivers.insert(name.to_string());
+                    }
+                    break;
+                }
+            }
+        } else if let Some(name) = key
+            .strip_prefix("merge.")
+            .and_then(|rest| rest.strip_suffix(".driver"))
+            .filter(|name| !name.is_empty())
+        {
+            merge_drivers.insert(name.to_string());
+        }
+    }
+    let mut filter_args = Vec::new();
+    for driver in filter_drivers {
+        for key in ["clean", "process"] {
+            filter_args.push("-c".to_string());
+            filter_args.push(format!("filter.{driver}.{key}="));
+        }
+        filter_args.push("-c".to_string());
+        filter_args.push(format!("filter.{driver}.required=false"));
+    }
+    RepositoryOverrides {
+        filter_args,
+        custom_merge_drivers: merge_drivers.into_iter().collect(),
+    }
 }
 
 fn filter_overrides_with_env(
@@ -1092,46 +1179,8 @@ fn filter_overrides_with_env(
     envs: &[(&str, OsString)],
     timeout: Duration,
 ) -> Vec<String> {
-    let Ok(out) = run_git(
-        checkout,
-        &["config", "--name-only", "--get-regexp", "^filter\\."],
-        envs,
-        timeout,
-    ) else {
-        return Vec::new();
-    };
-    // Exit 1 simply means the repository configures no filters.
-    if !out.ok() {
-        return Vec::new();
-    }
-    let listing = String::from_utf8_lossy(&out.stdout).into_owned();
-    let mut drivers: BTreeSet<&str> = BTreeSet::new();
-    for line in listing.lines().map(str::trim) {
-        let Some(rest) = line.strip_prefix("filter.") else {
-            continue;
-        };
-        // A driver name may itself contain dots, so strip from the right.
-        for suffix in [".clean", ".smudge", ".process", ".required"] {
-            if let Some(name) = rest.strip_suffix(suffix) {
-                if !name.is_empty() {
-                    drivers.insert(name);
-                }
-                break;
-            }
-        }
-    }
-    let mut args = Vec::new();
-    for driver in drivers {
-        for key in ["clean", "process"] {
-            args.push("-c".to_string());
-            args.push(format!("filter.{driver}.{key}="));
-        }
-        args.push("-c".to_string());
-        args.push(format!("filter.{driver}.required=false"));
-    }
-    args
+    repository_overrides_with_env(checkout, envs, timeout).filter_args
 }
-
 /// Everything `checkout` has changed relative to its merge base with `base`:
 /// staged, unstaged, untracked, conflicted, and committed-since-merge-base.
 ///
@@ -1153,6 +1202,7 @@ pub struct ChangeSetRead {
     pub head: HeadState,
     pub status_entries: Vec<StatusEntry>,
     pub filter_overrides: Vec<String>,
+    pub custom_merge_drivers: Vec<String>,
     pub target_oid: Option<String>,
 }
 
@@ -1162,6 +1212,15 @@ pub fn change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<Chan
 }
 
 pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result<ChangeSetRead> {
+    read_change_set_inner(checkout, base, timeout, true)
+}
+
+fn read_change_set_inner(
+    checkout: &Path,
+    base: &str,
+    timeout: Duration,
+    include_submodule_volume: bool,
+) -> Result<ChangeSetRead> {
     let mut kinds: BTreeMap<String, ChangeKind> = BTreeMap::new();
     // Line volume is attributed per path so an ignored path takes its lines
     // with it rather than leaving them to trip the runaway threshold alone.
@@ -1171,6 +1230,7 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
     // changed file, so this half must not count twice toward `runaway_files`.
     let mut rename_origins: BTreeSet<String> = BTreeSet::new();
     let mut uncomparable_submodules: BTreeSet<String> = BTreeSet::new();
+    let mut nested_changed_files: BTreeMap<String, usize> = BTreeMap::new();
     let mut set = ChangeSet::default();
     let mut reasons: Vec<String> = Vec::new();
 
@@ -1243,7 +1303,9 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
     // Every command below that hashes working-tree bytes receives the same
     // content-filter neutralization, including the no-index reader for
     // untracked files.
-    let filter_overrides = filter_overrides(checkout, timeout);
+    let repository_overrides = repository_overrides_with_env(checkout, &[], timeout);
+    let filter_overrides = repository_overrides.filter_args;
+    let custom_merge_drivers = repository_overrides.custom_merge_drivers;
 
     let mut target_oid = None;
     if let Some(head_oid) = head.oid() {
@@ -1342,7 +1404,7 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
     // deadline.
     let mut count_path = |entry: &StatusEntry| match count_lines_with_git(
         &top_level,
-        &entry.path,
+        &entry.raw_path,
         &filter_overrides,
         timeout,
     ) {
@@ -1369,10 +1431,41 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
         }
     }
 
+    if include_submodule_volume {
+        for entry in &entries {
+            let dirty_contents = entry
+                .submodule
+                .is_some_and(|submodule| submodule.modified_content || submodule.untracked_content);
+            if !dirty_contents {
+                continue;
+            }
+            let nested_checkout = top_level.join(OsString::from_vec(entry.raw_path.clone()));
+            match read_change_set_inner(&nested_checkout, "HEAD", timeout, false) {
+                Ok(nested) => {
+                    let nested_set = nested.change_set;
+                    let nested_files = nested_set
+                        .paths
+                        .iter()
+                        .filter(|path| !path.is_rename_origin)
+                        .count();
+                    let nested_volume = volume.entry(entry.path.clone()).or_default();
+                    nested_volume.0 = nested_volume.0.saturating_add(nested_set.lines_added);
+                    nested_volume.1 = nested_volume.1.saturating_add(nested_set.lines_removed);
+                    nested_changed_files.insert(entry.path.clone(), nested_files);
+                }
+                Err(err) => reasons.push(format!(
+                    "{DEGRADED_PARTIAL_VOLUME}: could not measure submodule `{}` volume: {err}",
+                    entry.path
+                )),
+            }
+        }
+    }
+
     set.paths = kinds
         .into_iter()
         .map(|(path, kind)| {
             let (added, removed) = volume.get(&path).copied().unwrap_or((0, 0));
+            let nested_files = nested_changed_files.get(&path).copied().unwrap_or(0);
             ChangedPath {
                 is_rename_origin: rename_origins.contains(&path),
                 submodule_contents_uncomparable: uncomparable_submodules.contains(&path),
@@ -1380,6 +1473,7 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
                 kind,
                 lines_added: added,
                 lines_removed: removed,
+                nested_changed_files: nested_files,
             }
         })
         .collect();
@@ -1396,6 +1490,7 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
         top_level,
         head,
         status_entries: entries,
+        custom_merge_drivers,
         filter_overrides,
         target_oid,
     })
@@ -1429,27 +1524,20 @@ fn note(kinds: &mut BTreeMap<String, ChangeKind>, path: String, kind: ChangeKind
 
 fn count_lines_with_git(
     top_level: &Path,
-    path: &str,
+    raw_path: &[u8],
     filter_overrides: &[String],
     timeout: Duration,
 ) -> std::result::Result<u64, String> {
-    // A lossy display surrogate no longer addresses the file on disk. This is
-    // unchanged from the former direct reader, which also found no such path.
-    if is_lossy_display_path(path) {
-        return Ok(0);
-    }
-    let mut args: Vec<&str> = filter_overrides.iter().map(String::as_str).collect();
-    args.extend([
-        "diff",
-        "--no-index",
-        "--numstat",
-        "-z",
-        "--",
-        "/dev/null",
-        path,
-    ]);
-    let output = git(top_level, &args, timeout).map_err(|err| err.to_string())?;
-    // `--no-index` uses exit 1 to mean "different", not failure.
+    let mut command = git_command(top_level, &[]);
+    command.args(filter_overrides);
+    command.args(["diff", "--no-index", "--numstat", "-z", "--", "/dev/null"]);
+    command.arg(OsString::from_vec(raw_path.to_vec()));
+    let output = run_command(
+        command,
+        timeout,
+        format!("bounded file read in {}", top_level.display()),
+    )
+    .map_err(|err| err.to_string())?;
     if output.timed_out || output.code.is_none() {
         return Err("bounded file read timed out".to_string());
     }
@@ -1575,6 +1663,7 @@ struct Side {
     tree: Option<String>,
     dirty: bool,
     unmerged: bool,
+    custom_merge_drivers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1704,6 +1793,7 @@ impl Predictor {
             tree: None,
             dirty: false,
             unmerged: false,
+            custom_merge_drivers: Vec::new(),
         });
     }
 
@@ -1813,6 +1903,7 @@ impl Predictor {
                 tree: None,
                 dirty: false,
                 unmerged: false,
+                custom_merge_drivers: Vec::new(),
             },
         );
         Ok(())
@@ -1930,9 +2021,11 @@ impl Predictor {
         let unmerged = entries
             .iter()
             .any(|entry| entry.kind == ChangeKind::Conflicted);
+        let repository_overrides = repository_overrides_with_env(checkout, &env, self.timeout);
+        let custom_merge_drivers = repository_overrides.custom_merge_drivers;
+        let overrides = repository_overrides.filter_args;
         let tree = if dirty {
             let changed = changed_index_paths(&entries);
-            let overrides = filter_overrides_with_env(checkout, &env, self.timeout);
             Some(self.snapshot_tree_from_git_dir(
                 checkout,
                 SnapshotSource {
@@ -1957,6 +2050,7 @@ impl Predictor {
                 tree,
                 dirty,
                 unmerged,
+                custom_merge_drivers,
             },
         })
     }
@@ -2059,6 +2153,7 @@ impl Predictor {
             tree,
             dirty,
             unmerged,
+            custom_merge_drivers: input.read.custom_merge_drivers.clone(),
         })
     }
 
@@ -2118,6 +2213,8 @@ impl Predictor {
         let entries = parse_status_v2(&status.stdout);
         let dirty = !entries.is_empty();
         let unmerged = entries.iter().any(|e| e.kind == ChangeKind::Conflicted);
+        let custom_merge_drivers =
+            repository_overrides_with_env(checkout, &[], self.timeout).custom_merge_drivers;
 
         let tree = if dirty {
             let changed = changed_index_paths(&entries);
@@ -2132,6 +2229,7 @@ impl Predictor {
             tree,
             dirty,
             unmerged,
+            custom_merge_drivers,
         })
     }
 
@@ -2149,7 +2247,7 @@ impl Predictor {
         &self,
         checkout: &Path,
         common_dir: &Path,
-        changed: &[&str],
+        changed: &[&[u8]],
     ) -> Result<String> {
         let out = git_ok(
             checkout,
@@ -2176,7 +2274,7 @@ impl Predictor {
         &self,
         checkout: &Path,
         source: SnapshotSource<'_>,
-        changed: &[&str],
+        changed: &[&[u8]],
     ) -> Result<String> {
         let git_dir = source.git_dir;
         let odb = source.odb;
@@ -2218,16 +2316,30 @@ impl Predictor {
         // `changed` already contains only status records that prove hashable
         // worktree content. Missing files and type changes are left to the
         // general add below.
-        let eligible: Vec<&str> = changed.to_vec();
+        let eligible: Vec<&[u8]> = changed.to_vec();
 
         // Status paths are user-controlled, so bound both their count and bytes
         // before one snapshot can grow past the operating system's exec limit.
         const MAX_PATH_BYTES: usize = 32 * 1024;
         const MAX_PATHS: usize = 256;
-        let refresh_chunk = |paths: &[&str]| -> Result<GitOut> {
+        let pathspec = TempIndex::new(self.scratch.join(format!("{index_prefix}-paths-{seq}")))?;
+        let refresh_chunk = |paths: &[&[u8]]| -> Result<GitOut> {
+            let mut pathspec_bytes = Vec::new();
+            for path in paths {
+                pathspec_bytes.extend_from_slice(path);
+                pathspec_bytes.push(0);
+            }
+            fs::write(&pathspec.path, pathspec_bytes)?;
+            let pathspec_arg = format!("--pathspec-from-file={}", pathspec.path.to_string_lossy());
             let mut args: Vec<&str> = overrides.iter().map(String::as_str).collect();
-            args.extend(["--literal-pathspecs", "add", "-A", "--renormalize", "--"]);
-            args.extend_from_slice(paths);
+            args.extend([
+                "--literal-pathspecs",
+                "add",
+                "-A",
+                "--renormalize",
+                "--pathspec-file-nul",
+                &pathspec_arg,
+            ]);
             run_git(checkout, &args, &env, self.timeout)
         };
         let mut first = 0;
@@ -2441,6 +2553,20 @@ impl Predictor {
             right_advisory: r.unmerged,
             ..Default::default()
         };
+        let custom_drivers: BTreeSet<&str> = l
+            .custom_merge_drivers
+            .iter()
+            .chain(&r.custom_merge_drivers)
+            .map(String::as_str)
+            .collect();
+        if !custom_drivers.is_empty() {
+            return Err(format!(
+                "custom merge driver(s) configured ({}); prediction is unavailable because \
+                 collide will not execute repository merge programs",
+                custom_drivers.into_iter().collect::<Vec<_>>().join(", ")
+            )
+            .into());
+        }
 
         // There is deliberately no prefilter here. There used to be one — skip
         // the pair when `paths` is empty, unless either side has a rename — and
@@ -2622,6 +2748,13 @@ impl Predictor {
     /// this path never reads status or creates another snapshot.
     pub fn predict_target(&self, checkout: &Path, target_ref: &str) -> Result<TargetMergeOutcome> {
         let side = self.side(checkout)?;
+        if !side.custom_merge_drivers.is_empty() {
+            return Err(format!(
+                "custom merge driver(s) configured ({}); target prediction is unavailable",
+                side.custom_merge_drivers.join(", ")
+            )
+            .into());
+        }
         let key = (side.common_dir.clone(), target_ref.to_string());
         let target = self.targets.get(&key).ok_or_else(|| {
             format!(
