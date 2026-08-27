@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `cycle_timeout_seconds`, a 30-second default wall-clock budget for one
+  repository-analysis refresh. The absolute deadline is inherited by checkout
+  and prediction workers; an overrun produces visible `cycle-timeout` unknown
+  statuses for every observed checkout instead of publishing partial clean
+  output.
+
+### Fixed
+
+- Repository identity, per-worktree and nested Git-directory discovery, and
+  untracked-file line reads now stay behind bounded Git subprocesses rather
+  than performing unbounded repository filesystem reads in the daemon process.
+  Content filters remain neutralised for the new no-index line-count path.
+
+
 ## [0.1.3] - 2026-08-26
 
 ### Added

@@ -27,6 +27,10 @@ pub const DEFAULT_GIT_TIMEOUT_SECONDS: u64 = 10;
 pub const MIN_GIT_TIMEOUT_SECONDS: u64 = 1;
 pub const MAX_GIT_TIMEOUT_SECONDS: u64 = 600;
 
+pub const DEFAULT_CYCLE_TIMEOUT_SECONDS: u64 = 30;
+pub const MIN_CYCLE_TIMEOUT_SECONDS: u64 = 1;
+pub const MAX_CYCLE_TIMEOUT_SECONDS: u64 = 3_600;
+
 const MAX_TTL_MS: u64 = 86_400_000;
 const _: () = assert!(MAX_INTERVAL_SECONDS.saturating_mul(3_000) <= MAX_TTL_MS);
 
@@ -57,9 +61,10 @@ pub struct Config {
     /// `origin` — the workspace still reports its dirty state, only its
     /// committed-since-base paths are missing.
     pub base_ref: String,
-    /// Timeout for any single git invocation, so one slow repo cannot stall
-    /// the refresh loop.
+    /// Timeout for any single git invocation.
     pub git_timeout: Duration,
+    /// Overall wall-clock budget for one complete refresh cycle.
+    pub cycle_timeout: Duration,
 }
 
 impl Default for Config {
@@ -82,6 +87,7 @@ impl Default for Config {
             notifications_enabled: false,
             base_ref: DEFAULT_BASE_REF.to_string(),
             git_timeout: Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECONDS),
+            cycle_timeout: Duration::from_secs(DEFAULT_CYCLE_TIMEOUT_SECONDS),
         }
     }
 }
@@ -122,8 +128,8 @@ pub fn load_with_args(args: &[String]) -> Result<Config> {
         config.base_ref = base_ref;
     }
     // Clamped last so neither source can push the derived TTL past herdr's
-    // ceiling or below its floor, and so a zero git timeout can never mean
-    // "fail every git call".
+    // ceiling or below its floor, a zero git timeout can never mean "fail every
+    // git call", and a zero cycle budget cannot make every refresh fail.
     config.interval = Duration::from_secs(
         config
             .interval
@@ -135,6 +141,12 @@ pub fn load_with_args(args: &[String]) -> Result<Config> {
             .git_timeout
             .as_secs()
             .clamp(MIN_GIT_TIMEOUT_SECONDS, MAX_GIT_TIMEOUT_SECONDS),
+    );
+    config.cycle_timeout = Duration::from_secs(
+        config
+            .cycle_timeout
+            .as_secs()
+            .clamp(MIN_CYCLE_TIMEOUT_SECONDS, MAX_CYCLE_TIMEOUT_SECONDS),
     );
     Ok(config)
 }
@@ -156,11 +168,12 @@ struct FileConfig {
     notifications_enabled: Option<bool>,
     base_ref: Option<String>,
     git_timeout_seconds: Option<u64>,
+    cycle_timeout_seconds: Option<u64>,
 }
 
 /// Every key `FileConfig` understands. Kept beside the struct because the
 /// unknown-key warning is only useful while the two agree.
-const KNOWN_KEYS: [&str; 10] = [
+const KNOWN_KEYS: [&str; 11] = [
     "interval_seconds",
     "runaway_files",
     "runaway_lines",
@@ -171,6 +184,7 @@ const KNOWN_KEYS: [&str; 10] = [
     "notifications_enabled",
     "base_ref",
     "git_timeout_seconds",
+    "cycle_timeout_seconds",
 ];
 
 fn config_file() -> PathBuf {
@@ -259,6 +273,9 @@ fn load_file() -> Config {
     }
     if let Some(seconds) = file.git_timeout_seconds {
         config.git_timeout = Duration::from_secs(seconds);
+    }
+    if let Some(seconds) = file.cycle_timeout_seconds {
+        config.cycle_timeout = Duration::from_secs(seconds);
     }
     config
 }

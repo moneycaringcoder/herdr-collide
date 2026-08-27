@@ -319,7 +319,8 @@ badge down.
   "conflict_history": false,
   "notifications_enabled": false,
   "base_ref": "origin/HEAD",
-  "git_timeout_seconds": 10
+  "git_timeout_seconds": 10,
+  "cycle_timeout_seconds": 30
 }
 ```
 
@@ -375,8 +376,11 @@ badge down.
   for a single run, and a configured ref that does not resolve is likewise reported as unknown.
   Refs are read only from the local ref store: `collide` never fetches, so a verdict against a stale
   `origin/main` explicitly describes where that ref was, not where the remote branch is now.
-- **`git_timeout_seconds`** — cap on any single git invocation, so one slow repository cannot stall
-  the refresh loop.
+- **`git_timeout_seconds`** — cap on any single Git invocation. Default 10 seconds.
+- **`cycle_timeout_seconds`** — wall-clock budget for one complete refresh. Default 30 seconds,
+  clamped to 1–3600. When the budget expires, outstanding Git children inherit only the remaining
+  time and the cycle reports every observed checkout as `unknown` with a `cycle-timeout` note
+  instead of publishing a partially clean result.
 
 ## How it works
 

@@ -14,6 +14,7 @@
 //!   call the pure pass.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::git;
@@ -457,7 +458,11 @@ fn has_reason_code(set: &ChangeSet, code: &str) -> bool {
 /// 3. **A deterministic pick among the members' own top levels.** Any rule will
 ///    do provided every member lands on the same answer; a checkout that is not
 ///    a linked worktree first, then the shortest path.
-fn agree_on_repo_root(checkouts: &mut [Checkout], trees: &WorkTrees) {
+fn agree_on_repo_root(
+    checkouts: &mut [Checkout],
+    trees: &WorkTrees,
+    git_dirs: &BTreeMap<String, std::path::PathBuf>,
+) {
     let mut roots: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
     for checkout in checkouts.iter() {
         let key = checkout.repo_key.0.as_str();
@@ -467,9 +472,9 @@ fn agree_on_repo_root(checkouts: &mut [Checkout], trees: &WorkTrees) {
         let members: Vec<&Checkout> = checkouts.iter().filter(|c| c.repo_key.0 == key).collect();
 
         // 1. The member whose own top level owns the common dir.
-        let from_main = members.iter().find_map(|c| {
-            let top = trees.get(&c.workspace_id)?;
-            let git_dir = git::worktree_git_dir(top)?;
+        let from_main = members.iter().find_map(|checkout| {
+            let top = trees.get(&checkout.workspace_id)?;
+            let git_dir = git_dirs.get(&checkout.workspace_id)?;
             (git_dir == std::path::Path::new(key)).then(|| top.to_path_buf())
         });
 
@@ -727,12 +732,22 @@ pub fn gather_for(checkouts: Vec<Checkout>, config: &Config) -> Result<Cycle> {
 /// These probes are read-only and lock-free; `status` remains in the later
 /// sequential change-set phase. Results are restored to snapshot order so
 /// diagnostics and every downstream deterministic sort remain unchanged.
+struct VerifiedCheckouts {
+    checkouts: Vec<Checkout>,
+    git_dirs: BTreeMap<String, std::path::PathBuf>,
+    notes: Vec<String>,
+}
+
 fn verify_checkouts(
     checkouts: Vec<Checkout>,
     timeout: std::time::Duration,
-) -> Result<(Vec<Checkout>, Vec<String>)> {
+) -> Result<VerifiedCheckouts> {
     if checkouts.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(VerifiedCheckouts {
+            checkouts: Vec::new(),
+            git_dirs: BTreeMap::new(),
+            notes: Vec::new(),
+        });
     }
     let workers = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -742,36 +757,42 @@ fn verify_checkouts(
     let indexed: Vec<(usize, Checkout)> = checkouts.into_iter().enumerate().collect();
     let chunk_size = indexed.len().div_ceil(workers);
     let mut results = Vec::with_capacity(indexed.len());
+    let cycle_deadline = git::current_cycle_deadline();
 
     std::thread::scope(|scope| -> Result<()> {
         let handles: Vec<_> = indexed
             .chunks(chunk_size)
             .map(|chunk| {
                 scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|(index, original)| {
-                            let mut checkout = original.clone();
-                            match git::repo_key(&checkout.checkout_path, timeout) {
-                                Ok(key) => {
-                                    checkout.repo_key = key;
-                                    if let Ok(branch) =
-                                        git::current_branch(&checkout.checkout_path, timeout)
-                                    {
-                                        checkout.branch = branch;
+                    git::with_cycle_deadline(cycle_deadline, || {
+                        chunk
+                            .iter()
+                            .map(|(index, original)| {
+                                let mut checkout = original.clone();
+                                match git::repo_key(&checkout.checkout_path, timeout) {
+                                    Ok(key) => {
+                                        checkout.repo_key = key;
+                                        if let Ok(branch) =
+                                            git::current_branch(&checkout.checkout_path, timeout)
+                                        {
+                                            checkout.branch = branch;
+                                        }
+                                        let git_dir =
+                                            git::worktree_git_dir(&checkout.checkout_path, timeout)
+                                                .ok();
+                                        (*index, Ok((checkout, git_dir)))
                                     }
-                                    (*index, Ok(checkout))
+                                    Err(err) => (
+                                        *index,
+                                        Err(format!(
+                                            "skipping {}: {err}",
+                                            checkout.checkout_path.display()
+                                        )),
+                                    ),
                                 }
-                                Err(err) => (
-                                    *index,
-                                    Err(format!(
-                                        "skipping {}: {err}",
-                                        checkout.checkout_path.display()
-                                    )),
-                                ),
-                            }
-                        })
-                        .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>()
+                    })
                 })
             })
             .collect();
@@ -787,14 +808,24 @@ fn verify_checkouts(
 
     results.sort_by_key(|(index, _)| *index);
     let mut verified = Vec::new();
+    let mut git_dirs = BTreeMap::new();
     let mut notes = Vec::new();
     for (_, result) in results {
         match result {
-            Ok(checkout) => verified.push(checkout),
+            Ok((checkout, git_dir)) => {
+                if let Some(git_dir) = git_dir {
+                    git_dirs.insert(checkout.workspace_id.clone(), git_dir);
+                }
+                verified.push(checkout);
+            }
             Err(note) => notes.push(note),
         }
     }
-    Ok((verified, notes))
+    Ok(VerifiedCheckouts {
+        checkouts: verified,
+        git_dirs,
+        notes,
+    })
 }
 
 /// Gathers only the verified repository containing `workspace_id`.
@@ -814,7 +845,103 @@ fn gather_for_retained(checkouts: Vec<Checkout>, config: &Config) -> Result<Reta
     gather_for_retained_scoped(checkouts, config, None)
 }
 
+fn deadline_gather(
+    mut checkouts: Vec<Checkout>,
+    config: &Config,
+    workspace_id: Option<&str>,
+    detail: &str,
+) -> RetainedGather {
+    if let Some(workspace_id) = workspace_id {
+        if let Some(repo_key) = checkouts
+            .iter()
+            .find(|checkout| checkout.workspace_id == workspace_id)
+            .map(|checkout| checkout.repo_key.clone())
+        {
+            checkouts.retain(|checkout| checkout.repo_key == repo_key);
+        } else {
+            checkouts.clear();
+        }
+    }
+    let reason = format!(
+        "{}: refresh exceeded the {}s cycle budget: {detail}",
+        git::DEGRADED_CYCLE_TIMEOUT,
+        config.cycle_timeout.as_secs()
+    );
+    let changes: Vec<(String, ChangeSet)> = checkouts
+        .iter()
+        .map(|checkout| {
+            (
+                checkout.workspace_id.clone(),
+                ChangeSet {
+                    degraded: true,
+                    degraded_reason: Some(reason.clone()),
+                    ..ChangeSet::default()
+                },
+            )
+        })
+        .collect();
+    let statuses = checkouts
+        .iter()
+        .map(|checkout| WorkspaceStatus {
+            workspace_id: checkout.workspace_id.clone(),
+            severity: Severity::Unknown,
+            overlap_count: 0,
+            conflict_count: 0,
+            unknown_count: 0,
+            runaway: false,
+            lines_changed: 0,
+            changed_files: 0,
+        })
+        .collect();
+    let targets = checkouts
+        .iter()
+        .map(|checkout| TargetPrediction {
+            workspace_id: checkout.workspace_id.clone(),
+            target_ref: Some(config.base_ref.clone()),
+            verdict: TargetVerdict::Unknown,
+            approximate: false,
+            advisory: false,
+            reason: Some(reason.clone()),
+        })
+        .collect();
+    RetainedGather {
+        cycle: Cycle {
+            report: Report {
+                checkouts,
+                pairings: Vec::new(),
+                statuses,
+                targets,
+                changes: changes.clone(),
+            },
+            changes,
+            notes: vec![reason],
+        },
+        predictor: None,
+        predictions: Vec::new(),
+    }
+}
+
 fn gather_for_retained_scoped(
+    checkouts: Vec<Checkout>,
+    config: &Config,
+    workspace_id: Option<&str>,
+) -> Result<RetainedGather> {
+    let observed = checkouts.clone();
+    let deadline = Instant::now() + config.cycle_timeout;
+    let result = git::with_cycle_deadline(Some(deadline), || {
+        gather_for_retained_scoped_inner(checkouts, config, workspace_id)
+    });
+    if Instant::now() >= deadline {
+        let detail = result.as_ref().err().map_or_else(
+            || "the cycle did not finish before its deadline".to_string(),
+            |err| err.to_string(),
+        );
+        return Ok(deadline_gather(observed, config, workspace_id, &detail));
+    }
+    result
+}
+
+fn gather_for_retained_scoped_inner(
     checkouts: Vec<Checkout>,
     config: &Config,
     workspace_id: Option<&str>,
@@ -825,8 +952,10 @@ fn gather_for_retained_scoped(
     // checkouts are only ever compared when their canonicalized
     // `--git-common-dir` matches, and a symlinked or relocated worktree can
     // easily report a repo_key that no longer agrees with it.
-    let (mut verified, verification_notes) = verify_checkouts(checkouts, config.git_timeout)?;
-    notes.extend(verification_notes);
+    let verified_read = verify_checkouts(checkouts, config.git_timeout)?;
+    let mut verified = verified_read.checkouts;
+    let git_dirs = verified_read.git_dirs;
+    notes.extend(verified_read.notes);
     if let Some(workspace_id) = workspace_id {
         let repo_key = verified
             .iter()
@@ -885,7 +1014,7 @@ fn gather_for_retained_scoped(
             }
         }
     }
-    agree_on_repo_root(&mut verified, &trees);
+    agree_on_repo_root(&mut verified, &trees, &git_dirs);
 
     let mut report = analyse(&verified, &changes, &trees, config);
 
@@ -1132,114 +1261,114 @@ fn predict_all(
 
     let mut results: Vec<(PredictedPair, Vec<String>)> = Vec::with_capacity(jobs.len());
     let mut panicked = 0usize;
+    let cycle_deadline = git::current_cycle_deadline();
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in jobs.chunks(jobs.len().div_ceil(workers)) {
             handles.push(scope.spawn(move || {
-                chunk
-                    .iter()
-                    .map(|(pairing, left, right)| {
-                        let paths: Vec<String> =
-                            pairing.shared.iter().map(|s| s.path.clone()).collect();
-                        match predictor.predict_pair(
-                            &left.checkout_path,
-                            &right.checkout_path,
-                            &paths,
-                        ) {
-                            Ok(prediction) => {
-                                let mut nested_notes = Vec::new();
-                                for nested in &prediction.submodules {
-                                    if nested.approximate {
-                                        nested_notes.push(format!(
-                                            "{} vs {}: submodule `{}` has multiple nested merge \
-                                             bases, so one was forced and its verdict approximates \
-                                             what a real nested merge would do",
-                                            pairing.left_workspace_id,
-                                            pairing.right_workspace_id,
-                                            nested.path
-                                        ));
-                                    }
-                                    match nested.conflict {
-                                        Some(true) => {
-                                            let detail = if nested.conflicting_paths.is_empty() {
-                                                "the nested merge reported a pair-level conflict \
-                                                 without naming a path"
-                                                    .to_string()
-                                            } else {
-                                                format!(
-                                                    "nested paths {} conflict",
-                                                    nested
-                                                        .conflicting_paths
-                                                        .iter()
-                                                        .map(|path| format!("`{path}`"))
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ")
-                                                )
-                                            };
+                git::with_cycle_deadline(cycle_deadline, || {
+                    chunk
+                        .iter()
+                        .map(|(pairing, left, right)| {
+                            let paths: Vec<String> =
+                                pairing.shared.iter().map(|s| s.path.clone()).collect();
+                            match predictor.predict_pair(
+                                &left.checkout_path,
+                                &right.checkout_path,
+                                &paths,
+                            ) {
+                                Ok(prediction) => {
+                                    let mut nested_notes = Vec::new();
+                                    for nested in &prediction.submodules {
+                                        if nested.approximate {
                                             nested_notes.push(format!(
-                                                "{} vs {}: submodule `{}` conflicts internally; \
-                                                 {detail}",
+                                                "{} vs {}: submodule `{}` has multiple nested merge \
+                                                 bases, so one was forced and its verdict approximates \
+                                                 what a real nested merge would do",
                                                 pairing.left_workspace_id,
                                                 pairing.right_workspace_id,
                                                 nested.path
                                             ));
                                         }
-                                        None => nested_notes.push(format!(
-                                            "{} vs {}: submodule `{}` comparison is unknown: {}",
-                                            pairing.left_workspace_id,
-                                            pairing.right_workspace_id,
-                                            nested.path,
-                                            nested.reason.as_deref().unwrap_or(
-                                                "the nested comparison could not complete"
-                                            )
-                                        )),
-                                        Some(false) => {}
+                                        match nested.conflict {
+                                            Some(true) => {
+                                                let detail = if nested.conflicting_paths.is_empty() {
+                                                    "the nested merge reported a pair-level conflict \
+                                                     without naming a path"
+                                                        .to_string()
+                                                } else {
+                                                    format!(
+                                                        "nested paths {} conflict",
+                                                        nested
+                                                            .conflicting_paths
+                                                            .iter()
+                                                            .map(|path| format!("`{path}`"))
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ")
+                                                    )
+                                                };
+                                                nested_notes.push(format!(
+                                                    "{} vs {}: submodule `{}` conflicts internally; \
+                                                     {detail}",
+                                                    pairing.left_workspace_id,
+                                                    pairing.right_workspace_id,
+                                                    nested.path
+                                                ));
+                                            }
+                                            None => nested_notes.push(format!(
+                                                "{} vs {}: submodule `{}` comparison is unknown: {}",
+                                                pairing.left_workspace_id,
+                                                pairing.right_workspace_id,
+                                                nested.path,
+                                                nested.reason.as_deref().unwrap_or(
+                                                    "the nested comparison could not complete"
+                                                )
+                                            )),
+                                            Some(false) => {}
+                                        }
                                     }
-                                }
-                                // `--why` keeps the prediction to read its merged
-                                // tree, so every field it needs is cloned rather
-                                // than moved out of it here.
-                                let verdicts = PairVerdicts {
-                                    left_workspace_id: pairing.left_workspace_id.clone(),
-                                    right_workspace_id: pairing.right_workspace_id.clone(),
-                                    verdicts: prediction.verdicts.clone(),
-                                    conflict_types_by_path: prediction
-                                        .conflict_types_by_path
-                                        .clone(),
-                                    submodules: prediction.submodules.clone(),
-                                    failed: false,
-                                    approximate: prediction.approximate,
-                                };
-                                (
-                                    PredictedPair {
-                                        verdicts,
-                                        prediction: Some(prediction),
-                                    },
-                                    nested_notes,
-                                )
-                            }
-                            Err(err) => (
-                                PredictedPair {
-                                    verdicts: PairVerdicts {
+                                    let verdicts = PairVerdicts {
                                         left_workspace_id: pairing.left_workspace_id.clone(),
                                         right_workspace_id: pairing.right_workspace_id.clone(),
-                                        verdicts: Vec::new(),
-                                        submodules: Vec::new(),
-                                        conflict_types_by_path: BTreeMap::new(),
-                                        failed: true,
-                                        approximate: false,
+                                        verdicts: prediction.verdicts.clone(),
+                                        conflict_types_by_path: prediction
+                                            .conflict_types_by_path
+                                            .clone(),
+                                        submodules: prediction.submodules.clone(),
+                                        failed: false,
+                                        approximate: prediction.approximate,
+                                    };
+                                    (
+                                        PredictedPair {
+                                            verdicts,
+                                            prediction: Some(prediction),
+                                        },
+                                        nested_notes,
+                                    )
+                                }
+                                Err(err) => (
+                                    PredictedPair {
+                                        verdicts: PairVerdicts {
+                                            left_workspace_id: pairing.left_workspace_id.clone(),
+                                            right_workspace_id: pairing.right_workspace_id.clone(),
+                                            verdicts: Vec::new(),
+                                            submodules: Vec::new(),
+                                            conflict_types_by_path: BTreeMap::new(),
+                                            failed: true,
+                                            approximate: false,
+                                        },
+                                        prediction: None,
                                     },
-                                    prediction: None,
-                                },
-                                vec![format!(
-                                    "{} vs {}: {err}",
-                                    left.checkout_path.display(),
-                                    right.checkout_path.display()
-                                )],
-                            ),
-                        }
-                    })
-                    .collect::<Vec<_>>()
+                                    vec![format!(
+                                        "{} vs {}: {err}",
+                                        left.checkout_path.display(),
+                                        right.checkout_path.display()
+                                    )],
+                                ),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
             }));
         }
         for handle in handles {

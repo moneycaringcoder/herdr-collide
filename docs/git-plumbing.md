@@ -212,11 +212,11 @@ The three-dot form already means "from the merge base to HEAD", so no separate
 
 The worktree's change set is the union of the two.
 
-Disk reads for untracked line counts must be joined onto
-`rev-parse --show-toplevel`, not onto the path the caller handed in.
-`status --porcelain` reports paths relative to the repository **root** whatever
-directory git ran in, so a checkout path pointing at a subdirectory otherwise
-addresses `<root>/pkg/pkg/file` and silently counts zero lines.
+Untracked line counts are read through bounded
+`git diff --no-index --numstat -z -- /dev/null <path>` children, with content
+filters neutralised exactly as they are for snapshotting. The path is relative
+to `rev-parse --show-toplevel`, because status paths are repository-relative
+even when the caller handed Git a subdirectory.
 
 ### Choosing the integration ref
 
@@ -650,6 +650,20 @@ the names, and the parser half is covered everywhere from captured bytes
 instead. Do not "fix" that skip by dropping the case: it is a real difference
 between the two supported platforms, and on macOS the bug it guards against
 cannot happen.
+
+## Overall refresh deadline
+
+`git_timeout_seconds` bounds one child; `cycle_timeout_seconds` bounds the
+repository-analysis cycle. An absolute deadline is inherited by checkout and
+pair-prediction worker threads, and every `run_git` call receives the smaller
+of its ordinary timeout and the cycle's remaining time. Once it expires, the
+cycle discards partial clean-looking output and reports all observed checkouts
+as `cycle-timeout` unknowns.
+
+Repository identity, top-level discovery, per-worktree git-dir discovery,
+nested git-dir/common-dir discovery, and untracked line reads all go through
+that process boundary. Scratch/state directory housekeeping remains ordinary
+filesystem I/O because it is plugin-owned rather than repository data.
 
 ## Unverified
 

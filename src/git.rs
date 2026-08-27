@@ -35,6 +35,7 @@
 //! bytes so that two different files can never collapse onto one string.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
@@ -67,6 +68,8 @@ pub const DEGRADED_UNREADABLE: &str = "unreadable";
 /// Line counts could only be read in part, so the runaway thresholds are
 /// measured against an understated total.
 pub const DEGRADED_PARTIAL_VOLUME: &str = "partial-volume";
+/// The overall refresh deadline expired before the cycle completed.
+pub const DEGRADED_CYCLE_TIMEOUT: &str = "cycle-timeout";
 
 /// Reason codes that exclude a checkout from pairing entirely.
 pub const UNPAIRABLE_REASONS: [&str; 2] = [DEGRADED_UNBORN, DEGRADED_BROKEN_HEAD];
@@ -84,11 +87,6 @@ pub const UNPAIRABLE_REASONS: [&str; 2] = [DEGRADED_UNBORN, DEGRADED_BROKEN_HEAD
 /// never be mistaken for one a user configured.
 pub const NO_INTEGRATION_REF: &str = "<no-integration-ref>";
 
-/// Untracked files are line-counted by reading them, since no `diff` covers
-/// them. Anything larger than this is counted as zero lines rather than paying
-/// to read it; runaway detection only needs an order of magnitude.
-const MAX_UNTRACKED_READ: u64 = 8 * 1024 * 1024;
-
 /// How long to keep waiting for a child's pipes after the child itself is gone.
 ///
 /// The child cannot exit until it has written everything, and it can only write
@@ -100,6 +98,42 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Process plumbing
+thread_local! {
+    static CYCLE_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+struct CycleDeadlineGuard {
+    previous: Option<Instant>,
+}
+
+impl Drop for CycleDeadlineGuard {
+    fn drop(&mut self) {
+        CYCLE_DEADLINE.set(self.previous);
+    }
+}
+
+/// Runs `operation` with one absolute refresh deadline on the current thread.
+/// Worker threads must explicitly inherit [`current_cycle_deadline`].
+pub fn with_cycle_deadline<T>(deadline: Option<Instant>, operation: impl FnOnce() -> T) -> T {
+    let previous = CYCLE_DEADLINE.replace(deadline);
+    let _guard = CycleDeadlineGuard { previous };
+    operation()
+}
+
+pub fn current_cycle_deadline() -> Option<Instant> {
+    CYCLE_DEADLINE.get()
+}
+
+pub fn cycle_deadline_expired() -> bool {
+    current_cycle_deadline().is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn effective_timeout(requested: Duration) -> Duration {
+    current_cycle_deadline().map_or(requested, |deadline| {
+        requested.min(deadline.saturating_duration_since(Instant::now()))
+    })
+}
+
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -162,9 +196,6 @@ fn run_git(
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir);
     cmd.args(args);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
 
     // Never inherit a caller's git environment: collide can be launched from a
     // git hook, where GIT_DIR/GIT_INDEX_FILE would silently retarget every
@@ -185,13 +216,25 @@ fn run_git(
     for (key, value) in envs {
         cmd.env(key, value);
     }
+    run_command(cmd, timeout, format!("git in {}", dir.display()))
+}
 
-    // Own process group, so anything git spawns can be killed with it. `setsid`
-    // also drops the controlling terminal, which is a second reason a helper
-    // cannot block us waiting for input. It fails only if the caller is already
-    // a group leader, which a freshly forked child never is; `setpgid` is the
-    // fallback for the paranoid case. Neither failure is worth aborting the
-    // spawn for — the bounded drain below still bounds the damage.
+fn run_command(mut cmd: Command, timeout: Duration, description: String) -> Result<GitOut> {
+    let timeout = effective_timeout(timeout);
+    if timeout.is_zero() {
+        return Ok(GitOut {
+            code: None,
+            stdout: Vec::new(),
+            stderr: b"refresh cycle deadline exceeded".to_vec(),
+            timed_out: true,
+        });
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // Own process group, so descendants can be killed with the direct child.
+    // The bounded drain below remains the fallback if group creation fails.
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
@@ -204,17 +247,13 @@ fn run_git(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to run git in {}: {e}", dir.display()))?;
+        .map_err(|err| format!("failed to run {description}: {err}"))?;
     let child_pid = child.id();
 
     let mut out_pipe = child.stdout.take().expect("stdout piped");
     let mut err_pipe = child.stderr.take().expect("stderr piped");
     let (out_tx, out_rx) = mpsc::channel();
     let (err_tx, err_rx) = mpsc::channel();
-    // Detached deliberately: if a descendant holds the write end open these
-    // threads outlive the call. One blocked thread holding one file descriptor
-    // is the price of never blocking the refresh loop, and it ends by itself the
-    // moment the descendant exits.
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = out_pipe.read_to_end(&mut buf);
@@ -248,10 +287,6 @@ fn run_git(
     let mut stdout = out_rx.recv_timeout(PIPE_DRAIN_GRACE).ok();
     let mut stderr = err_rx.recv_timeout(PIPE_DRAIN_GRACE).ok();
     if stdout.is_none() || stderr.is_none() {
-        // The child is gone and the pipe is still open, so something it spawned
-        // inherited it. Kill the group — but only now, so that a git which
-        // legitimately started a background helper (`fsmonitor--daemon`,
-        // `maintenance run --auto`) and then exited promptly keeps it.
         kill_process_group(child_pid);
         if stdout.is_none() {
             stdout = out_rx.recv_timeout(PIPE_DRAIN_GRACE).ok();
@@ -309,6 +344,52 @@ fn git_ok(dir: &Path, args: &[&str], timeout: Duration) -> Result<GitOut> {
         .into());
     }
     Ok(out)
+}
+
+fn path_exists_bounded(path: &Path, timeout: Duration) -> Result<bool> {
+    let mut command = Command::new("test");
+    command.arg("-e").arg(path);
+    let output = run_command(
+        command,
+        timeout,
+        format!("bounded existence check for {}", path.display()),
+    )?;
+    if output.timed_out {
+        return Err(format!("existence check timed out for {}", path.display()).into());
+    }
+    match output.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "could not check whether {} exists: {}",
+            path.display(),
+            output.stderr_text()
+        )
+        .into()),
+    }
+}
+
+fn copy_file_bounded(source: &Path, destination: &Path, timeout: Duration) -> Result<bool> {
+    if !path_exists_bounded(source, timeout)? {
+        return Ok(false);
+    }
+    let mut command = Command::new("cp");
+    command.arg(source).arg(destination);
+    let output = run_command(
+        command,
+        timeout,
+        format!("copy {} to {}", source.display(), destination.display()),
+    )?;
+    if output.timed_out || !output.ok() {
+        return Err(format!(
+            "could not copy {} to {}: {}",
+            source.display(),
+            destination.display(),
+            output.stderr_text()
+        )
+        .into());
+    }
+    Ok(true)
 }
 
 fn probe(dir: &Path, args: &[&str], timeout: Duration) -> Result<Option<String>> {
@@ -414,51 +495,37 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 // Repo identity and HEAD state
 // ---------------------------------------------------------------------------
 
-/// Resolves a worktree top level's `.git` entry to its canonical git directory
-/// without invoking git.
+/// Resolves a worktree top level to its per-worktree Git directory through a
+/// bounded Git probe.
 ///
-/// This deliberately does not follow `commondir`. The repository-root agreement
-/// rule compares this per-worktree git directory with the canonical common-dir
-/// key: a main worktree's directory or gitfile names the common store itself,
-/// while a linked worktree's gitfile names `<store>/worktrees/<name>`. Preserving
-/// that asymmetry is what makes identification of the main worktree exact.
-pub fn worktree_git_dir(top: &Path) -> Option<PathBuf> {
-    let dot_git = top.join(".git");
-    if dot_git.is_dir() {
-        return fs::canonicalize(dot_git).ok();
-    }
-    if !dot_git.is_file() {
-        return None;
-    }
-
-    let marker = fs::read_to_string(dot_git).ok()?;
-    let raw = marker
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(str::trim)
-        .filter(|path| !path.is_empty())?;
-    let path = PathBuf::from(raw);
-    let git_dir = if path.is_absolute() {
-        path
-    } else {
-        top.join(path)
-    };
-    fs::canonicalize(git_dir).ok()
+/// This deliberately asks for `--absolute-git-dir`, not the common dir. A main
+/// worktree returns the common store itself while a linked worktree returns its
+/// `<store>/worktrees/<name>` directory; preserving that asymmetry is what makes
+/// exact main-worktree identification possible.
+pub fn worktree_git_dir(top: &Path, timeout: Duration) -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        git_ok(
+            top,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+            timeout,
+        )?
+        .stdout_trimmed(),
+    ))
 }
 
-/// Canonicalized `--git-common-dir`: the only safe answer to "are these the
-/// same repository?". Every worktree of one repo shares it, while each has its
-/// own `--git-dir`. Canonicalizing matters because a symlinked or bind-mounted
-/// checkout otherwise yields two keys for one repo.
+/// Absolute `--git-common-dir`: the only safe answer to "are these the same
+/// repository?". Every worktree of one repo shares it, while each has its own
+/// `--git-dir`.
+///
+/// Git resolves gitfiles and common-dir indirection itself. Keeping that work
+/// inside the timed child avoids an unbounded `canonicalize` in the daemon.
 pub fn repo_key(checkout: &Path, timeout: Duration) -> Result<RepoKey> {
     let out = git_ok(
         checkout,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         timeout,
     )?;
-    let raw = PathBuf::from(out.stdout_trimmed());
-    let canonical = fs::canonicalize(&raw).unwrap_or(raw);
-    Ok(RepoKey(canonical.to_string_lossy().into_owned()))
+    Ok(RepoKey(out.stdout_trimmed()))
 }
 /// Resolves the checkout's working-tree root through the same bounded process
 /// boundary as every other Git query.
@@ -690,6 +757,10 @@ pub struct StatusEntry {
     pub submodule: Option<SubmoduleState>,
     pub kind: ChangeKind,
     pub is_rename: bool,
+    /// Whether status proves that this path currently has hashable worktree
+    /// content. Deletions and type changes are left to the general `add -A`
+    /// pass instead of being probed with unbounded filesystem metadata.
+    pub worktree_content: bool,
 }
 
 /// Parses `status --porcelain=v2 -z --untracked-files=all --renames` output.
@@ -724,6 +795,7 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                         kind: kind_from_xy(xy),
                         submodule: submodule_state_of(line),
                         is_rename: false,
+                        worktree_content: worktree_content_from_xy(xy),
                     });
                 }
                 i += 1;
@@ -739,6 +811,7 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                         kind: kind_from_xy(xy),
                         submodule: submodule_state_of(line),
                         is_rename: true,
+                        worktree_content: worktree_content_from_xy(xy),
                     });
                 }
                 // Consume the trailing origin-path field along with the record.
@@ -753,6 +826,7 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                         kind: ChangeKind::Conflicted,
                         submodule: None,
                         is_rename: false,
+                        worktree_content: true,
                     });
                 }
                 i += 1;
@@ -766,6 +840,7 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
                         kind: ChangeKind::Untracked,
                         submodule: None,
                         is_rename: false,
+                        worktree_content: false,
                     });
                 }
                 i += 1;
@@ -781,25 +856,38 @@ pub fn parse_status_v2(bytes: &[u8]) -> Vec<StatusEntry> {
 fn changed_index_paths(entries: &[StatusEntry]) -> Vec<&str> {
     let mut paths = BTreeSet::new();
     for entry in entries {
-        // The forced content pass has nothing to do for an untracked path, and
-        // a gitlink has no worktree file content to hash; the latter must stay
-        // seeded for uninitialised and unborn submodules.
-        if entry.kind == ChangeKind::Untracked || entry.submodule.is_some() {
+        // The forced content pass has nothing to do for an untracked path or a
+        // gitlink. Deletions and type changes are recorded by the general
+        // `add -A` pass; forcing them through `--renormalize` fails.
+        if entry.kind == ChangeKind::Untracked
+            || entry.submodule.is_some()
+            || !entry.worktree_content
+        {
             continue;
         }
         paths.insert(entry.path.as_str());
-        if let Some(origin) = entry.origin.as_deref() {
-            paths.insert(origin);
-        }
     }
     paths.into_iter().collect()
 }
 
-fn snapshot_content_path(checkout: &Path, path: &str) -> bool {
-    fs::symlink_metadata(checkout.join(path)).is_ok_and(|metadata| {
-        let file_type = metadata.file_type();
-        file_type.is_file() || file_type.is_symlink()
-    })
+fn snapshot_path_still_hashable(checkout: &Path, path: &str, timeout: Duration) -> Result<bool> {
+    let status = git_ok(
+        checkout,
+        &[
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=no",
+            "--",
+            path,
+        ],
+        timeout,
+    )?;
+    Ok(parse_status_v2(&status.stdout)
+        .into_iter()
+        .any(|entry| entry.path == path && entry.worktree_content))
 }
 
 /// Returns everything after the `n`th ASCII space, so a path containing spaces
@@ -843,6 +931,10 @@ fn submodule_state_of(line: &[u8]) -> Option<SubmoduleState> {
         }),
         _ => None,
     }
+}
+
+fn worktree_content_from_xy((index, worktree): (u8, u8)) -> bool {
+    !matches!(index, b'D' | b'T') && !matches!(worktree, b'D' | b'T')
 }
 
 /// `X` is the index status, `Y` the worktree status. An unstaged edit is the
@@ -1114,13 +1206,16 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
         }
         _ => {}
     }
+    // Every command below that hashes working-tree bytes receives the same
+    // content-filter neutralization, including the no-index reader for
+    // untracked files.
+    let filter_overrides = filter_overrides(checkout, timeout);
 
     if let Some(head_oid) = head.as_ref().and_then(HeadState::oid) {
         // Dirty-side line volume: everything between HEAD and the working tree.
         // This is the second command that would run the repository's content
         // filters, so it gets the same overrides as the snapshot.
-        let overrides = filter_overrides(checkout, timeout);
-        let mut dirty_args: Vec<&str> = overrides.iter().map(String::as_str).collect();
+        let mut dirty_args: Vec<&str> = filter_overrides.iter().map(String::as_str).collect();
         dirty_args.extend(["diff", "--numstat", "-z", "HEAD"]);
         let dirty = git(checkout, &dirty_args, timeout)?;
         if dirty.ok() {
@@ -1205,20 +1300,35 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
     // silently count zero lines. Resolve the top level once and join against it.
     let top_level = work_tree_root(checkout, timeout)?;
 
-    // Untracked files are invisible to every `diff`, so count them from disk.
-    for entry in &entries {
-        if entry.kind == ChangeKind::Untracked {
-            let lines = count_lines_on_disk(&top_level.join(&entry.path));
+    // Untracked files are invisible to every repository diff. Measure their
+    // line counts through a bounded `git diff --no-index` child rather than
+    // opening repository files in the daemon process, where a slow mount has no
+    // deadline.
+    let mut count_path = |entry: &StatusEntry| match count_lines_with_git(
+        &top_level,
+        &entry.path,
+        &filter_overrides,
+        timeout,
+    ) {
+        Ok(lines) => {
             volume.entry(entry.path.clone()).or_default().0 += lines;
         }
+        Err(err) => reasons.push(format!(
+            "{DEGRADED_PARTIAL_VOLUME}: could not measure `{}` line count: {err}",
+            entry.path
+        )),
+    };
+    for entry in &entries {
+        if entry.kind == ChangeKind::Untracked {
+            count_path(entry);
+        }
     }
-    // With no usable HEAD there is nothing to diff against, so the staged
-    // additions are counted the same way.
+    // With no usable HEAD there is nothing to diff against, so staged and
+    // unstaged additions use the same bounded path.
     if head.as_ref().and_then(HeadState::oid).is_none() {
         for entry in &entries {
             if entry.kind == ChangeKind::Staged || entry.kind == ChangeKind::Unstaged {
-                let lines = count_lines_on_disk(&top_level.join(&entry.path));
-                volume.entry(entry.path.clone()).or_default().0 += lines;
+                count_path(entry);
             }
         }
     }
@@ -1277,30 +1387,38 @@ fn note(kinds: &mut BTreeMap<String, ChangeKind>, path: String, kind: ChangeKind
         .or_insert(kind);
 }
 
-fn count_lines_on_disk(path: &Path) -> u64 {
-    let Ok(meta) = fs::metadata(path) else {
-        return 0;
-    };
-    if !meta.is_file() || meta.len() > MAX_UNTRACKED_READ {
-        return 0;
+fn count_lines_with_git(
+    top_level: &Path,
+    path: &str,
+    filter_overrides: &[String],
+    timeout: Duration,
+) -> std::result::Result<u64, String> {
+    // A lossy display surrogate no longer addresses the file on disk. This is
+    // unchanged from the former direct reader, which also found no such path.
+    if is_lossy_display_path(path) {
+        return Ok(0);
     }
-    let Ok(bytes) = fs::read(path) else {
-        return 0;
-    };
-    // A NUL in the first 8 KiB is git's own binary heuristic; binary files
-    // report no line counts, matching `--numstat`.
-    if bytes.iter().take(8192).any(|b| *b == 0) {
-        return 0;
+    let mut args: Vec<&str> = filter_overrides.iter().map(String::as_str).collect();
+    args.extend([
+        "diff",
+        "--no-index",
+        "--numstat",
+        "-z",
+        "--",
+        "/dev/null",
+        path,
+    ]);
+    let output = git(top_level, &args, timeout).map_err(|err| err.to_string())?;
+    // `--no-index` uses exit 1 to mean "different", not failure.
+    if output.timed_out || output.code.is_none() {
+        return Err("bounded file read timed out".to_string());
     }
-    if bytes.is_empty() {
-        return 0;
+    if !matches!(output.code, Some(0 | 1)) {
+        return Err(output.stderr_text());
     }
-    let newlines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
-    if bytes.last() == Some(&b'\n') {
-        newlines
-    } else {
-        newlines + 1
-    }
+    Ok(parse_numstat_z(&output.stdout)
+        .into_iter()
+        .fold(0u64, |total, stat| total.saturating_add(stat.added)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,62 +1504,23 @@ pub struct SubmodulePrediction {
     pub approximate: bool,
 }
 
-fn nested_repository_dirs(checkout: &Path) -> Result<(PathBuf, PathBuf)> {
-    let dot_git = checkout.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else {
-        let marker = fs::read_to_string(&dot_git).map_err(|err| {
-            format!(
-                "{} is not an initialised submodule checkout: {err}",
-                checkout.display()
-            )
-        })?;
-        let raw = marker
-            .trim()
-            .strip_prefix("gitdir:")
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| format!("{} has an invalid .git file", checkout.display()))?;
-        let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            path
-        } else {
-            checkout.join(path)
-        }
-    };
-    let git_dir = fs::canonicalize(&git_dir).map_err(|err| {
-        format!(
-            "{}: could not resolve nested git dir {}: {err}",
-            checkout.display(),
-            git_dir.display()
-        )
-    })?;
-    let common_dir = match fs::read_to_string(git_dir.join("commondir")) {
-        Ok(raw) => {
-            let path = PathBuf::from(raw.trim());
-            if path.is_absolute() {
-                path
-            } else {
-                git_dir.join(path)
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
-        Err(err) => {
-            return Err(format!(
-                "{}: could not read nested commondir: {err}",
-                checkout.display()
-            )
-            .into())
-        }
-    };
-    let common_dir = fs::canonicalize(&common_dir).map_err(|err| {
-        format!(
-            "{}: could not resolve nested common dir {}: {err}",
-            checkout.display(),
-            common_dir.display()
-        )
-    })?;
+fn nested_repository_dirs(checkout: &Path, timeout: Duration) -> Result<(PathBuf, PathBuf)> {
+    let git_dir = PathBuf::from(
+        git_ok(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+            timeout,
+        )?
+        .stdout_trimmed(),
+    );
+    let common_dir = PathBuf::from(
+        git_ok(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            timeout,
+        )?
+        .stdout_trimmed(),
+    );
     Ok((git_dir, common_dir))
 }
 
@@ -1612,7 +1691,7 @@ impl Predictor {
         // Bootstrap the repository paths from `.git` so even the authoritative
         // rev-parse below starts with writes redirected. Direct submodule
         // checkouts always use a directory or gitfile at this location.
-        let (git_dir, bootstrap_common_dir) = nested_repository_dirs(checkout)?;
+        let (git_dir, bootstrap_common_dir) = nested_repository_dirs(checkout, self.timeout)?;
         let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
         let odb = self.scratch.join(format!("submodule-{seq}")).join("odb");
         fs::create_dir_all(odb.join("pack"))?;
@@ -1638,14 +1717,7 @@ impl Predictor {
             )
             .into());
         }
-        let raw_common_dir = PathBuf::from(common.stdout_trimmed());
-        let common_dir = fs::canonicalize(&raw_common_dir).map_err(|err| {
-            format!(
-                "{}: could not canonicalize nested common dir {}: {err}",
-                checkout.display(),
-                raw_common_dir.display()
-            )
-        })?;
+        let common_dir = PathBuf::from(common.stdout_trimmed());
         let env = vec![
             ("GIT_OBJECT_DIRECTORY", odb.clone().into_os_string()),
             (
@@ -1736,15 +1808,14 @@ impl Predictor {
     }
 
     fn build_side(&self, checkout: &Path) -> Result<Side> {
-        let common_dir = {
-            let out = git_ok(
+        let common_dir = PathBuf::from(
+            git_ok(
                 checkout,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
                 self.timeout,
-            )?;
-            let raw = PathBuf::from(out.stdout_trimmed());
-            fs::canonicalize(&raw).unwrap_or(raw)
-        };
+            )?
+            .stdout_trimmed(),
+        );
 
         let head = match head_state(checkout, self.timeout)? {
             HeadState::Branch { oid, .. } | HeadState::Detached { oid } => oid,
@@ -1851,18 +1922,15 @@ impl Predictor {
         // will not revisit, so an unreadable index silently drops every
         // sparse-checkout and skip-worktree path out of the snapshot tree, and
         // the pair then reports one-sided deletions for files nobody touched.
-        match fs::copy(git_dir.join("index"), &index.path) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(format!(
+        let source_index = git_dir.join("index");
+        let _seeded =
+            copy_file_bounded(&source_index, &index.path, self.timeout).map_err(|err| {
+                format!(
                     "{}: could not seed the snapshot index from {}: {err}",
                     checkout.display(),
-                    git_dir.join("index").display()
+                    source_index.display()
                 )
-                .into())
-            }
-        }
+            })?;
 
         let mut env = base_env.to_vec();
         debug_assert!(env
@@ -1880,14 +1948,10 @@ impl Predictor {
         // old snapshot kept byte-for-byte. Both sides are normalized through
         // the same prediction path.
         //
-        // Missing files cannot be hidden by a stat cache and directories have
-        // no blob to re-read. Both are skipped because renormalizing them is a
-        // hard failure; the general add records their deletion or type change.
-        let eligible: Vec<&str> = changed
-            .iter()
-            .copied()
-            .filter(|path| snapshot_content_path(checkout, path))
-            .collect();
+        // `changed` already contains only status records that prove hashable
+        // worktree content. Missing files and type changes are left to the
+        // general add below.
+        let eligible: Vec<&str> = changed.to_vec();
 
         // Status paths are user-controlled, so bound both their count and bytes
         // before one snapshot can grow past the operating system's exec limit.
@@ -1915,15 +1979,15 @@ impl Predictor {
             let chunk = &eligible[first..end];
             let refresh = refresh_chunk(chunk)?;
             if !refresh.ok() {
-                // A concurrent delete or type change can invalidate the stat
-                // guard. Retry once only when re-statting proves the eligible
-                // set shrank; an unchanged set means a systematic failure that
-                // must remain loud rather than quietly restoring stale content.
-                let narrowed: Vec<&str> = chunk
-                    .iter()
-                    .copied()
-                    .filter(|path| snapshot_content_path(checkout, path))
-                    .collect();
+                // A concurrent delete or type change can invalidate the status
+                // record. Re-query those paths through bounded Git probes and
+                // retry once only when the eligible set actually shrank.
+                let mut narrowed = Vec::new();
+                for path in chunk {
+                    if snapshot_path_still_hashable(checkout, path, self.timeout)? {
+                        narrowed.push(*path);
+                    }
+                }
                 if narrowed.len() == chunk.len() {
                     return Err(format!(
                         "{}: could not prepare snapshot index: {}",
@@ -2648,5 +2712,5 @@ pub fn predict_conflict(
 }
 
 fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    path.to_path_buf()
 }

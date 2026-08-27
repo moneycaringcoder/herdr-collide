@@ -30,8 +30,8 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use collide::config::{
-    self, Config, DEFAULT_BASE_REF, MAX_GIT_TIMEOUT_SECONDS, MAX_INTERVAL_SECONDS,
-    MIN_GIT_TIMEOUT_SECONDS, MIN_INTERVAL_SECONDS,
+    self, Config, DEFAULT_BASE_REF, MAX_CYCLE_TIMEOUT_SECONDS, MAX_GIT_TIMEOUT_SECONDS,
+    MAX_INTERVAL_SECONDS, MIN_CYCLE_TIMEOUT_SECONDS, MIN_GIT_TIMEOUT_SECONDS, MIN_INTERVAL_SECONDS,
 };
 use collide::daemon::{self, ActiveBadges, BadgePatch, PushOutcome, SpawnLock};
 use collide::model::{Severity, WorkspaceStatus};
@@ -1002,6 +1002,37 @@ fn the_git_timeout_is_clamped_like_the_interval() {
         config::load_with_args(&[]).expect("load").git_timeout,
         Duration::from_secs(30)
     );
+}
+
+#[test]
+fn the_cycle_timeout_is_clamped_and_loads_independently() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("cfgcycle");
+
+    std::fs::write(dirs.config_file(), r#"{"cycle_timeout_seconds": 0}"#).expect("write");
+    assert_eq!(
+        config::load_with_args(&[]).expect("load").cycle_timeout,
+        Duration::from_secs(MIN_CYCLE_TIMEOUT_SECONDS)
+    );
+
+    std::fs::write(
+        dirs.config_file(),
+        r#"{"cycle_timeout_seconds": 18446744073709551615}"#,
+    )
+    .expect("write");
+    assert_eq!(
+        config::load_with_args(&[]).expect("load").cycle_timeout,
+        Duration::from_secs(MAX_CYCLE_TIMEOUT_SECONDS)
+    );
+
+    std::fs::write(
+        dirs.config_file(),
+        r#"{"git_timeout_seconds": 7, "cycle_timeout_seconds": 45}"#,
+    )
+    .expect("write");
+    let loaded = config::load_with_args(&[]).expect("load");
+    assert_eq!(loaded.git_timeout, Duration::from_secs(7));
+    assert_eq!(loaded.cycle_timeout, Duration::from_secs(45));
 }
 
 /// An unknown key is still applied around rather than fatal — a newer config
