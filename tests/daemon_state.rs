@@ -1325,6 +1325,26 @@ fn only_the_daemons_own_log_is_ever_truncated() {
     assert!(!daemon::should_truncate_log(&dir_meta, Some(&ours_meta), 0));
 }
 
+#[test]
+fn executable_identity_detects_atomic_plugin_replacement() {
+    let _guard = env_lock();
+    let dirs = TempDirs::new("executable-replacement");
+    let executable = dirs.state_dir().join("collide");
+    std::fs::write(&executable, "old").expect("write old executable");
+    let open = std::fs::File::open(&executable).expect("open old executable");
+    let original = open.metadata().expect("old metadata");
+    assert!(daemon::same_file_identity(&original, &original));
+
+    let replacement = dirs.state_dir().join("collide.new");
+    std::fs::write(&replacement, "new").expect("write replacement");
+    std::fs::rename(&replacement, &executable).expect("replace executable");
+    let current = std::fs::metadata(&executable).expect("new metadata");
+    assert!(
+        !daemon::same_file_identity(&original, &current),
+        "the daemon would keep serving its unlinked old executable"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A severity with nowhere to render
 // ---------------------------------------------------------------------------

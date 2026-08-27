@@ -231,8 +231,10 @@ scripts that intentionally inspect everything.
 
 The badge updater is off until you enable it. Once enabled it survives a herdr restart and a
 `herdr update --handoff`: a startup hook re-spawns it, but only if you had it enabled when herdr went
-away. Disabling it stops the updater, waits for it to finish, and then sweeps every current workspace
-so no stale badge is left behind.
+away. Worktree/workspace lifecycle hooks wake it immediately; ordinary file edits still use the
+configured poll interval. A GitHub reinstall replaces the running daemon automatically on its next
+cycle, so newly installed code does not wait for a herdr restart. Disabling stops the updater, waits
+for it to finish, and sweeps every current workspace so no stale badge remains.
 
 Everything is also available from the command line, which is handy when the plugin is misbehaving:
 

@@ -390,6 +390,7 @@ Verbs:
 | `--disable` | take the lock, mark disabled **first**, request stop, **await exit, escalating to `SIGKILL`**, clear the marker, release the lock, then sweep every current workspace over a fresh connection — **always**, and report every problem rather than the first |
 | `--toggle` | disable if live, else enable |
 | `--restore` | silent no-op unless the enabled marker is set and no daemon is live |
+| `--refresh` | event-hook no-op when disabled; otherwise send `SIGUSR1` so the daemon leaves its interval sleep and refreshes |
 
 Awaiting exit on `--disable` is load-bearing: the stop request only *posts*, and
 the pid file survives until the daemon finishes clearing. An `--enable` landing
@@ -408,6 +409,17 @@ every token on every workspace anyway.
 The signal thread must clear state over **its own connection**, so it never
 waits on the main loop's sleep or in-flight round trip, and the main loop must
 park rather than return so it cannot re-report into the race.
+
+An enabled daemon keeps an open descriptor for the executable it started from.
+Each cycle compares that descriptor's device/inode with the current plugin-path
+binary. A GitHub reinstall atomically replaces the path; the old daemon then
+takes the spawn lock, starts `<current path> --daemon` with its forwarded
+overrides, and exits. The replacement overwrites `updater.pid` and refreshes
+without waiting for a server restart or startup hook.
+
+Manifest `worktree.created`, `worktree.opened`, `worktree.removed`, and
+`workspace.closed` hooks run `--refresh`. They improve topology latency only;
+ordinary edits still poll because herdr exposes no filesystem-change event.
 
 ### The daemon's own diagnostics
 

@@ -38,6 +38,25 @@ command = ["cargo", "build", "--release", "--locked"]
 [[startup]]
 command = ["./target/release/collide", "--restore"]
 
+# Herdr has no filesystem-change events, so edits still use the polling
+# interval. Workspace/worktree lifecycle events are available and wake an
+# enabled updater immediately; --refresh is a silent no-op when it is disabled.
+[[events]]
+on = "worktree.created"
+command = ["./target/release/collide", "--refresh"]
+
+[[events]]
+on = "worktree.opened"
+command = ["./target/release/collide", "--refresh"]
+
+[[events]]
+on = "worktree.removed"
+command = ["./target/release/collide", "--refresh"]
+
+[[events]]
+on = "workspace.closed"
+command = ["./target/release/collide", "--refresh"]
+
 # Live detail view: every sibling worktree of the focused repo, the files they
 # share, and the per-file verdict.
 [[panes]]

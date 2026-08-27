@@ -17,12 +17,13 @@ just relaxing the manifest — worth doing only once someone actually asks.
 
 ## Blocked upstream
 
-### Event-driven refresh
+### Filesystem-driven refresh
 
-The plugin polls because herdr exposes no filesystem or git events. Nothing here is
-worth working around with a shorter interval, which only spends more of the budget
-to shrink the same window. If upstream ever exposes change events, this becomes the
-single largest improvement available.
+The plugin still polls because herdr exposes no filesystem or Git edit events.
+Workspace and worktree lifecycle events now wake the daemon immediately, but
+nothing can announce an ordinary file write. A shorter interval only spends
+more of the budget to shrink the same window. If upstream exposes repository
+change events, replacing edit polling remains the largest latency improvement.
 
 For the pairwise verdicts, polling costs latency rather than correctness. The
 edge-triggered features pay more than latency for it: notifications and conflict
