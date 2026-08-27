@@ -462,31 +462,18 @@ partial state and removes that recovery machinery entirely.
 
 ## Plugin execution environment
 
-Commands are argv arrays run with **no shell**, cwd = plugin root, and a minimal
-`PATH` — `git` must be resolved explicitly rather than assumed. Plugins run on
-the **server** host, so any tool we shell out to must exist there.
+Commands are argv arrays run with **no shell** on the server host. Herdr runs
+them from the plugin root and injects `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`,
+`HERDR_ENV`, `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`,
+`HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, and
+`HERDR_PLUGIN_CONTEXT_JSON`, plus available workspace/tab/pane and
+action/event/entrypoint fields.
 
-That PATH is `/usr/local/bin:/bin:/usr/bin` (read out of the 0.8.0 binary), and
-**herdr itself installs to `~/.local/bin`, which is not on it**:
-
-```
-$ env -i PATH=/usr/local/bin:/bin:/usr/bin sh -c 'command -v herdr'; echo $?
-127
-```
-
-So `Command::new("herdr")` from a plugin command does not resolve. The setup
-action used to reload the config that way and reported the resulting `ENOENT` as
-"herdr rejected the updated config", which sends the reader to inspect a file
-that was never the problem. Anything herdr can do over the socket should go over
-the socket; `HERDR_SOCKET_PATH` is injected into every command herdr spawns.
-
-The variables herdr injects into a plugin command are `HERDR_PLUGIN_ROOT`,
-`HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, `HERDR_SOCKET_PATH`,
-`HERDR_PLUGIN_ENTRYPOINT_ID` and `HERDR_PLUGIN_CONTEXT_JSON`, plus the
-action/event ones. **`HERDR_PLUGIN_ID` is not among them** — the string does not
-appear anywhere in the 0.8.0 binary — so the plugin id used to name the state
-directory is always our own constant, and that constant has to keep matching the
-directory herdr creates (`~/.local/state/herdr/plugins/moneycaringcoder.collide`).
+Use `HERDR_BIN_PATH` when a plugin needs the portable Herdr CLI. Collide uses
+the socket directly for its hot path so it avoids a subprocess per metadata
+patch and can distinguish protocol errors from transport failures. The
+compiled-in plugin id remains the fallback for hand invocation, where Herdr
+injects nothing, and must continue matching the manifest id.
 
 `herdr plugin link .` does **not** run `[[build]]`; `herdr plugin install` does.
 Build manually during local development.

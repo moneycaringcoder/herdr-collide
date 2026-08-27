@@ -349,8 +349,6 @@ badge down.
 - **`predict_conflicts`** — set to `false` to report shared paths only in the regular reports.
   Cheaper, and it stops distinguishing a real conflict from a plain overlap there. The on-demand
   `--why` command always predicts because it cannot explain a path honestly without doing so.
-- **`predict_conflicts`** — set to `false` to report shared paths only. Cheaper, and it stops
-  distinguishing a real conflict from a plain overlap.
 - **`conflict_history`** — opt in to an append-only record of real predicted-conflict episodes.
   Default `false`: until enabled, no history file is created. Each transition record stores the
   repository key, shared path, both worktrees' stable ids, display labels and branch names, the
