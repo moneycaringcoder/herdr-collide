@@ -579,28 +579,24 @@ Pipeline for N worktrees (N(N−1)/2 pairs):
    add a `--quiet` pre-check: see "The --quiet trap".
 
 Snapshot each worktree once and reuse its tree OID across all of its pairs.
+Change-set collection retains the porcelain-v2 branch/HEAD facts, top level,
+filter overrides, status entries, and integration OID that prediction needs.
+The predictor therefore does not repeat branch, HEAD, status, filter, git-dir,
+or target-ref probes. Independent outer snapshots and deduplicated direct
+submodule sides fan out across at most eight workers.
 
-Budget check at the default 5 s interval: 8 worktrees give 28 pairs, so ~55 ms
-of prediction plus ~230 ms of snapshotting — about 6 % of one interval, before
-the parallel fan-out. Prediction is not the term that matters; the per-worktree
-snapshot is.
+Measured by `gather_cost` after that cutover, warm cache on the development
+machine:
 
-Two invocations were added since those numbers were taken, both once per
-worktree per cycle: `rev-parse --show-toplevel` and
-`config --name-only --get-regexp '^filter\.'`. Each is in the 1–2 ms band with
-`rev-parse`, so the budget above is unchanged in any way that matters.
+| case | before | prepared/parallel |
+|---|---:|---:|
+| 16 dirty worktrees, 120 overlap pairs | 372.88 ms | 287.74 ms |
+| one predicted conflict | 88.01 ms | 50.84 ms |
+| one dirty direct-submodule conflict | 213.23 ms | 121.71 ms |
 
-Depth-one submodule comparison was measured separately on the development
-workstation with one dirty direct submodule shared by two superproject
-worktrees. After one warm-up, 30 complete `gather_for` cycles averaged
-**616.41 ms/cycle**. That two-worktree, one-pair measurement includes both
-outer change-set collection and snapshots, two nested snapshots, and one outer
-plus one nested merge prediction, and consumes about 12.3 % of the default 5 s
-interval in that configuration. It is not a constant cost per submodule: with
-W worktrees sharing the submodule, the nested snapshot component runs W times
-per cycle, while `merge-base`, `rev-parse`, and `merge-tree` run for each of the
-W(W−1)/2 nested pairs. The experiment did not time those components separately,
-so its aggregate percentage must not be extrapolated to larger W.
+The 16-worktree cycle fell 22.8%; the dirty-submodule case fell 42.9%. These
+numbers include every unchanged gathering and analysis phase, so they are the
+user-visible wall-time improvement rather than an isolated microbenchmark.
 
 Nested commands use a repository-specific object view. While snapshotting one
 nested checkout the exact write-related environment is:
@@ -622,9 +618,9 @@ every one of these commands.
 
 - **Dirty direct submodules are compared to depth one.** `status` still reports
   the submodule as one superproject-relative changed path
-  (`1 .M S.MU … sub`), but the sequential prime phase also opens each direct
-  nested checkout as a repository, resolves its common dir and HEAD, records
-  dirty/unmerged state, and snapshots dirty contents through a scratch index.
+  (`1 .M S.MU … sub`), but the bounded nested-prime workers open each required
+  direct checkout as a repository, resolve its common dir and HEAD, record
+  dirty/unmerged state, and snapshot dirty contents through a scratch index.
   The immutable prediction phase then runs a nested merge. A clean nested merge
   earns `overlap`; a nested conflict makes the superproject gitlink path
   `conflict`, with nested conflicting paths carried only in the detail note so

@@ -10,8 +10,8 @@ mod fixtures;
 use std::time::Duration;
 
 use collide::git::{
-    self, change_set, current_branch, parse_merge_tree_z, parse_numstat_z, parse_status_v2,
-    Predictor,
+    self, change_set, current_branch, parse_merge_tree_z, parse_numstat_z, parse_status_head,
+    parse_status_v2, HeadState, Predictor,
 };
 use collide::model::ChangeKind;
 
@@ -28,6 +28,7 @@ fn status_bytes(fixture: &Fixture, cwd: &std::path::Path, ignored: bool) -> Vec<
         "-z",
         "--untracked-files=all",
         "--renames",
+        "--branch",
     ];
     if ignored {
         args.push("--ignored=matching");
@@ -51,6 +52,29 @@ fn paths_of(entries: &[git::StatusEntry]) -> Vec<String> {
     entries.iter().map(|e| e.path.clone()).collect()
 }
 
+#[test]
+fn porcelain_branch_headers_classify_branch_detached_and_unborn_heads() {
+    let fixture = Fixture::new("status-branch-headers");
+    let branch = fixture.worktree("branch", "feature/branch");
+    assert!(matches!(
+        parse_status_head(&status_bytes(&fixture, &branch, false)),
+        Some(HeadState::Branch { name, .. }) if name == "feature/branch"
+    ));
+
+    let detached = fixture.detached_worktree("detached-status");
+    assert!(matches!(
+        parse_status_head(&status_bytes(&fixture, &detached, false)),
+        Some(HeadState::Detached { .. })
+    ));
+
+    let unborn = fixture.unborn_worktree("unborn-status", "fresh");
+    assert_eq!(
+        parse_status_head(&status_bytes(&fixture, &unborn, false)),
+        Some(HeadState::Unborn {
+            name: "fresh".to_string()
+        })
+    );
+}
 #[test]
 fn ordinary_records_carry_staged_and_unstaged_kinds() {
     let fixture = Fixture::new("ordinary");

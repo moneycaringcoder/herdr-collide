@@ -772,11 +772,6 @@ fn verify_checkouts(
                                 match git::repo_key(&checkout.checkout_path, timeout) {
                                     Ok(key) => {
                                         checkout.repo_key = key;
-                                        if let Ok(branch) =
-                                            git::current_branch(&checkout.checkout_path, timeout)
-                                        {
-                                            checkout.branch = branch;
-                                        }
                                         let git_dir =
                                             git::worktree_git_dir(&checkout.checkout_path, timeout)
                                                 .ok();
@@ -985,14 +980,16 @@ fn gather_for_retained_scoped_inner(
     }
 
     let mut changes: Vec<(String, ChangeSet)> = Vec::new();
+    let mut prepared: BTreeMap<String, git::ChangeSetRead> = BTreeMap::new();
     for checkout in &verified {
         let base = integration_refs
             .get(&checkout.repo_key)
             .expect("every verified checkout has an integration-ref decision");
         match git::read_change_set(&checkout.checkout_path, base, config.git_timeout) {
             Ok(read) => {
-                trees.insert(checkout.workspace_id.clone(), read.top_level);
-                changes.push((checkout.workspace_id.clone(), read.change_set));
+                trees.insert(checkout.workspace_id.clone(), read.top_level.clone());
+                changes.push((checkout.workspace_id.clone(), read.change_set.clone()));
+                prepared.insert(checkout.workspace_id.clone(), read);
             }
             Err(err) => {
                 notes.push(format!("{}: {err}", checkout.checkout_path.display()));
@@ -1012,6 +1009,11 @@ fn gather_for_retained_scoped_inner(
                     },
                 ));
             }
+        }
+    }
+    for checkout in &mut verified {
+        if let Some(read) = prepared.get(&checkout.workspace_id) {
+            checkout.branch = read.head.branch().map(str::to_string);
         }
     }
     agree_on_repo_root(&mut verified, &trees, &git_dirs);
@@ -1041,6 +1043,8 @@ fn gather_for_retained_scoped_inner(
         let mut predictor = git::Predictor::new(config.git_timeout)?;
         let mut primed: BTreeSet<&str> = BTreeSet::new();
         let mut prime_errors: BTreeMap<&str, String> = BTreeMap::new();
+        let mut prime_inputs = Vec::new();
+        let mut prime_ids = Vec::new();
         for checkout in &verified {
             let change = changes_by_id
                 .get(checkout.workspace_id.as_str())
@@ -1048,30 +1052,41 @@ fn gather_for_retained_scoped_inner(
             let target_ref = integration_refs
                 .get(&checkout.repo_key)
                 .expect("integration-ref decision exists");
-            // A commitless checkout cannot participate in either prediction.
-            // With no target and no pairing, no later result can consume a
-            // snapshot, so paying to create one would only touch scratch state.
             if !pairable(change)
                 || (target_ref == git::NO_INTEGRATION_REF
                     && !paired.contains(checkout.workspace_id.as_str()))
             {
                 continue;
             }
-            match predictor.prime(&checkout.checkout_path) {
-                Ok(()) => {
-                    primed.insert(checkout.workspace_id.as_str());
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    notes.push(format!("{}: {message}", checkout.checkout_path.display()));
-                    prime_errors.insert(checkout.workspace_id.as_str(), message);
-                }
+            let Some(read) = prepared.get(&checkout.workspace_id) else {
+                continue;
+            };
+            let Some(git_dir) = git_dirs.get(&checkout.workspace_id) else {
+                let message = "checkout Git directory was not resolved".to_string();
+                notes.push(format!("{}: {message}", checkout.checkout_path.display()));
+                prime_errors.insert(checkout.workspace_id.as_str(), message);
+                continue;
+            };
+            prime_ids.push(checkout.workspace_id.as_str());
+            prime_inputs.push(git::PreparedSideInput {
+                checkout: &checkout.checkout_path,
+                common_dir: std::path::Path::new(&checkout.repo_key.0),
+                git_dir,
+                read,
+            });
+        }
+        let snapshot_errors = predictor.prime_prepared_all(&prime_inputs);
+        for (workspace_id, input) in prime_ids.into_iter().zip(&prime_inputs) {
+            if let Some(message) = snapshot_errors.get(input.checkout) {
+                notes.push(format!("{}: {message}", input.checkout.display()));
+                prime_errors.insert(workspace_id, message.clone());
+            } else {
+                primed.insert(workspace_id);
             }
         }
 
-        // Resolve each local ref to a commit before the immutable prediction
-        // phase. No command here fetches or consults a remote; a stale
-        // origin/main intentionally remains a prediction about that stale ref.
+        // Reuse the integration OID resolved by change-set assembly rather
+        // than peeling the same ref again for prediction.
         let mut target_prime_errors: BTreeMap<&crate::model::RepoKey, String> = BTreeMap::new();
         let mut target_primed: BTreeSet<&crate::model::RepoKey> = BTreeSet::new();
         for checkout in &verified {
@@ -1085,21 +1100,30 @@ fn gather_for_retained_scoped_inner(
             {
                 continue;
             }
-            match predictor.prime_target(&checkout.checkout_path, target_ref) {
-                Ok(()) => {
-                    target_primed.insert(&checkout.repo_key);
-                }
-                Err(err) => {
-                    target_prime_errors.insert(&checkout.repo_key, err.to_string());
-                }
+            let target_oid = prepared
+                .get(&checkout.workspace_id)
+                .and_then(|read| read.target_oid.as_deref());
+            if let Some(target_oid) = target_oid {
+                predictor.prime_target_oid(
+                    std::path::Path::new(&checkout.repo_key.0),
+                    target_ref,
+                    target_oid,
+                );
+                target_primed.insert(&checkout.repo_key);
+            } else {
+                target_prime_errors.insert(
+                    &checkout.repo_key,
+                    format!("integration ref `{target_ref}` does not resolve to a commit"),
+                );
             }
         }
 
-        // Direct submodules are repositories in their own right. Resolve and
-        // snapshot every needed nested side here, while the predictor is still
-        // mutable and this phase is deliberately sequential.
+        // Direct submodules are repositories in their own right. Collect each
+        // needed `(checkout, path)` once, then prime the independent nested
+        // sides in bounded parallel workers.
         let changes_by_id: BTreeMap<&str, &ChangeSet> =
             changes.iter().map(|(id, set)| (id.as_str(), set)).collect();
+        let mut nested_jobs = Vec::new();
         for pairing in &report.pairings {
             let Some(left) = by_id.get(pairing.left_workspace_id.as_str()) else {
                 continue;
@@ -1121,11 +1145,12 @@ fn gather_for_retained_scoped_inner(
                     })
                 });
                 if needs_nested {
-                    predictor.prime_submodule(&left.checkout_path, &shared.path);
-                    predictor.prime_submodule(&right.checkout_path, &shared.path);
+                    nested_jobs.push((left.checkout_path.clone(), shared.path.clone()));
+                    nested_jobs.push((right.checkout_path.clone(), shared.path.clone()));
                 }
             }
         }
+        predictor.prime_submodules(&nested_jobs);
 
         let jobs: Vec<(&Pairing, &Checkout, &Checkout)> = report
             .pairings
