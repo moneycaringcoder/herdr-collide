@@ -170,7 +170,7 @@ fn separate_git_dir_checkouts_agree_on_the_main_root_when_it_is_present() {
     // Under `--separate-git-dir` the main worktree's `.git` is a gitfile naming
     // the common store. Resolving the gitfile therefore yields the repository
     // key, which is the exact premise rule 1 uses to identify the main worktree.
-    let git_dir = git::worktree_git_dir(&main).expect("resolve .git gitfile");
+    let git_dir = git::worktree_git_dir(&main, TIMEOUT).expect("resolve .git gitfile");
     assert_eq!(
         git_dir,
         PathBuf::from(&key.0),
@@ -394,5 +394,17 @@ fn superproject_checkouts_agree_on_one_root_while_the_submodule_keeps_its_own() 
         "submodule {} reported superproject root {}",
         submodule.display(),
         submodule_checkout.repo_root.display()
+    );
+}
+
+#[test]
+fn symlinked_checkout_paths_keep_one_repository_identity() {
+    let fixture = Fixture::new("symlinked-repo-key");
+    let alias = fixture.root().join("repo-alias");
+    std::os::unix::fs::symlink(&fixture.repo, &alias).expect("symlink repository");
+
+    assert_eq!(
+        git::repo_key(&fixture.repo, TIMEOUT).expect("real repo key"),
+        git::repo_key(&alias, TIMEOUT).expect("symlinked repo key")
     );
 }
