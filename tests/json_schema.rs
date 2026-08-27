@@ -74,7 +74,6 @@ fn json_schema_keys_are_exact() {
 
     let json = json_report(&Cycle {
         report,
-        changes,
         notes: vec!["a note".to_string()],
     });
 

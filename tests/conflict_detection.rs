@@ -1548,10 +1548,9 @@ fn equal_pairing_ranks_are_deterministic_and_tied_by_workspace_id() {
 fn json_pairings_follow_the_model_ranking() {
     // `triaged_report` constructs overlap, unknown, then conflict: deliberately the
     // reverse of the expected ranked order so this assertion detects missing sorting.
-    let (report, changes) = triaged_report();
+    let (report, _changes) = triaged_report();
     let json = json_report(&Cycle {
         report,
-        changes,
         notes: Vec::new(),
     });
     let json_order: Vec<(String, String)> = json["pairings"]
@@ -1656,7 +1655,6 @@ fn json_report_is_stable_and_documented() {
 
     let json = json_report(&Cycle {
         report,
-        changes,
         notes: vec!["a note".to_string()],
     });
 
@@ -1743,7 +1741,6 @@ fn json_reports_the_unknown_severity_the_schema_was_bumped_for() {
 
     let json = json_report(&Cycle {
         report,
-        changes,
         notes: Vec::new(),
     });
 
