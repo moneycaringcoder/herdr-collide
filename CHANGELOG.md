@@ -29,6 +29,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   likewise built once and reused when predictions are folded back into the
   report. The glob matcher compiles its deliberately small grammar once and
   matches without per-pattern dynamic-programming allocations.
+- Configuration docs no longer duplicate `predict_conflicts`, the Herdr
+  environment notes match the current `HERDR_BIN_PATH`/plugin context contract,
+  and obsolete sequential-prime and ignored-`base_ref` claims are removed.
 
 ### Fixed
 

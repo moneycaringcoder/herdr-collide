@@ -1870,9 +1870,10 @@ impl Predictor {
         }
         errors
     }
-    /// Resolves one local integration ref and caches its commit once per
-    /// repository. Call this during the sequential prime phase; predictions
-    /// only read the cached side and can then fan out through `&self`.
+
+    /// Resolves one local integration ref for the one-shot predictor API.
+    /// The normal gather path reuses the OID already retained by change-set
+    /// collection through [`Self::prime_target_oid`].
     pub fn prime_target(&mut self, checkout: &Path, target_ref: &str) -> Result<()> {
         let common_dir = self.side(checkout)?.common_dir.clone();
         let key = (common_dir.clone(), target_ref.to_string());
