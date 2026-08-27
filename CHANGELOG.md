@@ -21,6 +21,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   integration OIDs for prediction. Outer snapshots and deduplicated direct
   submodule sides prime in bounded parallel workers instead of repeating probes
   and snapshotting sequentially.
+- Refresh data now has one owner: `Report::changes`; `Cycle` no longer clones
+  the same change sets. Filtered change data and compiled ignore patterns are
+  likewise built once and reused when predictions are folded back into the
+  report. The glob matcher compiles its deliberately small grammar once and
+  matches without per-pattern dynamic-programming allocations.
 
 ### Fixed
 

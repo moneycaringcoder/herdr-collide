@@ -63,9 +63,23 @@ pub fn analyse(
     trees: &WorkTrees,
     config: &Config,
 ) -> Report {
+    analyse_with_filtered(checkouts, changes, trees, config).0
+}
+
+fn analyse_with_filtered<'a, 'config>(
+    checkouts: &[Checkout],
+    changes: &'a [(String, ChangeSet)],
+    trees: &WorkTrees,
+    config: &'config Config,
+) -> (
+    Report,
+    BTreeMap<&'a str, FilteredChange>,
+    IgnoreRules<'config>,
+) {
+    let ignored = IgnoreRules::new(config);
     let filtered: BTreeMap<&str, FilteredChange> = changes
         .iter()
-        .map(|(id, set)| (id.as_str(), FilteredChange::new(set, config)))
+        .map(|(id, set)| (id.as_str(), FilteredChange::new(set, &ignored)))
         .collect();
 
     // Group by repo key. `run_once` has already rewritten every repo key to the
@@ -150,13 +164,17 @@ pub fn analyse(
     sort_pairings(&mut pairings);
 
     let statuses = statuses(checkouts, &filtered, &pairings, config);
-    Report {
-        checkouts: checkouts.to_vec(),
-        pairings,
-        statuses,
-        targets: Vec::new(),
-        changes: changes.to_vec(),
-    }
+    (
+        Report {
+            checkouts: checkouts.to_vec(),
+            pairings,
+            statuses,
+            targets: Vec::new(),
+            changes: changes.to_vec(),
+        },
+        filtered,
+        ignored,
+    )
 }
 
 fn sort_pairings(pairings: &mut [Pairing]) {
@@ -201,6 +219,22 @@ pub fn apply_predictions(
     changes: &[(String, ChangeSet)],
     config: &Config,
 ) {
+    let ignored = IgnoreRules::new(config);
+    let filtered: BTreeMap<&str, FilteredChange> = changes
+        .iter()
+        .map(|(id, set)| (id.as_str(), FilteredChange::new(set, &ignored)))
+        .collect();
+    apply_predictions_with_filtered(report, predictions, changes, config, &filtered, &ignored);
+}
+
+fn apply_predictions_with_filtered(
+    report: &mut Report,
+    predictions: &[PairVerdicts],
+    changes: &[(String, ChangeSet)],
+    config: &Config,
+    filtered: &BTreeMap<&str, FilteredChange>,
+    ignored: &IgnoreRules<'_>,
+) {
     let by_pair: BTreeMap<(&str, &str), &PairVerdicts> = predictions
         .iter()
         .map(|p| {
@@ -213,10 +247,6 @@ pub fn apply_predictions(
 
     let pair_changes: BTreeMap<&str, &ChangeSet> =
         changes.iter().map(|(id, set)| (id.as_str(), set)).collect();
-    let filtered: BTreeMap<&str, FilteredChange> = changes
-        .iter()
-        .map(|(id, set)| (id.as_str(), FilteredChange::new(set, config)))
-        .collect();
 
     for pairing in &mut report.pairings {
         let key = (
@@ -327,7 +357,7 @@ pub fn apply_predictions(
             // filtered intersection, so without this a generated path that both
             // sides changed can come straight back as a conflict through the
             // unlisted-path door.
-            if is_ignored(path, config) {
+            if ignored.matches(path) {
                 continue;
             }
             let conflict_type = attributed_conflict_type(path);
@@ -357,7 +387,7 @@ pub fn apply_predictions(
     report.pairings.retain(|pairing| !pairing.shared.is_empty());
     sort_pairings(&mut report.pairings);
 
-    report.statuses = statuses(&report.checkouts, &filtered, &report.pairings, config);
+    report.statuses = statuses(&report.checkouts, filtered, &report.pairings, config);
 }
 
 /// A change set with configured ignore rules applied, reduced to what the
@@ -379,11 +409,11 @@ struct FilteredChange {
 }
 
 impl FilteredChange {
-    fn new(set: &ChangeSet, config: &Config) -> Self {
+    fn new(set: &ChangeSet, ignored: &IgnoreRules<'_>) -> Self {
         let kept: Vec<&crate::model::ChangedPath> = set
             .paths
             .iter()
-            .filter(|p| !is_ignored(&p.path, config))
+            .filter(|path| !ignored.matches(&path.path))
             .collect();
         let paths: BTreeSet<String> = kept.iter().map(|p| p.path.clone()).collect();
         let uncomparable_submodules = kept
@@ -539,6 +569,33 @@ pub fn work_tree_root(path: &std::path::Path) -> std::path::PathBuf {
     .unwrap_or_else(|_| path.to_path_buf())
 }
 
+struct IgnoreRules<'a> {
+    suffixes: &'a [String],
+    globs: crate::ignore::Matcher,
+}
+
+impl<'a> IgnoreRules<'a> {
+    fn new(config: &'a Config) -> Self {
+        Self {
+            suffixes: &config.ignore_suffixes,
+            globs: crate::ignore::Matcher::new(&config.ignore_globs),
+        }
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        self.suffixes.iter().any(|suffix| {
+            if suffix.is_empty() || !path.ends_with(suffix.as_str()) {
+                return false;
+            }
+            if suffix.starts_with('.') {
+                return true;
+            }
+            let start = path.len() - suffix.len();
+            start == 0 || path.as_bytes()[start - 1] == b'/'
+        }) || self.globs.matches(path)
+    }
+}
+
 /// Match configured suffix and glob rules against a repository-relative path.
 ///
 /// A bare suffix `ends_with` is too eager: `go.sum` would swallow
@@ -548,16 +605,7 @@ pub fn work_tree_root(path: &std::path::Path) -> std::path::PathBuf {
 /// may match mid-name; anything else must begin at the start of the path or
 /// straight after a `/`.
 pub fn is_ignored(path: &str, config: &Config) -> bool {
-    config.ignore_suffixes.iter().any(|suffix| {
-        if suffix.is_empty() || !path.ends_with(suffix.as_str()) {
-            return false;
-        }
-        if suffix.starts_with('.') {
-            return true;
-        }
-        let start = path.len() - suffix.len();
-        start == 0 || path.as_bytes()[start - 1] == b'/'
-    }) || crate::ignore::matches_any(path, &config.ignore_globs)
+    IgnoreRules::new(config).matches(path)
 }
 
 /// An unborn branch and a branch deleted underneath a worktree both leave the
@@ -655,11 +703,9 @@ fn statuses(
 // Impure gathering
 // ---------------------------------------------------------------------------
 
-/// Everything one refresh cycle produces, including the per-checkout change
-/// sets that the report itself does not carry.
+/// Everything one refresh cycle produces.
 pub struct Cycle {
     pub report: Report,
-    pub changes: Vec<(String, ChangeSet)>,
     /// Non-fatal problems worth showing the user: a checkout that vanished, a
     /// pair whose prediction failed.
     pub notes: Vec<String>,
@@ -913,9 +959,8 @@ fn deadline_gather(
                 pairings: Vec::new(),
                 statuses,
                 targets,
-                changes: changes.clone(),
+                changes,
             },
-            changes,
             notes: vec![reason],
         },
         predictor: None,
@@ -1025,7 +1070,8 @@ fn gather_for_retained_scoped_inner(
     }
     agree_on_repo_root(&mut verified, &trees, &git_dirs);
 
-    let mut report = analyse(&verified, &changes, &trees, config);
+    let (mut report, filtered, ignored) =
+        analyse_with_filtered(&verified, &changes, &trees, config);
 
     let mut retained_predictor = None;
     let mut retained_predictions = Vec::new();
@@ -1177,7 +1223,14 @@ fn gather_for_retained_scoped_inner(
         let predicted = predict_all(&predictor, &jobs, &mut notes);
         let verdicts: Vec<PairVerdicts> =
             predicted.iter().map(|pair| pair.verdicts.clone()).collect();
-        apply_predictions(&mut report, &verdicts, &changes, config);
+        apply_predictions_with_filtered(
+            &mut report,
+            &verdicts,
+            &changes,
+            config,
+            &filtered,
+            &ignored,
+        );
         retained_predictions = predicted
             .into_iter()
             .filter_map(|pair| {
@@ -1264,11 +1317,7 @@ fn gather_for_retained_scoped_inner(
     }
 
     Ok(RetainedGather {
-        cycle: Cycle {
-            report,
-            changes,
-            notes,
-        },
+        cycle: Cycle { report, notes },
         predictor: retained_predictor,
         predictions: retained_predictions,
     })
@@ -1576,7 +1625,7 @@ fn retained_prediction<'a>(
 }
 
 fn path_listed_for_pair(cycle: &Cycle, pairing: &Pairing, path: &str) -> bool {
-    cycle.changes.iter().any(|(id, changes)| {
+    cycle.report.changes.iter().any(|(id, changes)| {
         (id == &pairing.left_workspace_id || id == &pairing.right_workspace_id)
             && changes.paths.iter().any(|changed| changed.path == path)
     })
@@ -1584,6 +1633,7 @@ fn path_listed_for_pair(cycle: &Cycle, pairing: &Pairing, path: &str) -> bool {
 
 fn unavailable_path_report(cycle: &Cycle, shown_path: &str) -> Option<WhyReport> {
     let changes: BTreeMap<&str, &ChangeSet> = cycle
+        .report
         .changes
         .iter()
         .map(|(id, changes)| (id.as_str(), changes))
@@ -1804,6 +1854,7 @@ pub fn run_why(config: &Config, path: &str) -> Result<()> {
 pub fn text_report(cycle: &Cycle) -> String {
     let mut out = String::new();
     let changes: BTreeMap<&str, &ChangeSet> = cycle
+        .report
         .changes
         .iter()
         .map(|(id, set)| (id.as_str(), set))
@@ -1895,6 +1946,7 @@ pub fn text_report(cycle: &Cycle) -> String {
 /// ```
 pub fn json_report(cycle: &Cycle) -> serde_json::Value {
     let changes: BTreeMap<&str, &ChangeSet> = cycle
+        .report
         .changes
         .iter()
         .map(|(id, set)| (id.as_str(), set))

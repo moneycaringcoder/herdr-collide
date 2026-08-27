@@ -229,20 +229,20 @@ fn rename_conflict_on_an_unlisted_path_is_explained_and_matches_once() {
     let pair = fixture.committed_directory_rename_pair();
     let checkout_list = checkouts(&fixture, &pair);
     let cycle = gather_for(checkout_list.clone(), &config()).expect("once gather");
-    let renamed_path = cycle
-        .report
-        .pairings
-        .iter()
-        .flat_map(|pairing| &pairing.shared)
-        .find(|shared| {
-            shared.verdict == FileVerdict::Conflict
-                && cycle
-                    .changes
-                    .iter()
-                    .all(|(_, changes)| changes.paths.iter().all(|path| path.path != shared.path))
-        })
-        .map(|shared| shared.path.clone())
-        .expect("rename-induced conflict path absent from both change sets");
+    let renamed_path =
+        cycle
+            .report
+            .pairings
+            .iter()
+            .flat_map(|pairing| &pairing.shared)
+            .find(|shared| {
+                shared.verdict == FileVerdict::Conflict
+                    && cycle.report.changes.iter().all(|(_, changes)| {
+                        changes.paths.iter().all(|path| path.path != shared.path)
+                    })
+            })
+            .map(|shared| shared.path.clone())
+            .expect("rename-induced conflict path absent from both change sets");
 
     let once = text_report(&cycle);
     let why = why_for(checkout_list, &config(), &renamed_path).expect("why");
