@@ -13,6 +13,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and prediction workers; an overrun produces visible `cycle-timeout` unknown
   statuses for every observed checkout instead of publishing partial clean
   output.
+- Worktree/workspace lifecycle event hooks now wake an enabled updater through
+  an internal `--refresh`/`SIGUSR1` path. Ordinary edits continue polling
+  because herdr exposes no filesystem event.
 
 ### Changed
 
@@ -44,6 +47,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   target predictions remain `unknown` when such a driver is configured, and
   fixtures now cover split index, untracked cache, fsmonitor, Git-managed
   relocation, case folding, and canonically equivalent Unicode filenames.
+- An enabled daemon now detects when plugin installation replaces its
+  executable, starts the binary at the new path with the forwarded overrides,
+  and exits. Reinstallation no longer leaves old code running until a herdr
+  restart. The obsolete warning that configured `base_ref` was ignored is also
+  removed; that setting is already honored by change-set and target gathering.
 
 
 ## [0.1.3] - 2026-08-26

@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -209,6 +209,19 @@ pub fn toggle(args: &[String]) -> Result<()> {
     }
 }
 
+/// Event-hook entrypoint: wake a live updater without starting one.
+pub fn request_refresh() -> Result<()> {
+    let Some(pid) = live_pid() else {
+        return Ok(());
+    };
+    // SAFETY: `pid` was checked live and belongs to this program.
+    if unsafe { libc::kill(pid, signal_hook::consts::SIGUSR1) } == 0 {
+        Ok(())
+    } else {
+        Err(format!("could not request refresh from updater {pid}").into())
+    }
+}
+
 /// herdr startup hook. Silent no-op unless the enabled marker is set and no
 /// daemon is currently live.
 pub fn restore() -> Result<()> {
@@ -233,31 +246,68 @@ pub fn restore() -> Result<()> {
     spawn_detached(&[])
 }
 
-/// The refresh loop itself, running in the foreground.
-pub fn run(config: &Config) -> Result<()> {
-    write_pid(std::process::id());
+struct ExecutableWatch {
+    path: PathBuf,
+    file: fs::File,
+}
 
-    // Workspaces on which this daemon successfully lit a badge. Each refresh
-    // atomically patches every collide token name, so no per-token recovery
-    // state is needed.
+impl ExecutableWatch {
+    fn open() -> Option<Self> {
+        let path = std::env::current_exe().ok()?;
+        let file = fs::File::open(&path).ok()?;
+        Some(Self { path, file })
+    }
+
+    fn replaced(&self) -> bool {
+        let Ok(original) = self.file.metadata() else {
+            return false;
+        };
+        let Ok(current) = fs::metadata(&self.path) else {
+            return false;
+        };
+        !same_file_identity(&original, &current)
+    }
+}
+
+pub fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn spawn_replacement(path: &Path, forwarded: &[String]) -> Result<()> {
+    Command::new(path)
+        .arg("--daemon")
+        .args(forwarded)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "could not restart replaced daemon from {}: {err}",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
+/// The refresh loop itself, running in the foreground.
+pub fn run(config: &Config, args: &[String]) -> Result<()> {
+    write_pid(std::process::id());
+    let executable = ExecutableWatch::open();
+    let forwarded = forwarded_args(args)?;
+
     let active: Arc<Mutex<ActiveBadges>> = Arc::new(Mutex::new(ActiveBadges::new()));
     let stopping = Arc::new(AtomicBool::new(false));
-    spawn_signal_thread(Arc::clone(&active), Arc::clone(&stopping))?;
+    let wake = Arc::new(AtomicBool::new(false));
+    spawn_signal_thread(
+        Arc::clone(&active),
+        Arc::clone(&stopping),
+        Arc::clone(&wake),
+    )?;
 
     // A daemon that is SIGKILLed never runs `Predictor::drop`, and unlike a
     // one-shot run it gets killed often enough for the leftovers to add up.
     crate::git::sweep_scratch();
-
-    // gather_for derives its own integration ref (collide.rs calls
-    // git::integration_ref per checkout), so a configured base_ref does not
-    // reach git yet. Say so once rather than letting the setting look effective.
-    if config.base_ref != config::DEFAULT_BASE_REF {
-        eprintln!(
-            "collide: base_ref `{}` is not honoured yet — the analysis pass derives its own \
-             integration ref",
-            config.base_ref
-        );
-    }
 
     let mut client: Option<Herdr> = None;
     // Notes repeat every cycle for as long as their cause lasts, so only the
@@ -325,7 +375,15 @@ pub fn run(config: &Config) -> Result<()> {
         }
 
         cap_log();
-        nap(config.interval, &stopping);
+        if executable.as_ref().is_some_and(ExecutableWatch::replaced) {
+            let _lock = SpawnLock::acquire()?;
+            spawn_replacement(
+                &executable.as_ref().expect("checked above").path,
+                &forwarded,
+            )?;
+            return Ok(());
+        }
+        nap(config.interval, &stopping, &wake);
     }
 }
 
@@ -824,13 +882,22 @@ fn sweep(client: &mut Herdr) -> Result<()> {
     Ok(())
 }
 
-fn spawn_signal_thread(active: Arc<Mutex<ActiveBadges>>, stopping: Arc<AtomicBool>) -> Result<()> {
+fn spawn_signal_thread(
+    active: Arc<Mutex<ActiveBadges>>,
+    stopping: Arc<AtomicBool>,
+    wake: Arc<AtomicBool>,
+) -> Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGUSR1,
     ])?;
     std::thread::spawn(move || {
-        if signals.forever().next().is_some() {
+        for signal in signals.forever() {
+            if signal == signal_hook::consts::SIGUSR1 {
+                wake.store(true, Ordering::SeqCst);
+                continue;
+            }
             stopping.store(true, Ordering::SeqCst);
             shutdown(&active);
             std::process::exit(0);
@@ -861,12 +928,12 @@ fn shutdown(active: &Mutex<ActiveBadges>) {
     clear_pid_file();
 }
 
-/// Sleeps in slices so a stop request is noticed without waiting out a whole
-/// refresh interval.
-fn nap(interval: Duration, stopping: &AtomicBool) {
+/// Sleeps in slices so a stop or event-driven refresh is noticed without
+/// waiting out the configured polling interval.
+fn nap(interval: Duration, stopping: &AtomicBool, wake: &AtomicBool) {
     let deadline = Instant::now() + interval;
     while Instant::now() < deadline {
-        if stopping.load(Ordering::SeqCst) {
+        if stopping.load(Ordering::SeqCst) || wake.swap(false, Ordering::SeqCst) {
             return;
         }
         std::thread::sleep(LOOP_TICK.min(deadline.saturating_duration_since(Instant::now())));

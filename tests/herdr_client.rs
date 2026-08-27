@@ -1064,6 +1064,142 @@ fn a_failed_refresh_is_written_to_the_daemon_diagnostic_stream() {
 }
 
 #[test]
+fn refresh_verb_wakes_a_sleeping_daemon() {
+    let _guard = env_lock();
+    let empty = json!({
+        "protocol": 19,
+        "version": "0.8.0",
+        "layouts": [],
+        "tabs": [],
+        "panes": [],
+        "agents": [],
+        "workspaces": []
+    });
+    let server = TestServer::start(vec![snapshot_reply(empty.clone()), snapshot_reply(empty)]);
+    let dirs = scratch_dir("event-refresh");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_collide"))
+        .args(["--daemon", "--interval", "3600"])
+        .env("HERDR_SOCKET_PATH", &server.path)
+        .env("HERDR_PLUGIN_ID", SOURCE)
+        .env("HERDR_PLUGIN_CONFIG_DIR", &dirs)
+        .env("HERDR_PLUGIN_STATE_DIR", &dirs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start daemon");
+
+    let first_deadline = Instant::now() + Duration::from_secs(4);
+    while server.requests().is_empty() && Instant::now() < first_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(server.requests().len(), 1, "first refresh did not run");
+
+    let refresh = Command::new(env!("CARGO_BIN_EXE_collide"))
+        .arg("--refresh")
+        .env("HERDR_SOCKET_PATH", &server.path)
+        .env("HERDR_PLUGIN_ID", SOURCE)
+        .env("HERDR_PLUGIN_CONFIG_DIR", &dirs)
+        .env("HERDR_PLUGIN_STATE_DIR", &dirs)
+        .output()
+        .expect("request refresh");
+    assert!(refresh.status.success(), "{refresh:?}");
+
+    let second_deadline = Instant::now() + Duration::from_secs(2);
+    while server.requests().len() < 2 && Instant::now() < second_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&dirs);
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "daemon slept through the lifecycle refresh request"
+    );
+}
+
+#[test]
+fn replaced_daemon_restarts_from_the_new_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = env_lock();
+    let empty = json!({
+        "protocol": 19,
+        "version": "0.8.0",
+        "layouts": [],
+        "tabs": [],
+        "panes": [],
+        "agents": [],
+        "workspaces": []
+    });
+    let server = TestServer::start((0..10).map(|_| snapshot_reply(empty.clone())).collect());
+    let dirs = scratch_dir("daemon-replacement");
+    let executable = dirs.join("collide");
+    std::fs::copy(env!("CARGO_BIN_EXE_collide"), &executable).expect("copy executable");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod executable");
+
+    let mut old = Command::new(&executable)
+        .args(["--daemon", "--interval", "1"])
+        .env("HERDR_SOCKET_PATH", &server.path)
+        .env("HERDR_PLUGIN_ID", SOURCE)
+        .env("HERDR_PLUGIN_CONFIG_DIR", &dirs)
+        .env("HERDR_PLUGIN_STATE_DIR", &dirs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start old daemon");
+    let old_pid = old.id() as i32;
+    let first_deadline = Instant::now() + Duration::from_secs(4);
+    while server.requests().is_empty() && Instant::now() < first_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!server.requests().is_empty(), "old daemon never refreshed");
+
+    let replacement = dirs.join("collide.new");
+    std::fs::copy(env!("CARGO_BIN_EXE_collide"), &replacement).expect("copy replacement");
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod replacement");
+    std::fs::rename(&replacement, &executable).expect("replace executable");
+
+    let restart_deadline = Instant::now() + Duration::from_secs(5);
+    while old.try_wait().expect("poll old daemon").is_none() && Instant::now() < restart_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        old.try_wait().expect("final old poll").is_some(),
+        "old daemon did not exit after replacement"
+    );
+    let pid_path = dirs.join("updater.pid");
+    let mut new_pid = None;
+    while Instant::now() < restart_deadline {
+        new_pid = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+            .filter(|pid| *pid != old_pid);
+        if new_pid.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let new_pid = new_pid.expect("replacement daemon never recorded its pid");
+    assert!(
+        server.requests().len() >= 2,
+        "replacement daemon never refreshed"
+    );
+
+    // SAFETY: `new_pid` was written by the replacement daemon.
+    let _ = unsafe { libc::kill(new_pid, libc::SIGTERM) };
+    let stop_deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(new_pid, 0) } == 0 && Instant::now() < stop_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_dir_all(&dirs);
+}
+
+#[test]
 fn notifications_are_off_by_default_and_make_no_wire_request() {
     let _guard = env_lock();
     let server = TestServer::start(Vec::new());

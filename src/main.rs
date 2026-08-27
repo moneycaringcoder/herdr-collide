@@ -25,6 +25,7 @@ Badge updater:
   --toggle            Stop it if running, otherwise start it
   --restore           Restart it only if it was enabled (herdr startup hook)
   --daemon            Run the updater in the foreground (internal)
+  --refresh           Wake the updater immediately (internal event hook)
 
 Sidebar setup:
   --setup             Add collide's tokens to herdr's config.toml and reload
@@ -52,7 +53,7 @@ const VALUED: [&str; 3] = ["--interval", "--base-ref", "--why"];
 
 /// Every verb this binary accepts. The list is explicit on purpose — see
 /// [`verb_of`].
-const VERBS: [&str; 16] = [
+const VERBS: [&str; 17] = [
     "--once",
     "--json",
     "--watch",
@@ -64,6 +65,7 @@ const VERBS: [&str; 16] = [
     "--toggle",
     "--restore",
     "--daemon",
+    "--refresh",
     "--setup",
     "--setup-rollback",
     "--version",
@@ -158,7 +160,8 @@ fn run(args: &[String]) -> Result<()> {
         "--disable" => daemon::disable(),
         "--toggle" => daemon::toggle(args),
         "--restore" => daemon::restore(),
-        "--daemon" => daemon::run(&config::load_with_args(args)?),
+        "--daemon" => daemon::run(&config::load_with_args(args)?, args),
+        "--refresh" => daemon::request_refresh(),
         "--setup" => setup::run_setup(),
         "--setup-rollback" => setup::run_rollback(),
         "--version" => {
