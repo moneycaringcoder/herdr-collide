@@ -32,6 +32,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Configuration docs no longer duplicate `predict_conflicts`, the Herdr
   environment notes match the current `HERDR_BIN_PATH`/plugin context contract,
   and obsolete sequential-prime and ignored-`base_ref` claims are removed.
+- Porcelain-v2 status and numstat parsing now live in `git::status`, separating
+  byte-framing/path parsing from process, snapshot, and prediction plumbing.
+  Public parser APIs remain re-exported from `git`.
 
 ### Fixed
 
