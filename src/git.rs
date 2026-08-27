@@ -570,6 +570,13 @@ impl HeadState {
             _ => None,
         }
     }
+
+    pub fn branch(&self) -> Option<&str> {
+        match self {
+            HeadState::Branch { name, .. } | HeadState::Unborn { name } => Some(name),
+            HeadState::Detached { .. } | HeadState::BrokenHead { .. } => None,
+        }
+    }
 }
 
 /// Classifies HEAD, or fails if git could not tell us.
@@ -735,6 +742,32 @@ pub fn integration_ref(checkout: &Path, timeout: Duration) -> Result<Option<Stri
 }
 
 // ---------------------------------------------------------------------------
+/// Parses the `--branch` headers from porcelain-v2 status.
+pub fn parse_status_head(bytes: &[u8]) -> Option<HeadState> {
+    let mut oid = None;
+    let mut branch = None;
+    for field in bytes.split(|byte| *byte == 0) {
+        if let Some(value) = field.strip_prefix(b"# branch.oid ") {
+            oid = Some(String::from_utf8_lossy(value).into_owned());
+        } else if let Some(value) = field.strip_prefix(b"# branch.head ") {
+            branch = Some(String::from_utf8_lossy(value).into_owned());
+        }
+    }
+    match (oid.as_deref(), branch.as_deref()) {
+        (Some("(initial)"), Some(name)) => Some(HeadState::Unborn {
+            name: name.to_string(),
+        }),
+        (Some(oid), Some("(detached)")) => Some(HeadState::Detached {
+            oid: oid.to_string(),
+        }),
+        (Some(oid), Some(name)) => Some(HeadState::Branch {
+            name: name.to_string(),
+            oid: oid.to_string(),
+        }),
+        _ => None,
+    }
+}
+
 // Change sets
 // ---------------------------------------------------------------------------
 
@@ -1117,6 +1150,10 @@ fn filter_overrides_with_env(
 pub struct ChangeSetRead {
     pub change_set: ChangeSet,
     pub top_level: PathBuf,
+    pub head: HeadState,
+    pub status_entries: Vec<StatusEntry>,
+    pub filter_overrides: Vec<String>,
+    pub target_oid: Option<String>,
 }
 
 /// Compatibility wrapper for callers that only need the change set.
@@ -1149,6 +1186,7 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
             "-z",
             "--untracked-files=all",
             "--renames",
+            "--branch",
         ],
         timeout,
     )?;
@@ -1183,23 +1221,19 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
         ));
     }
 
-    // A HEAD git could not read is not a HEAD with no commit. Reporting it as
-    // one would quietly drop the checkout from every pairing, so it gets its own
-    // reason and the rest of the change set is still assembled from `status`.
-    let head = match head_state(checkout, timeout) {
-        Ok(head) => Some(head),
-        Err(err) => {
-            reasons.push(format!("{DEGRADED_UNREADABLE}: could not read HEAD: {err}"));
-            None
-        }
-    };
+    let head = parse_status_head(&status.stdout).ok_or_else(|| {
+        format!(
+            "git status returned no branch headers in {}",
+            checkout.display()
+        )
+    })?;
     match &head {
-        Some(HeadState::Unborn { name }) => {
+        HeadState::Unborn { name } => {
             reasons.push(format!(
                 "{DEGRADED_UNBORN}: `{name}` does not exist, so this checkout has no commit"
             ));
         }
-        Some(HeadState::BrokenHead { name }) => {
+        HeadState::BrokenHead { name } => {
             reasons.push(format!(
                 "{DEGRADED_BROKEN_HEAD}: `{name}` does not resolve to a commit"
             ));
@@ -1211,7 +1245,8 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
     // untracked files.
     let filter_overrides = filter_overrides(checkout, timeout);
 
-    if let Some(head_oid) = head.as_ref().and_then(HeadState::oid) {
+    let mut target_oid = None;
+    if let Some(head_oid) = head.oid() {
         // Dirty-side line volume: everything between HEAD and the working tree.
         // This is the second command that would run the repository's content
         // filters, so it gets the same overrides as the snapshot.
@@ -1254,6 +1289,7 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
                 format!("{DEGRADED_MISSING_BASE_REF}: `{base}` does not resolve")
             });
         }
+        target_oid = base_oid.clone();
         if let Some(base_oid) = base_oid {
             let merge_base = git(checkout, &["merge-base", &base_oid, head_oid], timeout)?;
             if !merge_base.ok() {
@@ -1325,7 +1361,7 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
     }
     // With no usable HEAD there is nothing to diff against, so staged and
     // unstaged additions use the same bounded path.
-    if head.as_ref().and_then(HeadState::oid).is_none() {
+    if head.oid().is_none() {
         for entry in &entries {
             if entry.kind == ChangeKind::Staged || entry.kind == ChangeKind::Unstaged {
                 count_path(entry);
@@ -1358,6 +1394,10 @@ pub fn read_change_set(checkout: &Path, base: &str, timeout: Duration) -> Result
     Ok(ChangeSetRead {
         change_set: set,
         top_level,
+        head,
+        status_entries: entries,
+        filter_overrides,
+        target_oid,
     })
 }
 
@@ -1560,11 +1600,27 @@ impl Side {
     }
 }
 
+pub struct PreparedSideInput<'a> {
+    pub checkout: &'a Path,
+    pub common_dir: &'a Path,
+    pub git_dir: &'a Path,
+    pub read: &'a ChangeSetRead,
+}
+
+struct SnapshotSource<'a> {
+    git_dir: &'a Path,
+    odb: &'a Path,
+    index_prefix: &'a str,
+    base_env: &'a [(&'a str, OsString)],
+    overrides: &'a [String],
+}
+
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Holds the per-cycle state that makes prediction cheap: one outer scratch
 /// object directory, one snapshot per worktree, and cached direct-submodule
-/// repository state. Priming is sequential; prediction only reads these maps.
+/// repository state. Independent outer and nested snapshots are primed in
+/// bounded workers; prediction only reads the completed maps.
 pub struct Predictor {
     timeout: Duration,
     scratch: PathBuf,
@@ -1630,6 +1686,100 @@ impl Predictor {
         Ok(())
     }
 
+    pub fn prime_prepared(&mut self, input: &PreparedSideInput<'_>) -> Result<()> {
+        let key = canonical(input.checkout);
+        if self.sides.contains_key(&key) {
+            return Ok(());
+        }
+        let side = self.build_side_prepared(input)?;
+        self.sides.insert(key, side);
+        Ok(())
+    }
+
+    pub fn prime_target_oid(&mut self, common_dir: &Path, target_ref: &str, oid: &str) {
+        let key = (common_dir.to_path_buf(), target_ref.to_string());
+        self.targets.entry(key).or_insert_with(|| Side {
+            common_dir: common_dir.to_path_buf(),
+            head: oid.to_string(),
+            tree: None,
+            dirty: false,
+            unmerged: false,
+        });
+    }
+
+    pub fn prime_prepared_all(
+        &mut self,
+        inputs: &[PreparedSideInput<'_>],
+    ) -> BTreeMap<PathBuf, String> {
+        let mut seen = BTreeSet::new();
+        let pending: Vec<&PreparedSideInput<'_>> = inputs
+            .iter()
+            .filter(|input| {
+                let key = canonical(input.checkout);
+                !self.sides.contains_key(&key) && seen.insert(key)
+            })
+            .collect();
+        if pending.is_empty() {
+            return BTreeMap::new();
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(pending.len());
+        let chunk_size = pending.len().div_ceil(workers);
+        let deadline = current_cycle_deadline();
+        let predictor: &Predictor = self;
+        let mut results = Vec::with_capacity(pending.len());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = pending
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    (
+                        chunk,
+                        scope.spawn(move || {
+                            with_cycle_deadline(deadline, || {
+                                chunk
+                                    .iter()
+                                    .map(|input| {
+                                        (
+                                            canonical(input.checkout),
+                                            predictor
+                                                .build_side_prepared(input)
+                                                .map_err(|err| err.to_string()),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        }),
+                    )
+                })
+                .collect();
+            for (chunk, handle) in handles {
+                match handle.join() {
+                    Ok(chunk_results) => results.extend(chunk_results),
+                    Err(_) => results.extend(chunk.iter().map(|input| {
+                        (
+                            canonical(input.checkout),
+                            Err("checkout snapshot worker panicked".to_string()),
+                        )
+                    })),
+                }
+            }
+        });
+        let mut errors = BTreeMap::new();
+        for (key, result) in results {
+            match result {
+                Ok(side) => {
+                    self.sides.insert(key, side);
+                }
+                Err(err) => {
+                    errors.insert(key, err);
+                }
+            }
+        }
+        errors
+    }
     /// Resolves one local integration ref and caches its commit once per
     /// repository. Call this during the sequential prime phase; predictions
     /// only read the cached side and can then fan out through `&self`.
@@ -1782,12 +1932,16 @@ impl Predictor {
             .any(|entry| entry.kind == ChangeKind::Conflicted);
         let tree = if dirty {
             let changed = changed_index_paths(&entries);
+            let overrides = filter_overrides_with_env(checkout, &env, self.timeout);
             Some(self.snapshot_tree_from_git_dir(
                 checkout,
-                &git_dir,
-                &odb,
-                "submodule-index",
-                &env,
+                SnapshotSource {
+                    git_dir: &git_dir,
+                    odb: &odb,
+                    index_prefix: "submodule-index",
+                    base_env: &env,
+                    overrides: &overrides,
+                },
                 &changed,
             )?)
         } else {
@@ -1804,6 +1958,107 @@ impl Predictor {
                 dirty,
                 unmerged,
             },
+        })
+    }
+
+    pub fn prime_submodules(&mut self, jobs: &[(PathBuf, String)]) {
+        let mut seen = BTreeSet::new();
+        let pending: Vec<(PathBuf, String)> = jobs
+            .iter()
+            .map(|(checkout, path)| (canonical(checkout), path.clone()))
+            .filter(|key| !self.nested_sides.contains_key(key) && seen.insert(key.clone()))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(pending.len());
+        let chunk_size = pending.len().div_ceil(workers);
+        let deadline = current_cycle_deadline();
+        let predictor: &Predictor = self;
+        let mut results = Vec::with_capacity(pending.len());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = pending
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    (
+                        chunk,
+                        scope.spawn(move || {
+                            with_cycle_deadline(deadline, || {
+                                chunk
+                                    .iter()
+                                    .map(|(checkout, path)| {
+                                        let nested_checkout = checkout.join(path);
+                                        let cached =
+                                            match predictor.build_nested_side(&nested_checkout) {
+                                                Ok(side) => CachedNestedSide::Ready(side),
+                                                Err(err) => {
+                                                    CachedNestedSide::Unavailable(err.to_string())
+                                                }
+                                            };
+                                        ((checkout.clone(), path.clone()), cached)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        }),
+                    )
+                })
+                .collect();
+            for (chunk, handle) in handles {
+                match handle.join() {
+                    Ok(chunk_results) => results.extend(chunk_results),
+                    Err(_) => results.extend(chunk.iter().map(|key| {
+                        (
+                            key.clone(),
+                            CachedNestedSide::Unavailable(
+                                "nested snapshot worker panicked".to_string(),
+                            ),
+                        )
+                    })),
+                }
+            }
+        });
+        self.nested_sides.extend(results);
+    }
+    fn build_side_prepared(&self, input: &PreparedSideInput<'_>) -> Result<Side> {
+        let head = input.read.head.oid().ok_or_else(|| {
+            format!(
+                "{} has no commit, nothing to compare",
+                input.checkout.display()
+            )
+        })?;
+        let dirty = !input.read.status_entries.is_empty();
+        let unmerged = input
+            .read
+            .status_entries
+            .iter()
+            .any(|entry| entry.kind == ChangeKind::Conflicted);
+        let tree = if dirty {
+            let changed = changed_index_paths(&input.read.status_entries);
+            let env = self.odb_env(input.common_dir);
+            Some(self.snapshot_tree_from_git_dir(
+                input.checkout,
+                SnapshotSource {
+                    git_dir: input.git_dir,
+                    odb: &self.odb,
+                    index_prefix: "index",
+                    base_env: &env,
+                    overrides: &input.read.filter_overrides,
+                },
+                &changed,
+            )?)
+        } else {
+            None
+        };
+        Ok(Side {
+            common_dir: input.common_dir.to_path_buf(),
+            head: head.to_string(),
+            tree,
+            dirty,
+            unmerged,
         })
     }
 
@@ -1903,18 +2158,31 @@ impl Predictor {
         )?;
         let git_dir = PathBuf::from(out.stdout_trimmed());
         let env = self.odb_env(common_dir);
-        self.snapshot_tree_from_git_dir(checkout, &git_dir, &self.odb, "index", &env, changed)
+        let overrides = filter_overrides_with_env(checkout, &env, self.timeout);
+        self.snapshot_tree_from_git_dir(
+            checkout,
+            SnapshotSource {
+                git_dir: &git_dir,
+                odb: &self.odb,
+                index_prefix: "index",
+                base_env: &env,
+                overrides: &overrides,
+            },
+            changed,
+        )
     }
 
     fn snapshot_tree_from_git_dir(
         &self,
         checkout: &Path,
-        git_dir: &Path,
-        odb: &Path,
-        index_prefix: &str,
-        base_env: &[(&str, OsString)],
+        source: SnapshotSource<'_>,
         changed: &[&str],
     ) -> Result<String> {
+        let git_dir = source.git_dir;
+        let odb = source.odb;
+        let index_prefix = source.index_prefix;
+        let base_env = source.base_env;
+        let overrides = source.overrides;
         let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
         let index = TempIndex::new(self.scratch.join(format!("{index_prefix}-{seq}")))?;
         // A worktree with no index yet legitimately starts from empty. Every
@@ -1939,7 +2207,6 @@ impl Predictor {
             .is_some_and(|(_, value)| value.as_os_str() == odb.as_os_str()));
         env.push(("GIT_INDEX_FILE", index.path.clone().into_os_string()));
 
-        let overrides = filter_overrides_with_env(checkout, base_env, self.timeout);
         // `--renormalize` re-reads pathspec'd tracked files instead of trusting
         // their stat cache. Retaining each copied entry preserves its index
         // flags and keeps tracked-but-ignored paths tracked. The filter

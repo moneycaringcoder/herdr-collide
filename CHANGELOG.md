@@ -14,6 +14,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   statuses for every observed checkout instead of publishing partial clean
   output.
 
+### Changed
+
+- Change-set collection now retains porcelain-v2 branch/HEAD facts, status
+  entries, filter overrides, top levels, per-worktree Git directories, and
+  integration OIDs for prediction. Outer snapshots and deduplicated direct
+  submodule sides prime in bounded parallel workers instead of repeating probes
+  and snapshotting sequentially.
+
 ### Fixed
 
 - Repository identity, per-worktree and nested Git-directory discovery, and
