@@ -464,15 +464,14 @@ fn refresh(
     let skipped = client.skipped_worktrees();
     let cycle = crate::collide::gather_for(checkouts, config)?;
 
-    // A workspace herdr says is a repo but whose worktree object this client
-    // could not read is dropped silently, which makes the session look smaller
-    // than it is. Folded in with the analysis notes so it repeats no more often
-    // than they do.
+    // A workspace whose public checkout metadata cannot be reduced is dropped,
+    // which makes the session look smaller than it is. Folded in with the
+    // analysis notes so it repeats no more often than they do.
     let mut notes = cycle.notes.clone();
     if skipped > 0 {
         notes.push(format!(
-            "{skipped} workspace(s) carried a worktree object this client could not read \
-             (no workspace_id, repo_key or checkout_path); they are missing from the report"
+            "{skipped} workspace(s) carried unreadable checkout metadata; \
+             they are missing from the report"
         ));
     }
     // Computing a severity herdr has not been told to render is the same as

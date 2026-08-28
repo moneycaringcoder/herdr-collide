@@ -454,6 +454,47 @@ fn snapshot_line(snapshot: Value) -> String {
     .to_string()
 }
 
+fn worktree_list_reply() -> Reply {
+    Reply::Line(
+        json!({
+            "id": "collide:2",
+            "result": {
+                "type": "worktree_list",
+                "source": {
+                    "repo_key": "/repo/.git",
+                    "repo_name": "repo",
+                    "repo_root": "/repo",
+                    "source_checkout_path": "/repo",
+                    "source_workspace_id": "w2"
+                },
+                "worktrees": [
+                    {
+                        "branch": "main",
+                        "is_bare": false,
+                        "is_detached": false,
+                        "is_linked_worktree": false,
+                        "is_prunable": false,
+                        "label": "repo",
+                        "open_workspace_id": "w2",
+                        "path": "/repo"
+                    },
+                    {
+                        "branch": "fix",
+                        "is_bare": false,
+                        "is_detached": false,
+                        "is_linked_worktree": true,
+                        "is_prunable": false,
+                        "label": "fix",
+                        "open_workspace_id": "w3",
+                        "path": "/wt/fix"
+                    }
+                ]
+            }
+        })
+        .to_string(),
+    )
+}
+
 /// Structure copied from `herdr api snapshot` on a live 0.8.0 server, paths
 /// redacted. Fields the client ignores are kept deliberately.
 fn snapshot_with_one_repo() -> Value {
@@ -826,8 +867,8 @@ fn non_git_workspaces_are_skipped_rather_than_failing() {
         Some("gitsmith"),
         "the user's own name for the agent wins over the program name"
     );
-    // Branches come from git, not from the snapshot and not from
-    // `worktree.list` — this client never calls that method.
+    // This legacy 0.8.0 path reads no branch from the snapshot and does not
+    // issue worktree.list; the 0.8.2 path is covered separately below.
     assert_eq!(main.branch, None);
 
     let linked = &checkouts[1];
@@ -836,6 +877,227 @@ fn non_git_workspaces_are_skipped_rather_than_failing() {
         linked.agent.as_deref(),
         Some("codex"),
         "panes[] carries the agent when agents[] has no row"
+    );
+}
+
+/// Herdr 0.8.2 workspace summaries deliberately carry no deprecated
+/// `worktree` object. Each workspace is resolved through the public
+/// `worktree.list` source, preserving sibling checkout discovery.
+#[test]
+fn herdr_0_8_2_discovers_sibling_checkouts_without_workspace_worktree_metadata() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![
+        snapshot_reply(json!({
+            "protocol": 19,
+            "version": "0.8.2",
+            "focused_pane_id": "w2:p1",
+            "focused_tab_id": "w2:t1",
+            "focused_workspace_id": "w2",
+            "layouts": [],
+            "tabs": [],
+            "workspaces": [
+                {"workspace_id": "w2", "label": "main", "number": 2, "agent_status": "idle",
+                 "focused": true, "pane_count": 1, "tab_count": 1, "active_tab_id": "w2:t1"},
+                {"workspace_id": "w3", "label": "fix", "number": 3, "agent_status": "idle",
+                 "focused": false, "pane_count": 1, "tab_count": 1, "active_tab_id": "w3:t1"}
+            ],
+            "panes": [
+                {"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1",
+                 "terminal_id": "term_1", "focused": true, "revision": 1,
+                 "agent_status": "idle", "agent": "claude", "cwd": "/repo"},
+                {"pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1",
+                 "terminal_id": "term_2", "focused": false, "revision": 1,
+                 "agent_status": "idle", "agent": "codex", "cwd": "/wt/fix"}
+            ],
+            "agents": []
+        })),
+        worktree_list_reply(),
+    ]);
+    let mut client = server.client();
+
+    let checkouts = client.checkouts().expect("0.8.2 checkout discovery");
+
+    assert_eq!(
+        checkouts
+            .iter()
+            .map(|checkout| checkout.workspace_id.as_str())
+            .collect::<Vec<_>>(),
+        ["w2", "w3"]
+    );
+    assert_eq!(checkouts[0].checkout_path, PathBuf::from("/repo"));
+    assert_eq!(checkouts[0].branch.as_deref(), Some("main"));
+    assert!(!checkouts[0].is_linked_worktree);
+    assert_eq!(checkouts[1].checkout_path, PathBuf::from("/wt/fix"));
+    assert_eq!(checkouts[1].branch.as_deref(), Some("fix"));
+    assert!(checkouts[1].is_linked_worktree);
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one worktree.list response maps every open sibling in the repository"
+    );
+    assert_eq!(parse_framed(&requests[0])["method"], "session.snapshot");
+    let request = parse_framed(&requests[1]);
+    assert_eq!(request["method"], "worktree.list");
+    assert_eq!(request["params"], json!({"workspace_id": "w2"}));
+}
+
+#[test]
+fn source_checkout_path_never_maps_an_unrelated_linked_workspace_to_main() {
+    let _guard = env_lock();
+    let server = TestServer::start(vec![
+        snapshot_reply(json!({
+            "protocol": 19,
+            "version": "0.8.2",
+            "layouts": [],
+            "tabs": [],
+            "panes": [],
+            "agents": [],
+            "workspaces": [
+                {"workspace_id": "w2", "label": "main", "number": 2, "agent_status": "idle",
+                 "focused": true, "pane_count": 0, "tab_count": 1, "active_tab_id": "w2:t1"},
+                {"workspace_id": "w3", "label": "linked", "number": 3, "agent_status": "idle",
+                 "focused": false, "pane_count": 0, "tab_count": 1, "active_tab_id": "w3:t1"}
+            ]
+        })),
+        Reply::Line(
+            json!({
+                "id": "collide:2",
+                "result": {
+                    "type": "worktree_list",
+                    "source": {
+                        "repo_key": "/repo/.git",
+                        "repo_name": "repo",
+                        "repo_root": "/repo",
+                        "source_checkout_path": "/repo",
+                        "source_workspace_id": "w2"
+                    },
+                    "worktrees": [
+                        {"branch": "main", "is_bare": false, "is_detached": false,
+                         "is_linked_worktree": false, "is_prunable": false,
+                         "label": "repo", "path": "/repo"},
+                        {"branch": "fix", "is_bare": false, "is_detached": false,
+                         "is_linked_worktree": true, "is_prunable": false,
+                         "label": "fix", "path": "/wt/fix"}
+                    ]
+                }
+            })
+            .to_string(),
+        ),
+        Reply::Line(
+            json!({
+                "id": "collide:3",
+                "error": {
+                    "code": "not_git_worktree",
+                    "message": "workspace is not a Git worktree"
+                }
+            })
+            .to_string(),
+        ),
+    ]);
+    let mut client = server.client();
+
+    let checkouts = client.checkouts().expect("checkout discovery");
+
+    assert_eq!(checkouts.len(), 1);
+    assert_eq!(checkouts[0].workspace_id, "w2");
+    assert_eq!(checkouts[0].checkout_path, PathBuf::from("/repo"));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        parse_framed(&requests[2])["params"],
+        json!({"workspace_id": "w3"})
+    );
+}
+
+#[test]
+fn parent_repo_response_does_not_absorb_pending_nested_repo_workspace() {
+    let _guard = env_lock();
+    let list_reply = |repo_key: &str,
+                      repo_root: &str,
+                      source_workspace_id: &str,
+                      checkout_path: &str,
+                      branch: &str| {
+        Reply::Line(
+            json!({
+                "id": "collide:list",
+                "result": {
+                    "type": "worktree_list",
+                    "source": {
+                        "repo_key": repo_key,
+                        "repo_name": branch,
+                        "repo_root": repo_root,
+                        "source_checkout_path": checkout_path,
+                        "source_workspace_id": source_workspace_id
+                    },
+                    "worktrees": [{
+                        "branch": branch,
+                        "is_bare": false,
+                        "is_detached": false,
+                        "is_linked_worktree": false,
+                        "is_prunable": false,
+                        "label": branch,
+                        "path": checkout_path
+                    }]
+                }
+            })
+            .to_string(),
+        )
+    };
+    let server = TestServer::start(vec![
+        snapshot_reply(json!({
+            "protocol": 19,
+            "version": "0.8.2",
+            "layouts": [],
+            "tabs": [],
+            "agents": [],
+            "workspaces": [
+                {"workspace_id": "wa", "label": "parent", "number": 1, "agent_status": "idle",
+                 "focused": true, "pane_count": 1, "tab_count": 1, "active_tab_id": "wa:t1"},
+                {"workspace_id": "wb", "label": "nested", "number": 2, "agent_status": "idle",
+                 "focused": false, "pane_count": 1, "tab_count": 1, "active_tab_id": "wb:t1"}
+            ],
+            "panes": [
+                {"pane_id": "wa:p1", "workspace_id": "wa", "tab_id": "wa:t1",
+                 "terminal_id": "term_a", "focused": true, "revision": 1,
+                 "agent_status": "idle", "cwd": "/repo"},
+                {"pane_id": "wb:p1", "workspace_id": "wb", "tab_id": "wb:t1",
+                 "terminal_id": "term_b", "focused": false, "revision": 1,
+                 "agent_status": "idle", "cwd": "/repo/vendor/lib"}
+            ]
+        })),
+        list_reply("/repo/.git", "/repo", "wa", "/repo", "parent"),
+        list_reply(
+            "/repo/vendor/lib/.git",
+            "/repo/vendor/lib",
+            "wb",
+            "/repo/vendor/lib",
+            "nested",
+        ),
+    ]);
+    let mut client = server.client();
+
+    let checkouts = client.checkouts().expect("nested checkout discovery");
+
+    assert_eq!(checkouts.len(), 2);
+    assert_eq!(checkouts[0].workspace_id, "wa");
+    assert_eq!(checkouts[0].repo_key.0, "/repo/.git");
+    assert_eq!(checkouts[0].checkout_path, PathBuf::from("/repo"));
+    assert_eq!(checkouts[1].workspace_id, "wb");
+    assert_eq!(checkouts[1].repo_key.0, "/repo/vendor/lib/.git");
+    assert_eq!(
+        checkouts[1].checkout_path,
+        PathBuf::from("/repo/vendor/lib")
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        parse_framed(&requests[1])["params"],
+        json!({"workspace_id": "wa"})
+    );
+    assert_eq!(
+        parse_framed(&requests[2])["params"],
+        json!({"workspace_id": "wb"})
     );
 }
 

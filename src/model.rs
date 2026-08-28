@@ -5,9 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Canonical identity for "the same repository", taken from herdr's
-/// `workspace.worktree.repo_key` (the `.git` path). Two checkouts are only ever
-/// compared when their repo keys match.
+/// Canonical identity for "the same repository", sourced from Herdr's
+/// `worktree.list` response and re-derived from Git before comparison. Two
+/// checkouts are only ever compared when their verified repo keys match.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepoKey(pub String);
 

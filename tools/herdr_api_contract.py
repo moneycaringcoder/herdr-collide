@@ -6,12 +6,12 @@ in the upstream tree, which is byte-compared against the running code by
 upstream's own `generated_protocol_schema_artifact_is_current` test, or the
 output of `herdr api schema` from a local build.
 
-The contract below is deliberately narrow. It names the four methods collide
+The contract below is deliberately narrow. It names the five methods collide
 calls, the parameters it sends, and the response fields it reads, and nothing
 else. Upstream is free to add, remove, and rename anything collide does not
 touch; this only fails when the surface collide actually stands on moves.
 
-`worktree.list`, `pane.report_agent` and `pane.release_agent` are documented in
+`pane.report_agent` and `pane.release_agent` are documented in
 `docs/herdr-protocol.md` but are not called by this client, so they are not in
 the contract. A canary that guards methods the plugin does not use goes red for
 reasons that cost a maintainer an afternoon and change nothing.
@@ -40,6 +40,7 @@ MIN_PROTOCOL = 19
 # only sometimes; it must still exist.
 REQUESTS: dict[str, dict[str, tuple[str, ...]]] = {
     "session.snapshot": {"required": (), "optional": ()},
+    "worktree.list": {"required": (), "optional": ("workspace_id",)},
     "server.reload_config": {"required": (), "optional": ()},
     "notification.show": {
         "required": ("title",),
@@ -59,6 +60,7 @@ RESULTS: dict[str, tuple[str, ...]] = {
     # The arrays live under `snapshot`. A client reading them off the result
     # object finds nothing, which looks exactly like an idle session.
     "session_snapshot": ("snapshot",),
+    "worktree_list": ("source", "worktrees"),
     # The reply to `server.reload_config` is not `{"type":"ok"}`, and the
     # difference matters: a reload can succeed as a request while failing as a
     # reload. Only `status == "applied"` means the file took effect, and
@@ -83,24 +85,25 @@ OBJECTS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "WorkspaceInfo": {
         "required": ("workspace_id", "label"),
-        # No `worktree` key means the workspace is not a repository, which is
-        # data rather than an error — but the key going away entirely would
-        # make every session look like it contains no repositories at all.
-        "optional": ("worktree",),
-    },
-    "WorkspaceWorktreeInfo": {
-        # A repository collide can see but cannot address is counted as skipped
-        # rather than silently dropped, so these three are what addressability
-        # means here.
-        "required": ("repo_key", "checkout_path"),
-        "optional": ("repo_root", "is_linked_worktree"),
+        "optional": ("active_tab_id",),
     },
     "AgentInfo": {
         "required": ("workspace_id",),
         # `name` is the user's own label and wins over the program name.
         "optional": ("name", "agent"),
     },
-    "PaneInfo": {"required": ("workspace_id",), "optional": ("agent",)},
+    "PaneInfo": {
+        "required": ("workspace_id",),
+        "optional": ("agent", "tab_id", "focused", "cwd", "foreground_cwd"),
+    },
+    "WorktreeSourceInfo": {
+        "required": ("repo_key", "repo_root", "source_checkout_path"),
+        "optional": ("source_workspace_id",),
+    },
+    "WorktreeInfo": {
+        "required": ("path",),
+        "optional": ("branch", "is_linked_worktree", "open_workspace_id"),
+    },
 }
 
 # Enumerations collide depends on by value. `applied` is the only reload status

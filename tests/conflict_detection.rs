@@ -1837,20 +1837,22 @@ fn end_to_end_separates_the_conflicting_pair_from_the_clean_one() {
 }
 
 #[test]
-fn invocation_workspace_scopes_the_report_to_its_verified_repository() {
+fn invocation_candidates_fall_back_only_after_focused_repo_cannot_match() {
     let fixture = Fixture::new("focused-repository");
     let (left, right) = fixture.committed_conflict_pair();
-    let foreign = fixture.foreign_repo("foreign");
+    let unrepresented = fixture.foreign_repo("plugin-checkout");
     let key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
-    let foreign_key = git::repo_key(&foreign, TIMEOUT).unwrap();
     let checkouts = vec![
         checkout("left", &left, &key.0),
         checkout("right", &right, &key.0),
-        checkout("foreign", &foreign, &foreign_key.0),
     ];
 
-    let cycle = collide::collide::gather_for_workspace(checkouts.clone(), &config(), "left")
-        .expect("scoped gather");
+    let cycle = collide::collide::gather_for_invocation(
+        checkouts.clone(),
+        &config(),
+        &[unrepresented, left.clone()],
+    )
+    .expect("workspace candidate should follow an unrepresented focused repo");
     assert_eq!(
         cycle
             .report
@@ -1863,14 +1865,54 @@ fn invocation_workspace_scopes_the_report_to_its_verified_repository() {
     assert_eq!(cycle.report.pairings.len(), 1);
     assert_eq!(cycle.report.pairings[0].conflicts(), 1);
 
-    let err = collide::collide::gather_for_workspace(checkouts, &config(), "missing")
+    let missing = fixture.root().join("not-a-checkout");
+    let unreadable_fallback = collide::collide::gather_for_invocation(
+        checkouts.clone(),
+        &config(),
+        &[missing.clone(), left],
+    )
+    .expect("workspace candidate should follow an unreadable focused cwd");
+    assert_eq!(
+        unreadable_fallback
+            .report
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.workspace_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["left", "right"])
+    );
+
+    let err = collide::collide::gather_for_invocation(checkouts, &config(), &[missing])
         .err()
-        .expect("a stale invocation id must not select another repository");
+        .expect("an unreadable direct cwd must fail clearly");
     assert!(
         err.to_string()
-            .contains("invocation workspace `missing` is not a readable git-backed workspace"),
+            .contains("no invocation repository candidate could be selected"),
         "{err}"
     );
+}
+
+#[test]
+fn valid_nested_focused_repository_wins_over_workspace_repository() {
+    let fixture = Fixture::new("nested-focused-repository");
+    let (left, right) = fixture.committed_conflict_pair();
+    let nested = left.join("nested-repo");
+    fixture.init_repo(&nested);
+    fixture.write(&nested, "nested.txt", "nested\n");
+    fixture.commit_all(&nested, "nested base");
+
+    let outer_key = git::repo_key(&fixture.repo, TIMEOUT).unwrap();
+    let nested_key = git::repo_key(&nested, TIMEOUT).unwrap();
+    let checkouts = vec![
+        checkout("left", &left, &outer_key.0),
+        checkout("right", &right, &outer_key.0),
+        checkout("nested", &nested, &nested_key.0),
+    ];
+
+    let cycle = collide::collide::gather_for_invocation(checkouts, &config(), &[nested, left])
+        .expect("focused nested repository");
+    assert_eq!(cycle.report.checkouts.len(), 1);
+    assert_eq!(cycle.report.checkouts[0].workspace_id, "nested");
 }
 
 #[test]

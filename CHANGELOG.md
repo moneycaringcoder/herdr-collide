@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Installed report, JSON, `--why`, and detail-pane actions now consume
+  `HERDR_PLUGIN_CONTEXT_JSON` instead of the plugin process cwd. The focused
+  pane cwd is tried before the workspace cwd; each candidate must resolve
+  through Git and match a readable Herdr checkout. The installed plugin root is
+  never selected. Direct CLI invocations retain one process-cwd candidate, and
+  the badge daemon remains session-wide.
+- Herdr 0.8.2 checkout discovery no longer requires deprecated
+  `session.snapshot.workspaces[*].worktree` metadata. Collide consumes
+  explicitly named open siblings before querying another unresolved workspace.
+  Pane-cwd and `source_checkout_path` fallbacks apply only to the queried
+  workspace, preventing a parent response from absorbing a distinct nested
+  repository.
+- A scoped cycle timeout now fails clearly instead of widening the report to
+  unrelated repositories or comparing Herdr-provided repository keys with
+  Git-derived identity.
+
 ## [0.2.0] - 2026-08-28
 
 ### Added
@@ -120,12 +138,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Skin-tone emoji, ZWJ families, regional-indicator flags, Hebrew points, Thai
   marks, and future Unicode table updates can no longer be split or
   under-counted into a line that wraps the redraw-in-place detail pane.
-- Herdr-invoked reports, JSON snapshots, `--why`, and the live detail pane now
-  honor `HERDR_WORKSPACE_ID` and show only sibling worktrees from that
-  workspace's verified repository, matching their manifest descriptions.
-  Direct shell invocations without workspace context remain session-wide. A
-  stale or non-repository invocation id fails visibly instead of selecting an
-  unrelated repository.
+- Herdr-invoked reports, JSON snapshots, `--why`, and the live detail pane were
+  scoped to the invoking workspace's repository. Current releases obtain that
+  invocation scope from `HERDR_PLUGIN_CONTEXT_JSON`; direct shell invocations
+  use their process cwd.
 - Worktree-root discovery now reuses Git's timed `--show-toplevel` result from
   change-set collection instead of performing a second, unbounded
   `canonicalize` and ancestor walk in the daemon thread. A slow filesystem can

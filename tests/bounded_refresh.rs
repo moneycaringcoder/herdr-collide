@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use fixtures::Fixture;
 
 #[test]
-fn a_slow_repository_degrades_when_the_cycle_budget_expires() {
+fn a_slow_scoped_repository_fails_clearly_when_cycle_budget_expires() {
     let fixture = Fixture::new("bounded-cycle");
     let worktree = fixture.worktree("slow-worktree", "slow-worktree");
+    let unrelated = fixture.foreign_repo("unrelated");
     fixture.leaking_fsmonitor(&worktree, 90);
 
     let root = fixture.root();
@@ -41,9 +42,26 @@ fn a_slow_repository_degrades_when_the_cycle_budget_expires() {
         "worktree": {
             "repo_key": fixture.repo.join(".git"),
             "repo_name": "repo",
-            "repo_root": fixture.repo,
-            "checkout_path": worktree,
+            "repo_root": fixture.repo.clone(),
+            "checkout_path": worktree.clone(),
             "is_linked_worktree": true
+        }
+    });
+    let unrelated_workspace = serde_json::json!({
+        "workspace_id": "unrelated",
+        "number": 2,
+        "label": "unrelated",
+        "focused": false,
+        "pane_count": 0,
+        "tab_count": 0,
+        "active_tab_id": "unrelated:t1",
+        "agent_status": "idle",
+        "worktree": {
+            "repo_key": unrelated.join(".git"),
+            "repo_name": "unrelated",
+            "repo_root": unrelated.clone(),
+            "checkout_path": unrelated,
+            "is_linked_worktree": false
         }
     });
     let server = std::thread::spawn(move || loop {
@@ -66,7 +84,7 @@ fn a_slow_repository_degrades_when_the_cycle_budget_expires() {
                     "tabs": [],
                     "panes": [],
                     "agents": [],
-                    "workspaces": [workspace]
+                    "workspaces": [workspace, unrelated_workspace]
                 }
             }
         });
@@ -78,10 +96,12 @@ fn a_slow_repository_degrades_when_the_cycle_budget_expires() {
         .args(["--once", "--base-ref", "main"])
         .env("HERDR_SOCKET_PATH", &socket)
         .env("HERDR_PLUGIN_ID", "test.collide.bounded")
-        .env("HERDR_WORKSPACE_ID", "slow")
+        .env_remove("HERDR_PLUGIN_CONTEXT_JSON")
+        .env_remove("HERDR_PLUGIN_ROOT")
         .env("HERDR_PLUGIN_CONFIG_DIR", &config_dir)
         .env("HERDR_PLUGIN_STATE_DIR", &state_dir)
         .env("HOME", root.join("home"))
+        .current_dir(&worktree)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -98,9 +118,13 @@ fn a_slow_repository_degrades_when_the_cycle_budget_expires() {
     let output = child.wait_with_output().expect("collect collide");
 
     assert!(
-        output.status.success(),
-        "refresh exceeded its bound or failed: {output:?}"
+        !output.status.success(),
+        "a scoped timeout must not widen into unrelated unknown rows: {output:?}"
     );
-    let stdout = String::from_utf8(output.stdout).expect("utf-8 output");
-    assert!(stdout.contains("cycle-timeout"), "{stdout}");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(stderr.contains("scoped refresh exceeded"), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "a scoped timeout must not emit unrelated repository rows"
+    );
 }
