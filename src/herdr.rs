@@ -1,41 +1,18 @@
-//! herdr socket client.
+//! Thin, plugin-local wrapper around Crook's herdr client.
 //!
-//! Newline-delimited JSON over the socket at `HERDR_SOCKET_PATH`. The server
-//! answers exactly one request per connection and then closes, so every call
-//! must be able to reconnect and retry once — see docs/herdr-protocol.md.
+//! This module keeps Collide's response validation and domain reduction while
+//! Crook owns socket resolution and NDJSON transport.
 
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use serde_json::{json, Map, Value};
+use crook::client::{Client, Error as ClientError, RetrySafety};
+use crook::env::PluginEnv;
+use serde_json::{json, Value};
 
 use crate::config;
 use crate::model::{Checkout, RepoKey};
 use crate::Result;
-
-/// Reference value from the protocol notes. Long enough that a busy server is
-/// not mistaken for a dead one, short enough that the refresh loop can never
-/// wedge behind one call.
-const IO_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Pause before the single retry.
-///
-/// The retry exists to carry the client across a `herdr update --handoff`,
-/// where the old server unlinks the socket and the new one binds it. A retry
-/// fired immediately does not do that: measured back to back, the two attempts
-/// were 0.05 ms apart, which is one attempt as far as the handoff window is
-/// concerned. This is long enough to land on the other side of a rebind and
-/// short enough that a refresh cycle never notices.
-const RETRY_BACKOFF: Duration = Duration::from_millis(150);
-
-/// How many times `connect` dials before giving up. `connect` is a call like
-/// any other — `--disable`'s sweep, `--once` and the daemon's shutdown clear
-/// all go through it — so it gets the same one retry the protocol notes require
-/// of every call.
-const CONNECT_ATTEMPTS: usize = 2;
 
 /// herdr rejects a `ttl_ms` outside this range with `invalid_metadata_ttl`.
 /// Clamping is better than losing the push: the protocol notes say to clamp the
@@ -80,56 +57,28 @@ pub fn error_code<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a 
     err.downcast_ref::<HerdrError>().map(|e| e.code.as_str())
 }
 
-/// Split so that only transport failures are retried. Retrying a rejected
-/// request would just be rejected again, and would double-count against
-/// herdr's own error accounting.
-enum Failure {
-    Transport(String),
-    Protocol(HerdrError),
-}
-
+/// Crook-backed Herdr client with Collide's last snapshot-reduction state.
 #[derive(Debug)]
 pub struct Herdr {
-    socket_path: PathBuf,
-    next_id: u64,
+    client: Client,
     skipped_worktrees: usize,
 }
 
 impl Herdr {
     pub fn connect() -> Result<Self> {
-        let socket_path = socket_path();
-        // Dial so a missing server is reported here, with the path, rather than
-        // as a confusing failure inside the first call. The connection is
-        // dropped immediately: one request per connection means there is
-        // nothing worth holding open.
-        //
-        // Retried with the same backoff `call` uses, because a handoff can just
-        // as easily land here as in the middle of a call.
-        let mut last = None;
-        for attempt in 0..CONNECT_ATTEMPTS {
-            match dial(&socket_path) {
-                Ok(_) => {
-                    return Ok(Self {
-                        socket_path,
-                        next_id: 0,
-                        skipped_worktrees: 0,
-                    })
-                }
-                Err(err) => {
-                    last = Some(err);
-                    if attempt + 1 < CONNECT_ATTEMPTS {
-                        std::thread::sleep(RETRY_BACKOFF);
-                    }
-                }
-            }
-        }
-        Err(last.unwrap_or_else(|| "could not reach herdr".into()))
+        let plugin_env = PluginEnv::resolve(config::PLUGIN_ID);
+        let client = Client::connect(plugin_env.socket_path().to_path_buf(), "collide")
+            .map_err(local_error)?;
+        Ok(Self {
+            client,
+            skipped_worktrees: 0,
+        })
     }
 
     /// One `session.snapshot` call, reduced to the git-backed workspaces.
     /// Workspaces with no `worktree` key are not repos and are skipped.
     pub fn checkouts(&mut self) -> Result<Vec<Checkout>> {
-        let result = self.call("session.snapshot", json!({}))?;
+        let result = self.call("session.snapshot", json!({}), RetrySafety::Idempotent)?;
         // The payload is `{"type":"session_snapshot","snapshot":{...}}`; the
         // arrays live one level down, under `snapshot`. Verified against a live
         // 0.8.0 server — reading them off the result object silently yields no
@@ -192,7 +141,7 @@ impl Herdr {
     /// token *names*: a row naming a token nobody sets still reloads as
     /// `applied`, so this proves the file parsed, not that the badge will show.
     pub fn reload_config(&mut self) -> Result<()> {
-        let result = self.call("server.reload_config", json!({}))?;
+        let result = self.call("server.reload_config", json!({}), RetrySafety::Never)?;
         let status = text(&result, "status").unwrap_or("missing");
         if status == "applied" {
             return Ok(());
@@ -223,6 +172,7 @@ impl Herdr {
                 "title": title,
                 "body": body,
             }),
+            RetrySafety::Never,
         )?;
         if text(&result, "type") != Some("notification_show") {
             return Err(format!(
@@ -275,122 +225,22 @@ impl Herdr {
         if let Some(ttl_ms) = ttl_ms {
             params["ttl_ms"] = Value::from(ttl_ms.clamp(MIN_TTL_MS, MAX_TTL_MS));
         }
-        self.call("workspace.report_metadata", params)?;
+        self.call("workspace.report_metadata", params, RetrySafety::Never)?;
         Ok(())
     }
 
-    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.next_id += 1;
-        let id = format!("collide:{}", self.next_id);
-        match self.call_once(&id, method, &params) {
-            Ok(result) => Ok(result),
-            Err(Failure::Protocol(err)) => Err(Box::new(err)),
-            // Every attempt dials its own connection — the server answers one
-            // request and closes, so there is nothing to reuse and nothing to
-            // keep open. A transport failure is therefore a real failure rather
-            // than the protocol's normal end-of-message, and the one thing worth
-            // retrying it for is a `herdr update --handoff`, where the first
-            // attempt lands on a socket the old server has just unlinked. That
-            // only works with the pause below: the new server needs a moment to
-            // bind, and two attempts fired back to back were measured 0.05 ms
-            // apart.
-            Err(Failure::Transport(first)) => {
-                std::thread::sleep(RETRY_BACKOFF);
-                match self.call_once(&id, method, &params) {
-                    Ok(result) => Ok(result),
-                    Err(Failure::Protocol(err)) => Err(Box::new(err)),
-                    Err(Failure::Transport(second)) => {
-                        Err(format!("{method} failed twice: {first}; on retry: {second}").into())
-                    }
-                }
-            }
-        }
-    }
-
-    fn call_once(
-        &self,
-        id: &str,
-        method: &str,
-        params: &Value,
-    ) -> std::result::Result<Value, Failure> {
-        let stream = dial(&self.socket_path).map_err(|e| Failure::Transport(e.to_string()))?;
-
-        // `params` is mandatory and must be an object — never null, `{}` when
-        // empty.
-        let params = if params.is_object() {
-            params.clone()
-        } else {
-            Value::Object(Map::new())
-        };
-        let mut line = serde_json::to_string(&json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .map_err(|e| Failure::Transport(format!("could not encode request: {e}")))?;
-        line.push('\n');
-
-        (&stream)
-            .write_all(line.as_bytes())
-            .and_then(|()| (&stream).flush())
-            .map_err(|e| Failure::Transport(format!("write to {method} failed: {e}")))?;
-
-        let mut response = String::new();
-        BufReader::new(&stream)
-            .read_line(&mut response)
-            .map_err(|e| Failure::Transport(format!("read of {method} response failed: {e}")))?;
-        if response.trim().is_empty() {
-            return Err(Failure::Transport(
-                "server closed the connection without answering".into(),
-            ));
-        }
-
-        let value: Value = serde_json::from_str(response.trim_end())
-            .map_err(|e| Failure::Transport(format!("malformed response to {method}: {e}")))?;
-
-        if let Some(err) = value.get("error") {
-            return Err(Failure::Protocol(HerdrError {
-                code: text(err, "code").unwrap_or("unknown_error").to_string(),
-                message: text(err, "message").unwrap_or("no message").to_string(),
-            }));
-        }
-        match value.get("result") {
-            Some(result) => Ok(result.clone()),
-            None => Err(Failure::Transport(format!(
-                "response to {method} carried neither result nor error"
-            ))),
-        }
+    fn call(&self, method: &str, params: Value, retry_safety: RetrySafety) -> Result<Value> {
+        self.client
+            .request(method, params, retry_safety)
+            .map_err(local_error)
     }
 }
 
-fn dial(socket_path: &Path) -> Result<UnixStream> {
-    let stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("cannot reach herdr at {}: {e}", socket_path.display()))?;
-    // Without these a half-open socket parks the refresh loop forever.
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    Ok(stream)
-}
-
-/// Where herdr's socket lives.
-///
-/// The fallback goes through `config::xdg_dir` rather than reading
-/// `XDG_CONFIG_HOME` itself. It used to do the latter, and the two then disagreed
-/// about the same variable: `xdg_dir` ignores a *relative* `XDG_CONFIG_HOME`, as
-/// the spec requires, while this read it and resolved it against the process
-/// cwd — which for a plugin command is the plugin root. `--setup` would edit the
-/// right `config.toml` and then dial a socket somewhere else entirely, and since
-/// a reload that does not succeed rolls the edit back, `--setup` could never
-/// succeed at all.
-fn socket_path() -> PathBuf {
-    // herdr injects this into everything it spawns; the fallback exists only
-    // for hand invocation from a shell.
-    if let Some(path) = config::non_empty_env("HERDR_SOCKET_PATH") {
-        return PathBuf::from(path);
+fn local_error(error: ClientError) -> Box<dyn std::error::Error> {
+    match error {
+        ClientError::Protocol { code, message } => Box::new(HerdrError { code, message }),
+        error => Box::new(error),
     }
-    config::xdg_dir("XDG_CONFIG_HOME", ".config")
-        .join("herdr")
-        .join("herdr.sock")
 }
 
 /// Non-empty string field, since herdr reports absent context as an empty

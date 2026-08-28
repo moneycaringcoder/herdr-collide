@@ -94,9 +94,18 @@ impl TestServer {
                             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                                 continue;
                             }
-                            requests.lock().expect("requests").push(line);
+                            requests.lock().expect("requests").push(line.clone());
                             match replies.next() {
                                 Some(Reply::Line(reply)) => {
+                                    let reply = match serde_json::from_str::<Value>(&reply) {
+                                        Ok(mut response) => {
+                                            let request: Value = serde_json::from_str(&line)
+                                                .expect("fake request is JSON");
+                                            response["id"] = request["id"].clone();
+                                            response.to_string()
+                                        }
+                                        Err(_) => reply,
+                                    };
                                     let mut stream = &stream;
                                     let _ = stream.write_all(reply.as_bytes());
                                     let _ = stream.write_all(b"\n");
@@ -424,8 +433,8 @@ fn parse_framed(raw: &str) -> Value {
 
 /// Every mutation answers with this, verified live against herdr 0.8.0 for both
 /// a set and a clear of `workspace.report_metadata`.
-fn ok_reply() -> Reply {
-    Reply::Line(json!({"id": "collide:1", "result": {"type": "ok"}}).to_string())
+fn ok_reply(id: u64) -> Reply {
+    Reply::Line(json!({"id": format!("collide:{id}"), "result": {"type": "ok"}}).to_string())
 }
 
 /// A `session.snapshot` reply in the real envelope: the arrays live under
@@ -600,7 +609,7 @@ fn connect_survives_the_socket_being_unlinked_and_rebound() {
 #[test]
 fn badge_patch_sends_mixed_tokens_and_ttl_atomically() {
     let _guard = env_lock();
-    let server = TestServer::start(vec![ok_reply()]);
+    let server = TestServer::start(vec![ok_reply(1)]);
     let mut client = server.client();
     let tokens = std::collections::BTreeMap::from([
         ("collide_conflict".to_string(), Some("✘ 2".to_string())),
@@ -636,7 +645,7 @@ fn badge_patch_sends_mixed_tokens_and_ttl_atomically() {
 #[test]
 fn badge_patch_clamps_ttl_into_the_protocol_range() {
     let _guard = env_lock();
-    let server = TestServer::start(vec![ok_reply(), ok_reply()]);
+    let server = TestServer::start(vec![ok_reply(1), ok_reply(2)]);
     let mut client = server.client();
     let tokens =
         std::collections::BTreeMap::from([("collide_clean".to_string(), Some("ok".to_string()))]);
@@ -657,7 +666,7 @@ fn badge_patch_clamps_ttl_into_the_protocol_range() {
 #[test]
 fn all_clear_patch_sends_null_tokens_and_no_ttl() {
     let _guard = env_lock();
-    let server = TestServer::start(vec![ok_reply()]);
+    let server = TestServer::start(vec![ok_reply(1)]);
     let mut client = server.client();
     let tokens = std::collections::BTreeMap::from([
         ("collide_conflict".to_string(), None),

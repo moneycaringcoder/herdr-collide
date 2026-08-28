@@ -59,8 +59,8 @@ fn run_cli_why(fixture: &Fixture, pair: &(PathBuf, PathBuf), path: &str) -> std:
             })
         })
         .collect();
-    let reply = json!({
-        "id": "herdr.collide:1",
+    let mut reply = json!({
+        "id": null,
         "result": {
             "type": "session_snapshot",
             "snapshot": {
@@ -73,8 +73,7 @@ fn run_cli_why(fixture: &Fixture, pair: &(PathBuf, PathBuf), path: &str) -> std:
                 "workspaces": workspaces
             }
         }
-    })
-    .to_string();
+    });
     let server = std::thread::spawn(move || loop {
         let (stream, _) = listener.accept().expect("accept collide");
         let mut request = String::new();
@@ -85,6 +84,10 @@ fn run_cli_why(fixture: &Fixture, pair: &(PathBuf, PathBuf), path: &str) -> std:
             continue;
         }
         assert!(request.contains("session.snapshot"), "{request}");
+        let request: serde_json::Value =
+            serde_json::from_str(&request).expect("parse fake Herdr request");
+        reply["id"] = request["id"].clone();
+        let reply = reply.to_string();
         let mut stream = &stream;
         stream.write_all(reply.as_bytes()).expect("write reply");
         stream.write_all(b"\n").expect("finish reply");
