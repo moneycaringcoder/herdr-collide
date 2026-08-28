@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[test]
-fn sighup_restores_the_cursor_before_the_watch_pane_exits() {
+fn sighup_restores_the_terminal_before_the_watch_pane_exits() {
     let root = std::env::temp_dir().join(format!("collide-watch-sighup-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("state")).expect("create state");
@@ -116,6 +116,11 @@ fn sighup_restores_the_cursor_before_the_watch_pane_exits() {
         "{status:?}: {}",
         String::from_utf8_lossy(&output)
     );
+    // Linux's PTY master retains the final presentation sequences after the
+    // slave closes. macOS may return EOF without those queued bytes during a
+    // SIGHUP teardown, so the termios assertions above are the portable
+    // restoration contract.
+    #[cfg(target_os = "linux")]
     for sequence in [
         b"\x1b[?1049h".as_slice(),
         b"\x1b[?25l".as_slice(),
