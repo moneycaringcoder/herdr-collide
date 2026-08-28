@@ -51,7 +51,7 @@ jobs:
         run: cargo build --release --locked
 
   msrv:
-    name: minimum Rust 1.80
+    name: minimum Rust 1.88
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -59,7 +59,7 @@ jobs:
           persist-credentials: false
 
       - name: Install minimum Rust
-        run: rustup toolchain install 1.80.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal
 
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
@@ -72,4 +72,4 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Test minimum Rust
-        run: cargo +1.80.0 test --all --locked
+        run: cargo +1.88.0 test --all --locked

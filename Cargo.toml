@@ -2,7 +2,7 @@
 name = "collide"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Warns when agents in different git worktrees of one repo are about to collide."
 license = "MIT"
 repository = "https://github.com/moneycaringcoder/herdr-collide"
@@ -16,12 +16,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Terminal column widths and grapheme-safe truncation. Both are pure Rust and
 # keep the pane's no-wrap contract aligned with maintained Unicode tables.
-# `unicode-segmentation` 1.13 requires Rust 1.85, so the exact 1.12 release is
-# part of the declared Rust 1.80 compatibility surface.
-unicode-width = "=0.2.0"
-unicode-segmentation = "=1.12.0"
-crossterm = "0.28"
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+crossterm = "0.29"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 
 # Unix-only: setsid for daemon detachment, and SIGINT/SIGTERM shutdown plumbing.
 [target.'cfg(unix)'.dependencies]

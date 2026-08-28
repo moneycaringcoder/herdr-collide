@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
 
 use crate::collide::InteractiveGather;
@@ -27,7 +27,7 @@ pub fn run_watch(config: &Config) -> Result<()> {
     let guard = terminal::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    terminal.backend_mut().clear()?;
     let result = event_loop(config, &stop, &mut terminal);
     drop(terminal);
     drop(guard);
