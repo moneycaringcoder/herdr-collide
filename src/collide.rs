@@ -14,6 +14,7 @@
 //!   call the pure pass.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::config::Config;
@@ -734,18 +735,18 @@ pub fn gather(config: &Config) -> Result<Cycle> {
 }
 
 fn gather_retained(config: &Config) -> Result<RetainedGather> {
+    let invocation_cwds = crate::config::invocation_cwds()?;
     let mut herdr = crate::herdr::Herdr::connect()?;
     let checkouts = herdr.checkouts()?;
     let skipped = herdr.skipped_worktrees();
-    let scope = crate::config::non_empty_env("HERDR_WORKSPACE_ID");
-    let mut gathered = gather_for_retained_scoped(checkouts, config, scope.as_deref())?;
-    // A workspace herdr calls a repository but whose worktree object this client
-    // could not read is dropped, which makes the session look smaller than it
-    // is. The daemon reports that; so must the one-shot commands, which are what
-    // somebody runs when they are actually looking.
+    let mut gathered = gather_for_retained_scoped(checkouts, config, &invocation_cwds)?;
+    // A workspace whose public worktree metadata could not be reduced is
+    // dropped, which makes the session look smaller than it is. The daemon
+    // reports that; so must the one-shot commands, which are what somebody runs
+    // when they are actually looking.
     if skipped > 0 {
         gathered.cycle.notes.push(format!(
-            "{skipped} workspace(s) carried a worktree object this client could not read; \
+            "{skipped} workspace(s) carried unreadable checkout metadata; \
              they are missing from this report"
         ));
     }
@@ -907,40 +908,23 @@ fn verify_checkouts(
     })
 }
 
-/// Gathers only the verified repository containing `workspace_id`.
+/// Gathers the first verified repository represented by `invocation_cwds`.
 ///
-/// Herdr actions and pane entrypoints provide this id in their invocation
-/// environment. The daemon deliberately uses [`gather_for`] instead so its
-/// badges remain session-wide.
-pub fn gather_for_workspace(
+/// Installed actions pass focused-pane then workspace cwd from
+/// `HERDR_PLUGIN_CONTEXT_JSON`; direct CLI callers pass one process cwd.
+pub fn gather_for_invocation(
     checkouts: Vec<Checkout>,
     config: &Config,
-    workspace_id: &str,
+    invocation_cwds: &[PathBuf],
 ) -> Result<Cycle> {
-    Ok(gather_for_retained_scoped(checkouts, config, Some(workspace_id))?.cycle)
+    Ok(gather_for_retained_scoped(checkouts, config, invocation_cwds)?.cycle)
 }
 
 fn gather_for_retained(checkouts: Vec<Checkout>, config: &Config) -> Result<RetainedGather> {
-    gather_for_retained_scoped(checkouts, config, None)
+    gather_for_retained_scoped(checkouts, config, &[])
 }
 
-fn deadline_gather(
-    mut checkouts: Vec<Checkout>,
-    config: &Config,
-    workspace_id: Option<&str>,
-    detail: &str,
-) -> RetainedGather {
-    if let Some(workspace_id) = workspace_id {
-        if let Some(repo_key) = checkouts
-            .iter()
-            .find(|checkout| checkout.workspace_id == workspace_id)
-            .map(|checkout| checkout.repo_key.clone())
-        {
-            checkouts.retain(|checkout| checkout.repo_key == repo_key);
-        } else {
-            checkouts.clear();
-        }
-    }
+fn deadline_gather(checkouts: Vec<Checkout>, config: &Config, detail: &str) -> RetainedGather {
     let reason = format!(
         "{}: refresh exceeded the {}s cycle budget: {detail}",
         git::DEGRADED_CYCLE_TIMEOUT,
@@ -1002,19 +986,26 @@ fn deadline_gather(
 fn gather_for_retained_scoped(
     checkouts: Vec<Checkout>,
     config: &Config,
-    workspace_id: Option<&str>,
+    invocation_cwds: &[PathBuf],
 ) -> Result<RetainedGather> {
     let observed = checkouts.clone();
     let deadline = Instant::now() + config.cycle_timeout;
     let result = git::with_cycle_deadline(Some(deadline), || {
-        gather_for_retained_scoped_inner(checkouts, config, workspace_id)
+        gather_for_retained_scoped_inner(checkouts, config, invocation_cwds)
     });
     if Instant::now() >= deadline {
         let detail = result.as_ref().err().map_or_else(
             || "the cycle did not finish before its deadline".to_string(),
             |err| err.to_string(),
         );
-        return Ok(deadline_gather(observed, config, workspace_id, &detail));
+        if !invocation_cwds.is_empty() {
+            return Err(format!(
+                "scoped refresh exceeded the {}s cycle budget: {detail}",
+                config.cycle_timeout.as_secs()
+            )
+            .into());
+        }
+        return Ok(deadline_gather(observed, config, &detail));
     }
     result
 }
@@ -1022,29 +1013,44 @@ fn gather_for_retained_scoped(
 fn gather_for_retained_scoped_inner(
     checkouts: Vec<Checkout>,
     config: &Config,
-    workspace_id: Option<&str>,
+    invocation_cwds: &[PathBuf],
 ) -> Result<RetainedGather> {
     let mut notes = Vec::new();
 
-    // Repo identity is re-derived from git rather than trusted from herdr: two
+    // Repo identity is re-derived from git rather than trusted from Herdr: two
     // checkouts are only ever compared when their canonicalized
-    // `--git-common-dir` matches, and a symlinked or relocated worktree can
-    // easily report a repo_key that no longer agrees with it.
+    // `--git-common-dir` matches.
     let verified_read = verify_checkouts(checkouts, config.git_timeout)?;
     let mut verified = verified_read.checkouts;
     let git_dirs = verified_read.git_dirs;
     notes.extend(verified_read.notes);
-    if let Some(workspace_id) = workspace_id {
-        let repo_key = verified
-            .iter()
-            .find(|checkout| checkout.workspace_id == workspace_id)
-            .map(|checkout| checkout.repo_key.clone())
-            .ok_or_else(|| {
-                format!(
-                    "invocation workspace `{workspace_id}` is not a readable git-backed workspace"
-                )
-            })?;
-        verified.retain(|checkout| checkout.repo_key == repo_key);
+    if !invocation_cwds.is_empty() {
+        let mut rejected = Vec::new();
+        let mut selected = None;
+        for path in invocation_cwds {
+            match git::repo_key(path, config.git_timeout) {
+                Ok(repo_key)
+                    if verified
+                        .iter()
+                        .any(|checkout| checkout.repo_key == repo_key) =>
+                {
+                    selected = Some(repo_key);
+                    break;
+                }
+                Ok(_) => rejected.push(format!(
+                    "`{}` is not represented by a readable Git-backed Herdr workspace",
+                    path.display()
+                )),
+                Err(err) => rejected.push(format!("`{}` is not readable: {err}", path.display())),
+            }
+        }
+        let selected = selected.ok_or_else(|| {
+            format!(
+                "no invocation repository candidate could be selected: {}",
+                rejected.join("; ")
+            )
+        })?;
+        verified.retain(|checkout| checkout.repo_key == selected);
     }
 
     // Filled from the top-level answer `read_change_set` already needs for

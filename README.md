@@ -253,11 +253,14 @@ top-level list; it also exits cleanly on `SIGINT`, `SIGTERM`, and `SIGHUP`, and
 restores raw mode, the alternate screen, mouse capture, and the cursor on every
 return and panic path.
 
-Herdr supplies the invoking workspace to the report, JSON action, and detail
-pane. Those surfaces include every sibling worktree of that workspace's
-verified repository and no other repository. Running the binary from a shell
-with no `HERDR_WORKSPACE_ID` keeps the session-wide view, which is useful for
-scripts that intentionally inspect everything.
+Herdr supplies `HERDR_PLUGIN_CONTEXT_JSON` to the report, JSON action, and
+detail pane. Collide tries the focused pane cwd first, then the workspace cwd,
+and selects the first readable Git repository represented by the live session.
+Those surfaces include every sibling checkout of that verified repository and
+no other repository. The installed plugin root is never an invocation
+repository candidate. A direct shell invocation has no plugin context and uses
+its process cwd as its single repository candidate. The badge daemon remains
+session-wide.
 
 The badge updater is off until you enable it. Once enabled it survives a herdr restart and a
 `herdr update --handoff`: a startup hook re-spawns it, but only if you had it enabled when herdr went
@@ -409,17 +412,20 @@ badge down.
 - **`git_timeout_seconds`** — cap on any single Git invocation. Default 10 seconds.
 - **`cycle_timeout_seconds`** — wall-clock budget for one complete refresh. Default 30 seconds,
   clamped to 1–3600. When the budget expires, outstanding Git children inherit only the remaining
-  time and the cycle reports every observed checkout as `unknown` with a `cycle-timeout` note
-  instead of publishing a partially clean result.
+  time. The session-wide daemon reports observed checkouts as `unknown` with a `cycle-timeout`
+  note; a repository-scoped report fails clearly instead of widening to unrelated repositories.
 
 ## How it works
 
-Each cycle takes a single `session.snapshot` over herdr's socket — one round trip for every workspace,
-pane, and agent at once, so nothing tears while a workspace is closing. Workspaces with no worktree
-information are not repositories and are dropped. For the rest, repository identity is re-derived from
-git itself rather than trusted from the snapshot — the canonicalized common git directory — and
-checkouts are grouped by that, so two of them are only ever compared when they are genuinely the same
-repository.
+Each cycle takes one `session.snapshot` over herdr's socket for a consistent
+workspace, pane, and agent summary. Herdr 0.8.2 workspace summaries omit the
+deprecated worktree metadata, so Collide resolves repositories through the
+public `worktree.list` method. One response maps every open sibling it names;
+Collide consumes those mappings before querying another unresolved workspace,
+avoiding one list call per workspace in the same repository. Repository
+identity is then re-derived from Git — the canonicalized common Git directory —
+rather than trusted from Herdr, so two checkouts are compared only when they
+are genuinely the same repository.
 
 For each checkout, `collide` reads a change set — staged, unstaged, untracked, conflicted, and
 committed since the merge base — with read-only git plumbing. Pairs of checkouts within a repository
@@ -430,7 +436,8 @@ only what they have committed.
 
 ```mermaid
 flowchart LR
-    S["session.snapshot<br/><small>one round trip</small>"] --> G["group by repository<br/><small>canonical git-common-dir</small>"]
+    S["session.snapshot<br/><small>consistent session summary</small>"] --> W["worktree.list<br/><small>deduplicated per repository</small>"]
+    W --> G["group by repository<br/><small>verified git-common-dir</small>"]
     G --> C["change set per checkout<br/><small>dirty + committed since base</small>"]
     C --> I{"share<br/>files?"}
     I -- no --> D["dropped for free"]

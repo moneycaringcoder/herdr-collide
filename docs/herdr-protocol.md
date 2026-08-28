@@ -1,8 +1,8 @@
-# herdr socket protocol notes (verified against herdr 0.8.0, protocol 19)
+# herdr socket protocol notes (verified through herdr 0.8.2, protocol 19)
 
-Working notes for this plugin's socket client. Everything here was verified
-against a live herdr 0.8.0 server and the bundled schema (`herdr api schema
---json`), not inferred from documentation.
+Working notes for this plugin's socket client. The 0.8.2 invocation environment
+and checkout shapes were verified against a live server and the bundled schema
+(`herdr api schema --json`), not inferred from documentation.
 
 An adversarial review found five claims in an earlier version of this file that
 were wrong, and each of them had a matching bug in the code. They are corrected
@@ -11,9 +11,8 @@ quietly edited, because a note that has been wrong once is worth re-checking:
 
 - the retry that carries a call across a handoff needs a **pause**, and has to
   cover dialling as well as calling;
-- `worktree.list` is not called by this plugin at all, and its
-  `not_git_worktree` error is about the **cwd**, not about a workspace with no
-  `worktree` object;
+- `worktree.list` is the public checkout source in 0.8.2, and its
+  `not_git_worktree` error is about the resolved workspace cwd;
 - an unwritable state dir must **fail** `--enable`, not warn;
 - bounding the `--disable` wait is not enough without escalating to `SIGKILL`;
 - `agents[].agent_session` is an object and can never serve as a display name.
@@ -32,6 +31,22 @@ at all.
 `HERDR_SOCKET_PATH` is injected into every command herdr spawns (build hooks,
 startup hooks, actions, panes). Fall back to `$XDG_CONFIG_HOME/herdr/herdr.sock`
 (macOS/Linux) only for hand invocation. Treat an empty-string env var as unset.
+
+### Installed plugin invocation context
+
+Herdr 0.8.2 runs installed commands with the plugin root as process cwd and
+injects that path as `HERDR_PLUGIN_ROOT`. The user repository therefore comes
+only from `HERDR_PLUGIN_CONTEXT_JSON`, whose known fields are
+`workspace_id`, `workspace_cwd`, `focused_pane_id`, and `focused_pane_cwd`.
+Empty values are absent. Unknown fields are tolerated; malformed non-empty JSON,
+non-string known fields, and relative cwd fields are hard errors.
+
+Repository-scoped report, JSON, `--why`, and detail-pane invocations try
+`focused_pane_cwd` first and `workspace_cwd` second. A candidate must be a
+readable Git repository whose derived common-dir identity matches a verified
+Herdr checkout. The process cwd is used only by a direct CLI invocation with no
+plugin context and no plugin root. The daemon deliberately remains
+session-wide.
 
 Framing is **newline-delimited JSON**. Not length-prefixed. There is no
 `jsonrpc` field.
@@ -69,9 +84,10 @@ Consequences:
    The retry also has to cover *dialling*, not just a call on an open path.
    `connect` used to dial exactly once, so `--disable`'s sweep, `--once` and the
    daemon's shutdown clear all failed outright if they started during a handoff.
-2. `session.snapshot` is strictly better than `workspace.list` + N ×
-   `pane.list`: one connection instead of N+1, and no tearing when a workspace
-   closes mid-enumeration.
+2. `session.snapshot` gives one consistent workspace/pane/agent summary instead
+   of tearing across `workspace.list` + N × `pane.list`. Herdr 0.8.2 then needs
+   `worktree.list` for repository details; one response can map several open
+   sibling workspaces and is consumed before another workspace is queried.
 
 The one exception is `events.subscribe`, which **does** hold the connection
 open and streams `{"event": <kind>, "data": {...}}` envelopes with no `id`.
@@ -84,31 +100,20 @@ Returns flat sibling arrays joined by ID, plus `version` and `protocol`:
 
 ```
 snapshot.workspaces[]  workspace_id, number, label, focused, pane_count,
-                       tab_count, active_tab_id, agent_status,
-                       tokens?, worktree?
+                       tab_count, active_tab_id, agent_status, tokens?
 snapshot.panes[]       pane_id, terminal_id, workspace_id, tab_id, focused,
-                       agent_status, revision, cwd?, agent?, tokens?
+                       agent_status, revision, cwd?, foreground_cwd?, agent?,
+                       tokens?
 snapshot.agents[]      pane_id, tab_id, workspace_id, agent_session, name?
 snapshot.tabs[] snapshot.layouts[]
 ```
 
-`workspace.worktree` (absent entirely for non-git workspaces — confirmed on a
-live session where seven of ten workspaces had no such key at all):
-
-```
-repo_key           the .git path — canonical same-repo identity
-repo_name          the repo's directory name; we do not read it
-repo_root          main checkout root
-checkout_path      this workspace's checkout
-is_linked_worktree bool
-```
-
-The schema types the field `anyOf [WorkspaceWorktreeInfo, null]`, so an explicit
-`null` is legal even though the server does not currently send one. It means the
-same thing as an absent key: not a repo. A `worktree` that is present but is
-*neither* an object nor null, or one missing `repo_key`/`checkout_path`, is a
-protocol break; the client counts those and the daemon reports the count, because
-dropping them silently makes the session look smaller than it is.
+Herdr 0.8.2 omits the deprecated `workspace.worktree` metadata from runtime
+workspace summaries even though the compatibility schema still permits it.
+Collide therefore uses the workspace array only for identity, labels, ordering,
+and joins to pane/agent state. Pre-0.8.2 snapshots carrying
+`WorkspaceWorktreeInfo` remain readable during an upgrade, but current checkout
+discovery does not require that field.
 
 `tokens` on a workspace/pane is a **readback of what plugins have set**, which
 makes it useful for verifying our own writes in tests.
@@ -122,42 +127,34 @@ level further down.
 Note: `snapshot.protocol` and `snapshot.version` let us gate behaviour without
 shelling out to `herdr --version`.
 
-### `worktree.list` — params `{workspace_id?, cwd?}`
+### `worktree.list` — params `{"workspace_id": "..."}`
 
-**This plugin does not call it.** An earlier version of this document said
-branch names come from here and that "a later pass" fills them in; the code has
-always asked git instead (`git::current_branch`, via `collide::gather_for`),
-which is both cheaper and correct for a detached HEAD. Kept here only because
-the shape is easy to get wrong if someone reaches for it later.
-
-Returns `{source: WorktreeSourceInfo, worktrees: [WorktreeInfo]}`. Branch names
-are absent from the workspace object, so this is where they would come from.
-Match on `worktrees[].path == workspace.worktree.checkout_path`; never infer a
-branch from the directory name (verified mismatched in a live session).
-
-**The error case is about the cwd, not about the workspace.** This document used
-to say the method "returns an error envelope for a non-git workspace", meaning a
-workspace with no `worktree` object in the snapshot. That is wrong, and it is
-wrong in the direction that would have made a caller trust an empty result.
-Verified live against 0.8.0:
+This is the public repository source used for Herdr 0.8.2 workspaces. It returns
+`{source: WorktreeSourceInfo, worktrees: [WorktreeInfo]}`:
 
 ```
-worktree.list {"workspace_id":"w1B"}   -> {"type":"worktree_list", ...}
-    w1B has NO `worktree` object in the snapshot, but its cwd is inside a repo,
-    so the call succeeds and lists that repo's worktrees.
-
-worktree.list {"workspace_id":"wM"}    -> error
-    {"code":"not_git_worktree",
-     "message":"Herdr worktree actions require a workspace inside a Git work tree"}
-
-worktree.list {"cwd":"/tmp"}           -> error
-    {"code":"not_git_worktree",
-     "message":"Herdr worktree actions require a path inside a Git work tree"}
+source.repo_key
+source.repo_root
+source.source_checkout_path
+source.source_workspace_id?
+worktrees[].path
+worktrees[].branch?
+worktrees[].is_linked_worktree
+worktrees[].open_workspace_id?
 ```
 
-So `not_git_worktree` means "this path is not in a work tree", and it is data
-("not a repo"), never a transport failure — treating it as one would burn
-strikes toward the failure-shutdown threshold.
+`open_workspace_id` directly maps an entry to a snapshot workspace. Pane
+`foreground_cwd`/`cwd` containment is the fallback mapping. The source checkout
+path may be used only when `source_workspace_id` equals the workspace being
+reduced; otherwise a linked workspace could be silently mapped to the main
+checkout. Every workspace mapped by one response is consumed before Collide
+queries another unresolved workspace, deduplicating list calls per repository.
+Git re-derives common-dir identity and the final branch/head facts before
+analysis.
+
+`not_git_worktree` means the resolved workspace cwd is not inside a Git work
+tree and is ordinary non-repository data. `workspace_not_found` is likewise a
+benign close race. Other protocol or transport errors remain failures.
 
 ### `workspace.report_metadata` — the badge (default surface)
 

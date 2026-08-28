@@ -75,29 +75,21 @@ impl Herdr {
         })
     }
 
-    /// One `session.snapshot` call, reduced to the git-backed workspaces.
-    /// Workspaces with no `worktree` key are not repos and are skipped.
+    /// Reduces the live session to readable Git-backed workspaces.
+    ///
+    /// Herdr 0.8.2 removed the deprecated `worktree` metadata from
+    /// `session.snapshot` workspace summaries. For that version and newer,
+    /// `worktree.list` is the public source for repository identity and checkout
+    /// paths. Older snapshots are still understood so Collide remains usable
+    /// during a Herdr upgrade.
     pub fn checkouts(&mut self) -> Result<Vec<Checkout>> {
         let result = self.call("session.snapshot", json!({}), RetrySafety::Idempotent)?;
-        // The payload is `{"type":"session_snapshot","snapshot":{...}}`; the
-        // arrays live one level down, under `snapshot`. Verified against a live
-        // 0.8.0 server — reading them off the result object silently yields no
-        // workspaces at all, which looks exactly like an idle session.
-        //
-        // Absent `snapshot` is an error rather than a fallback: an empty
-        // checkout list is indistinguishable from an idle session, so a
-        // protocol change here would make the plugin quietly report nothing at
-        // all instead of failing.
         let snapshot = result.get("snapshot").ok_or_else(|| {
             format!(
                 "session.snapshot returned no `snapshot` object (result type `{}`)",
                 text(&result, "type").unwrap_or("missing")
             )
         })?;
-        // The same argument one level down. `workspaces` is a required field of
-        // `SessionSnapshot`, so its absence is a protocol break, not an idle
-        // session — and treating it as an empty array would hide the break
-        // exactly the way reading the arrays off `result` used to.
         if snapshot.get("workspaces").is_none() {
             return Err(format!(
                 "session.snapshot carried no `workspaces` array (snapshot keys: {})",
@@ -111,17 +103,77 @@ impl Herdr {
         {
             return Err("session.snapshot `workspaces` was not an array".into());
         }
-        let (checkouts, skipped) = reduce_snapshot(snapshot);
+
+        if !worktree_list_is_public_source(snapshot) {
+            let (checkouts, skipped) = reduce_snapshot(snapshot);
+            self.skipped_worktrees = skipped;
+            return Ok(checkouts);
+        }
+
+        let agents = workspace_agents(snapshot);
+        let mut pending: Vec<(usize, &Value)> =
+            array(snapshot, "workspaces").iter().enumerate().collect();
+        let mut checkouts = Vec::new();
+        let mut skipped = 0usize;
+        while let Some((_, workspace)) = pending.first().copied() {
+            let Some(workspace_id) = text(workspace, "workspace_id") else {
+                pending.remove(0);
+                skipped += 1;
+                continue;
+            };
+            let listed = match self.call(
+                "worktree.list",
+                json!({"workspace_id": workspace_id}),
+                RetrySafety::Idempotent,
+            ) {
+                Ok(listed) => listed,
+                Err(err)
+                    if matches!(
+                        error_code(&*err),
+                        Some("not_git_worktree" | "workspace_not_found")
+                    ) =>
+                {
+                    pending.remove(0);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if text(&listed, "type") != Some("worktree_list") {
+                return Err(format!(
+                    "worktree.list for workspace `{workspace_id}` returned result type `{}`",
+                    text(&listed, "type").unwrap_or("missing")
+                )
+                .into());
+            }
+
+            let mut mapped = Vec::new();
+            for (position, (snapshot_index, candidate)) in pending.iter().enumerate() {
+                if let Some(checkout) = reduce_worktree_list(snapshot, candidate, &agents, &listed)
+                {
+                    checkouts.push((*snapshot_index, checkout));
+                    mapped.push(position);
+                }
+            }
+            if mapped.is_empty() {
+                pending.remove(0);
+                skipped += 1;
+                continue;
+            }
+            for position in mapped.into_iter().rev() {
+                pending.remove(position);
+            }
+        }
+        checkouts.sort_by_key(|(snapshot_index, _)| *snapshot_index);
         self.skipped_worktrees = skipped;
-        Ok(checkouts)
+        Ok(checkouts
+            .into_iter()
+            .map(|(_, checkout)| checkout)
+            .collect())
     }
 
-    /// Workspaces the last `checkouts` call dropped because their `worktree`
-    /// object was there but unreadable — a `worktree` that is not an object at
-    /// all, or a workspace missing its `workspace_id`, `repo_key` or
-    /// `checkout_path`. Zero is the normal case; anything else means the plugin
-    /// is quietly seeing fewer repos than the session has, which is worth a
-    /// note rather than silence.
+    /// Workspaces the last [`checkouts`](Self::checkouts) call could not reduce
+    /// from Herdr's checkout metadata. Zero is the normal case; anything else
+    /// means the plugin is seeing fewer repositories than the session exposes.
     pub fn skipped_worktrees(&self) -> usize {
         self.skipped_worktrees
     }
@@ -267,14 +319,50 @@ fn key_list(value: &Value) -> String {
     }
 }
 
-/// Reduces a `session.snapshot` result to the git-backed workspaces. The flat
-/// sibling arrays are joined on `workspace_id`.
-/// Drops `.` components from a path herdr reports.
-///
-/// herdr echoes back whatever path a worktree was created with, so a workspace
-/// made with `--cwd .` arrives as `/home/you/repos/app/.` and would be rendered
-/// that way in the detail pane. Purely cosmetic — the path still resolves — but
-/// the pane is something people look at.
+/// Herdr 0.8.2 made `worktree.list` the public checkout source. Missing or
+/// unparseable versions take the current path rather than trusting deprecated
+/// workspace-summary fields.
+fn worktree_list_is_public_source(snapshot: &Value) -> bool {
+    text(snapshot, "version")
+        .and_then(parse_version)
+        .is_none_or(|version| version >= (0, 8, 2))
+}
+
+fn parse_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let core = raw.split_once('-').map_or(raw, |(core, _)| core);
+    let mut parts = core.split('.');
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ))
+}
+
+/// Agent display names from the flat snapshot arrays, joined on workspace id.
+fn workspace_agents(snapshot: &Value) -> Vec<(String, String)> {
+    let mut agents = Vec::new();
+    let mut record = |workspace_id: Option<&str>, name: Option<&str>| {
+        if let (Some(workspace_id), Some(name)) = (workspace_id, name) {
+            if !agents.iter().any(|(id, _)| id == workspace_id) {
+                agents.push((workspace_id.to_string(), name.to_string()));
+            }
+        }
+    };
+    for agent in array(snapshot, "agents") {
+        // `name` is the user's label ("gitsmith"); `agent` is the program
+        // ("claude"). `agent_session` is an object, not a display name.
+        record(
+            text(agent, "workspace_id"),
+            text(agent, "name").or_else(|| text(agent, "agent")),
+        );
+    }
+    for pane in array(snapshot, "panes") {
+        record(text(pane, "workspace_id"), text(pane, "agent"));
+    }
+    agents
+}
+
+/// Drops `.` components from a path Herdr reports.
 fn tidy_path(raw: &str) -> PathBuf {
     let path = Path::new(raw);
     let tidied: PathBuf = path
@@ -288,38 +376,100 @@ fn tidy_path(raw: &str) -> PathBuf {
     }
 }
 
-/// Reduces the snapshot to git-backed checkouts, and counts the workspaces that
-/// carried a `worktree` object we could not read. A workspace with no
-/// `worktree` at all is data, not a problem, and is not counted.
-fn reduce_snapshot(snapshot: &Value) -> (Vec<Checkout>, usize) {
-    let mut agents: Vec<(String, String)> = Vec::new();
-    let mut record_agent = |workspace_id: Option<&str>, name: Option<&str>| {
-        if let (Some(workspace_id), Some(name)) = (workspace_id, name) {
-            if !agents.iter().any(|(id, _)| id == workspace_id) {
-                agents.push((workspace_id.to_string(), name.to_string()));
-            }
+/// Joins one 0.8.2 workspace summary to a `worktree.list` response. Public
+/// `open_workspace_id` mappings win, followed by pane cwd containment. The
+/// response's source checkout belongs only to its explicit source workspace.
+fn reduce_worktree_list(
+    snapshot: &Value,
+    workspace: &Value,
+    agents: &[(String, String)],
+    listed: &Value,
+) -> Option<Checkout> {
+    let workspace_id = text(workspace, "workspace_id")?;
+    let source = listed.get("source")?.as_object()?;
+    let repo_key = source.get("repo_key")?.as_str()?.trim();
+    let repo_root = source.get("repo_root")?.as_str()?.trim();
+    if repo_key.is_empty() || repo_root.is_empty() {
+        return None;
+    }
+    let worktrees = listed.get("worktrees")?.as_array()?;
+    let mut panes: Vec<&Value> = array(snapshot, "panes")
+        .iter()
+        .filter(|pane| text(pane, "workspace_id") == Some(workspace_id))
+        .collect();
+    let active_tab_id = text(workspace, "active_tab_id");
+    panes.sort_by_key(|pane| {
+        if pane.get("focused").and_then(Value::as_bool) == Some(true) {
+            0
+        } else if text(pane, "tab_id") == active_tab_id {
+            1
+        } else {
+            2
         }
+    });
+    let pane_cwds = panes.iter().flat_map(|pane| {
+        [text(pane, "foreground_cwd"), text(pane, "cwd")]
+            .into_iter()
+            .flatten()
+    });
+    let fallback = if source
+        .get("source_workspace_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        == Some(workspace_id)
+    {
+        source
+            .get("source_checkout_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    } else {
+        None
     };
-    for agent in array(snapshot, "agents") {
-        // `name` is the user's own label for the agent ("gitsmith"); `agent` is
-        // the program ("claude"). `agent_session` is an object on the wire, not
-        // a string, so it is no use as a display name.
-        let name = text(agent, "name").or_else(|| text(agent, "agent"));
-        record_agent(text(agent, "workspace_id"), name);
-    }
-    for pane in array(snapshot, "panes") {
-        record_agent(text(pane, "workspace_id"), text(pane, "agent"));
-    }
+    let listed_workspace = worktrees
+        .iter()
+        .find(|worktree| text(worktree, "open_workspace_id") == Some(workspace_id))
+        .and_then(|worktree| text(worktree, "path").map(|path| (tidy_path(path), worktree)));
+    let (checkout_path, worktree) = listed_workspace.or_else(|| {
+        pane_cwds
+            .chain(fallback)
+            .find_map(|cwd| containing_worktree(cwd, worktrees))
+    })?;
 
+    Some(Checkout {
+        workspace_id: workspace_id.to_string(),
+        workspace_label: text(workspace, "label").unwrap_or(workspace_id).to_string(),
+        repo_key: RepoKey(repo_key.to_string()),
+        repo_root: tidy_path(repo_root),
+        checkout_path,
+        is_linked_worktree: worktree
+            .get("is_linked_worktree")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        branch: text(worktree, "branch").map(str::to_string),
+        agent: agents
+            .iter()
+            .find(|(id, _)| id == workspace_id)
+            .map(|(_, name)| name.clone()),
+    })
+}
+
+fn containing_worktree<'a>(cwd: &str, worktrees: &'a [Value]) -> Option<(PathBuf, &'a Value)> {
+    let cwd = tidy_path(cwd);
+    worktrees
+        .iter()
+        .filter_map(|worktree| {
+            let path = tidy_path(text(worktree, "path")?);
+            cwd.starts_with(&path).then_some((path, worktree))
+        })
+        .max_by_key(|(path, _)| path.components().count())
+}
+/// Legacy reduction for Herdr versions before 0.8.2.
+fn reduce_snapshot(snapshot: &Value) -> (Vec<Checkout>, usize) {
+    let agents = workspace_agents(snapshot);
     let mut checkouts = Vec::new();
     let mut skipped = 0usize;
     for workspace in array(snapshot, "workspaces") {
-        // No `worktree` key means the workspace is not a repo. That is data,
-        // not an error: most sessions have at least one such workspace. A
-        // `worktree` that is present but not an object is a protocol break, and
-        // is counted. (The schema permits an explicit `null` here, which the
-        // live server does not currently send; `null` is "not a repo", not a
-        // break.)
         let Some(worktree) = workspace.get("worktree") else {
             continue;
         };
@@ -335,10 +485,6 @@ fn reduce_snapshot(snapshot: &Value) -> (Vec<Checkout>, usize) {
             text(worktree, "repo_key"),
             text(worktree, "checkout_path"),
         ) else {
-            // A repo we can see but cannot address — no `workspace_id` on the
-            // workspace, or no `repo_key`/`checkout_path` on the worktree.
-            // Silently dropping it makes the session look smaller than it is,
-            // which is the failure this count exists to surface.
             skipped += 1;
             continue;
         };
@@ -353,10 +499,6 @@ fn reduce_snapshot(snapshot: &Value) -> (Vec<Checkout>, usize) {
                 .get("is_linked_worktree")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            // Branch names are absent from the workspace object. `collide`
-            // fills them in later by asking git directly
-            // (`git::current_branch`), not by calling `worktree.list` — this
-            // client never calls that method at all.
             branch: None,
             agent: agents
                 .iter()

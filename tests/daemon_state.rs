@@ -365,6 +365,72 @@ fn the_injected_env_var_wins_over_every_fallback() {
 }
 
 #[test]
+fn plugin_context_orders_focused_then_workspace_cwd_and_excludes_plugin_root() {
+    let _guard = env_lock();
+    let env = EnvGuard::new(&["HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PLUGIN_ROOT"]);
+    env.set("HERDR_PLUGIN_ROOT", "/installed/collide");
+    env.set(
+        "HERDR_PLUGIN_CONTEXT_JSON",
+        r#"{"workspace_id":"w2","workspace_cwd":"/user/workspace","focused_pane_id":"w2:p1","focused_pane_cwd":"/user/focused"}"#,
+    );
+
+    assert_eq!(
+        config::invocation_cwds().expect("valid plugin context"),
+        vec![
+            PathBuf::from("/user/focused"),
+            PathBuf::from("/user/workspace")
+        ]
+    );
+}
+
+#[test]
+fn plugin_context_uses_workspace_cwd_when_focused_pane_cwd_is_empty() {
+    let _guard = env_lock();
+    let env = EnvGuard::new(&["HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PLUGIN_ROOT"]);
+    env.set("HERDR_PLUGIN_ROOT", "/installed/collide");
+    env.set(
+        "HERDR_PLUGIN_CONTEXT_JSON",
+        r#"{"workspace_cwd":"/user/workspace","focused_pane_cwd":""}"#,
+    );
+
+    assert_eq!(
+        config::invocation_cwds().expect("workspace fallback"),
+        vec![PathBuf::from("/user/workspace")]
+    );
+}
+
+#[test]
+fn malformed_or_missing_installed_plugin_context_never_falls_back_to_plugin_root() {
+    let _guard = env_lock();
+    let env = EnvGuard::new(&["HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PLUGIN_ROOT"]);
+    env.set("HERDR_PLUGIN_ROOT", "/installed/collide");
+    env.set("HERDR_PLUGIN_CONTEXT_JSON", "not-json");
+
+    let malformed = config::invocation_cwds().expect_err("malformed context");
+    assert!(
+        malformed.to_string().contains("HERDR_PLUGIN_CONTEXT_JSON"),
+        "{malformed}"
+    );
+
+    std::env::remove_var("HERDR_PLUGIN_CONTEXT_JSON");
+    let missing = config::invocation_cwds().expect_err("missing installed context");
+    assert!(missing
+        .to_string()
+        .contains("refusing to use the plugin root"));
+}
+
+#[test]
+fn direct_invocation_has_exactly_one_process_cwd_candidate() {
+    let _guard = env_lock();
+    let _env = EnvGuard::new(&["HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PLUGIN_ROOT"]);
+
+    assert_eq!(
+        config::invocation_cwds().expect("direct cwd"),
+        vec![std::env::current_dir().expect("process cwd")]
+    );
+}
+
+#[test]
 fn the_xdg_variables_are_honoured_when_herdr_injects_nothing() {
     let _guard = env_lock();
     let env = dir_env();

@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crook::env::PluginEnv;
+use crook::env::{PluginContext, PluginEnv};
 
 use crate::Result;
 
@@ -337,6 +337,47 @@ pub fn state_dir() -> PathBuf {
 /// [`state_dir`] — a config read by hand must be the config herdr reads.
 pub fn config_dir() -> PathBuf {
     PluginEnv::resolve(PLUGIN_ID).config_dir().to_path_buf()
+}
+
+/// Repository candidates for an interactive report invocation, in precedence
+/// order.
+///
+/// Installed commands run with the plugin checkout as their process cwd, so
+/// that directory is never a valid fallback when Herdr supplied plugin
+/// context. The focused pane is tried first; the workspace cwd remains a
+/// fallback when the focused pane is not a readable repository represented in
+/// the Herdr session. A hand-run CLI has neither plugin context nor a plugin
+/// root and contributes only its process cwd.
+pub fn invocation_cwds() -> Result<Vec<PathBuf>> {
+    let plugin_env = PluginEnv::resolve(PLUGIN_ID);
+    match PluginContext::resolve()? {
+        Some(context) => {
+            let mut candidates = Vec::with_capacity(2);
+            if let Some(path) = context.focused_pane_cwd() {
+                candidates.push(path.to_path_buf());
+            }
+            if let Some(path) = context.workspace_cwd() {
+                if candidates.iter().all(|candidate| candidate != path) {
+                    candidates.push(path.to_path_buf());
+                }
+            }
+            if candidates.is_empty() {
+                return Err(
+                    "HERDR_PLUGIN_CONTEXT_JSON contains no focused pane cwd or workspace cwd"
+                        .into(),
+                );
+            }
+            Ok(candidates)
+        }
+        None if plugin_env.plugin_root().is_some() => Err(
+            "installed plugin invocation is missing HERDR_PLUGIN_CONTEXT_JSON; \
+             refusing to use the plugin root as the invocation repository"
+                .into(),
+        ),
+        None => Ok(vec![std::env::current_dir().map_err(|err| {
+            format!("could not resolve the invocation working directory: {err}")
+        })?]),
+    }
 }
 
 /// An XDG base directory. The variable wins when it is set to an absolute path
