@@ -64,11 +64,11 @@ deliberately not folded into `⧉`, whose whole meaning is *"I checked, and it m
 workspace shows nothing at all. Numbers abbreviate once they get long — `1.2k`, `12k`, `1.2M` — so a
 badge never grows wide enough to push the branch name off the row.
 
-The full picture lives in the **Collide: shared files** overlay pane, which redraws on an interval.
-Worktrees are grouped by repository, and every pairing that shares anything is listed under its group:
+The full picture lives in the interactive **Collide: shared files** overlay pane. It refreshes on the
+configured interval, groups worktrees by repository, and lists every pairing that shares anything:
 
 ```
-collide · shared files
+Collide: shared files
 
 repo /tmp/collide-demo/app
   api [feature/api] (no agent)  ✘ 2
@@ -110,6 +110,26 @@ That block is a capture from a real run against a six-worktree fixture, not a mo
 the informative tail survives, a checkout that could only be read in part says which part and what
 follows from it, and the view reflows down to very narrow panes — at 40 columns the badge is the last
 thing given up, not the first.
+
+The pane inherits the terminal theme for ordinary text. Conflict tags are red,
+overlaps yellow, runaways magenta, and unknown stays at the default foreground:
+missing information is not painted as a severity. The cursor reverses the whole
+row, and checkout details appear in a centered bordered modal.
+
+```
+  ↑ / k        previous row; scroll up in a hunk view
+  ↓ / j        next row; scroll down in a hunk view
+  mouse wheel  previous / next row, or scroll hunks
+  left click   move the cursor to that row (never open it)
+  Enter        checkout detail, or why/hunks for a shared-file row
+  R            refresh immediately
+  q / Esc      back from detail/hunks; quit from the top-level list
+```
+
+Automatic and `R` refreshes carry the cursor by stable row identity. An open
+hunk view stays open by path and is re-read from the refreshed cycle's retained
+merge tree; if the path vanished, the pane returns to the list with a note.
+Enter never runs a second merge for the cycle on screen.
 
 ## Install
 
@@ -211,6 +231,7 @@ if you leave one out, workspaces at that severity simply show nothing.
 
 | Action | What it does |
 | --- | --- |
+| **Collide: open shared files** | Opens the interactive detail pane |
 | **Collide: set up sidebar (start here)** | Adds the tokens above to `config.toml`, backs it up, reloads herdr |
 | **Collide: undo sidebar setup** | Restores the backup that setup took |
 | **Collide: report** | One-shot collision report for the focused repo |
@@ -219,9 +240,18 @@ if you leave one out, workspaces at that severity simply show nothing.
 | **Collide: disable badge updater** | Stops it and clears every badge this plugin set |
 | **Collide: toggle badge updater** | Whichever of the two applies |
 
-There is one pane, **Collide: shared files**, placed as an overlay. It runs the live detail view shown
-above and refreshes on the configured interval. Close it the way you close any herdr overlay; it exits
-cleanly on `SIGINT`, `SIGTERM`, and `SIGHUP`, and restores the cursor on every return and panic path.
+There is one pane, **Collide: shared files**, placed as an overlay. The
+`open-detail` action is its front door. A herdr keybinding can open it directly:
+
+```toml
+type = "plugin_action"
+command = "moneycaringcoder.collide.open-detail"
+```
+
+The pane refreshes on the configured interval. `q` or `Esc` closes it from the
+top-level list; it also exits cleanly on `SIGINT`, `SIGTERM`, and `SIGHUP`, and
+restores raw mode, the alternate screen, mouse capture, and the cursor on every
+return and panic path.
 
 Herdr supplies the invoking workspace to the report, JSON action, and detail
 pane. Those surfaces include every sibling worktree of that workspace's
