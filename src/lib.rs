@@ -15,5 +15,6 @@ pub mod ignore;
 pub mod model;
 pub mod render;
 pub mod setup;
+pub mod tui;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
