@@ -5,6 +5,7 @@
 
 mod run;
 mod state;
-mod view;
+pub mod view;
 
-pub use run::run_watch;
+pub use run::{map_key_event, run_watch};
+pub use state::{adopt, apply, display_order, show_hunks, Detail, Key, Mode, RowId};

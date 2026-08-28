@@ -37,8 +37,12 @@ pub enum Key {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     List,
-    CheckoutDetail { workspace_id: String },
-    OpeningHunks { path: String },
+    CheckoutDetail {
+        workspace_id: String,
+    },
+    OpeningHunks {
+        path: String,
+    },
     Hunks {
         path: String,
         text: String,
@@ -194,10 +198,9 @@ pub fn adopt(mut detail: Detail, report: &Report) -> Detail {
         .as_ref()
         .and_then(|selected| rows.iter().position(|row| row == selected))
         .or_else(|| {
-            open_path.as_deref().and_then(|path| {
-                rows.iter()
-                    .position(|row| row.shared_path() == Some(path))
-            })
+            open_path
+                .as_deref()
+                .and_then(|path| rows.iter().position(|row| row.shared_path() == Some(path)))
         })
         .unwrap_or_else(|| old_cursor.min(rows.len().saturating_sub(1)));
     detail.rows = rows;
@@ -206,14 +209,11 @@ pub fn adopt(mut detail: Detail, report: &Report) -> Detail {
 
     match &detail.mode {
         Mode::CheckoutDetail { workspace_id }
-            if !detail
-                .rows
-                .contains(&RowId::Checkout(workspace_id.clone())) =>
+            if !detail.rows.contains(&RowId::Checkout(workspace_id.clone())) =>
         {
             detail.mode = Mode::List;
-            detail.message = Some(
-                "The focused checkout vanished during refresh; returned to the list.".into(),
-            );
+            detail.message =
+                Some("The focused checkout vanished during refresh; returned to the list.".into());
         }
         Mode::OpeningHunks { path } | Mode::Hunks { path, .. }
             if !detail
@@ -240,7 +240,10 @@ pub(crate) struct RepoGroup<'a> {
 pub(crate) fn repo_groups(report: &Report) -> Vec<RepoGroup<'_>> {
     let mut grouped: BTreeMap<&RepoKey, Vec<&Checkout>> = BTreeMap::new();
     for checkout in &report.checkouts {
-        grouped.entry(&checkout.repo_key).or_default().push(checkout);
+        grouped
+            .entry(&checkout.repo_key)
+            .or_default()
+            .push(checkout);
     }
     grouped
         .into_iter()
@@ -308,13 +311,15 @@ pub fn display_order(report: &Report) -> Vec<RowId> {
                 .map(|checkout| RowId::Checkout(checkout.workspace_id.clone())),
         );
         for pairing in pairings_for_repo(report, group.key) {
-            rows.extend(files_for_pair(pairing).into_iter().map(|file| {
-                RowId::SharedFile {
-                    left_workspace_id: pairing.left_workspace_id.clone(),
-                    right_workspace_id: pairing.right_workspace_id.clone(),
-                    path: file.path.clone(),
-                }
-            }));
+            rows.extend(
+                files_for_pair(pairing)
+                    .into_iter()
+                    .map(|file| RowId::SharedFile {
+                        left_workspace_id: pairing.left_workspace_id.clone(),
+                        right_workspace_id: pairing.right_workspace_id.clone(),
+                        path: file.path.clone(),
+                    }),
+            );
         }
     }
     rows

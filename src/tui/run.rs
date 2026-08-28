@@ -34,11 +34,7 @@ pub fn run_watch(config: &Config) -> Result<()> {
     result
 }
 
-fn event_loop(
-    config: &Config,
-    stop: &AtomicBool,
-    terminal: &mut DetailTerminal,
-) -> Result<()> {
+fn event_loop(config: &Config, stop: &AtomicBool, terminal: &mut DetailTerminal) -> Result<()> {
     let mut detail = Detail::empty();
     let mut gathered: Option<InteractiveGather> = None;
     let mut mouse = view::MouseMap::default();
@@ -59,12 +55,7 @@ fn event_loop(
         if let Mode::OpeningHunks { path } = detail.mode.clone() {
             detail = match gathered.as_ref() {
                 Some(gathered) => match gathered.explain(&path) {
-                    Ok(why) => state::show_hunks(
-                        detail,
-                        path,
-                        why.text,
-                        why.prediction_failed,
-                    ),
+                    Ok(why) => state::show_hunks(detail, path, why.text, why.prediction_failed),
                     Err(err) => state::show_hunks(
                         detail,
                         path.clone(),
@@ -138,12 +129,7 @@ fn refresh(
             if let Some(path) = detail.open_hunk_path().map(str::to_string) {
                 match next.explain(&path) {
                     Ok(why) => {
-                        detail = state::show_hunks(
-                            detail,
-                            path,
-                            why.text,
-                            why.prediction_failed,
-                        );
+                        detail = state::show_hunks(detail, path, why.text, why.prediction_failed);
                     }
                     Err(err) => {
                         detail = state::show_hunks(

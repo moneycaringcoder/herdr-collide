@@ -172,7 +172,10 @@ fn render_header(
                 ""
             }
         ),
-        None => format!("waiting for session · refresh every {}s", interval.as_secs()),
+        None => format!(
+            "waiting for session · refresh every {}s",
+            interval.as_secs()
+        ),
     };
     frame.render_widget(Paragraph::new(summary).style(normal()), inner);
 }
@@ -287,9 +290,11 @@ fn body_lines(detail: &Detail, cycle: Option<&Cycle>, width: usize) -> Vec<BodyL
     let mut saw_runaway = false;
 
     for group in state::repo_groups(report) {
-        if !lines.is_empty() && !lines.last().is_some_and(|line| {
-            line.segments.len() == 1 && line.segments[0].text.is_empty()
-        }) {
+        if !lines.is_empty()
+            && !lines
+                .last()
+                .is_some_and(|line| line.segments.len() == 1 && line.segments[0].text.is_empty())
+        {
             lines.push(BodyLine::plain(""));
         }
         let root = group
@@ -307,9 +312,7 @@ fn body_lines(detail: &Detail, cycle: Option<&Cycle>, width: usize) -> Vec<BodyL
             let Some(focus) = detail.rows.iter().position(|row| row == &row_id) else {
                 continue;
             };
-            let status = status_by_id
-                .get(checkout.workspace_id.as_str())
-                .copied();
+            let status = status_by_id.get(checkout.workspace_id.as_str()).copied();
             saw_runaway |= status.is_some_and(|status| status.runaway);
             lines.push(BodyLine::focus(
                 checkout_segments(checkout, status, width),
@@ -367,10 +370,7 @@ fn body_lines(detail: &Detail, cycle: Option<&Cycle>, width: usize) -> Vec<BodyL
                 let Some(focus) = detail.rows.iter().position(|row| row == &row_id) else {
                     continue;
                 };
-                lines.push(BodyLine::focus(
-                    shared_segments(file, width),
-                    focus,
-                ));
+                lines.push(BodyLine::focus(shared_segments(file, width), focus));
             }
         }
     }
@@ -663,10 +663,7 @@ fn render_checkout_modal(
         .title(Span::styled(" Checkout detail ", normal()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(lines.join("\n")).style(normal()),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines.join("\n")).style(normal()), inner);
 }
 
 fn render_hunks(frame: &mut Frame<'_>, detail: &Detail, area: Rect) {

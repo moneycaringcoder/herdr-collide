@@ -597,10 +597,7 @@ pub(crate) fn worktree_line(
 /// matched and turned into a full explanation; git's own text is kept because
 /// it names the branch or ref involved. An unrecognised code falls through to
 /// git's text verbatim rather than being swallowed.
-pub(crate) fn degraded_notes(
-    change_set: Option<&ChangeSet>,
-    checkout: &Checkout,
-) -> Vec<String> {
+pub(crate) fn degraded_notes(change_set: Option<&ChangeSet>, checkout: &Checkout) -> Vec<String> {
     let Some(change_set) = change_set else {
         // No change set at all: the only signal left is the missing branch.
         return if checkout.branch.is_none() {
@@ -989,7 +986,6 @@ fn push_wrapped(out: &mut String, first: &str, rest: &str, text: &str, width: us
         push_line(out, &format!("{prefix}{line}"), width);
     }
 }
-
 
 /// Non-fatal problems the gathering pass collected — a checkout that vanished,
 /// a pair whose prediction failed. They belong on screen: silently dropping
