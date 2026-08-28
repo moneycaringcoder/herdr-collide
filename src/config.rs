@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crook::env::PluginEnv;
+
 use crate::Result;
 
 pub const PLUGIN_ID: &str = "moneycaringcoder.collide";
@@ -314,7 +316,7 @@ pub fn value_arg(args: &[String], name: &str) -> Result<Option<String>> {
 }
 
 pub fn plugin_id() -> String {
-    non_empty_env("HERDR_PLUGIN_ID").unwrap_or_else(|| PLUGIN_ID.to_string())
+    PluginEnv::resolve(PLUGIN_ID).plugin_id().to_owned()
 }
 
 /// Where the daemon's markers live: `~/.local/state/herdr/plugins/<id>/`.
@@ -327,29 +329,14 @@ pub fn plugin_id() -> String {
 /// state dirs: the hand-run disable found no pid file, silently did nothing,
 /// and left a daemon running that the user had no way to stop.
 pub fn state_dir() -> PathBuf {
-    non_empty_env("HERDR_PLUGIN_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            xdg_dir("XDG_STATE_HOME", ".local/state")
-                .join("herdr")
-                .join("plugins")
-                .join(plugin_id())
-        })
+    PluginEnv::resolve(PLUGIN_ID).state_dir().to_path_buf()
 }
 
 /// Where the config file lives:
 /// `~/.config/herdr/plugins/config/<id>/`. Same split-brain rule as
 /// [`state_dir`] — a config read by hand must be the config herdr reads.
 pub fn config_dir() -> PathBuf {
-    non_empty_env("HERDR_PLUGIN_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            xdg_dir("XDG_CONFIG_HOME", ".config")
-                .join("herdr")
-                .join("plugins")
-                .join("config")
-                .join(plugin_id())
-        })
+    PluginEnv::resolve(PLUGIN_ID).config_dir().to_path_buf()
 }
 
 /// An XDG base directory. The variable wins when it is set to an absolute path
