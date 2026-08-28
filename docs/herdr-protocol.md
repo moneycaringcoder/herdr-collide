@@ -143,14 +143,15 @@ worktrees[].is_linked_worktree
 worktrees[].open_workspace_id?
 ```
 
-`open_workspace_id` directly maps an entry to a snapshot workspace. Pane
-`foreground_cwd`/`cwd` containment is the fallback mapping. The source checkout
-path may be used only when `source_workspace_id` equals the workspace being
-reduced; otherwise a linked workspace could be silently mapped to the main
-checkout. Every workspace mapped by one response is consumed before Collide
-queries another unresolved workspace, deduplicating list calls per repository.
-Git re-derives common-dir identity and the final branch/head facts before
-analysis.
+`open_workspace_id` directly maps an entry to any pending snapshot workspace.
+Only the workspace that was actually queried may fall back to its pane
+`foreground_cwd`/`cwd`, or to `source_checkout_path` when
+`source_workspace_id` equals that queried workspace. Applying pane containment
+to another pending workspace would collapse a distinct nested repository such
+as `/repo/vendor/lib` into a parent `/repo` response. Every explicitly mapped
+workspace is consumed before Collide queries another unresolved workspace,
+deduplicating list calls without crossing repository domains. Git re-derives
+common-dir identity and the final branch/head facts before analysis.
 
 `not_git_worktree` means the resolved workspace cwd is not inside a Git work
 tree and is ordinary non-repository data. `workspace_not_found` is likewise a

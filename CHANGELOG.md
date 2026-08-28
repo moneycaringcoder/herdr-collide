@@ -16,9 +16,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the badge daemon remains session-wide.
 - Herdr 0.8.2 checkout discovery no longer requires deprecated
   `session.snapshot.workspaces[*].worktree` metadata. Collide consumes
-  `worktree.list` mappings for every open sibling in a response before querying
-  another unresolved workspace, and accepts `source_checkout_path` only for its
-  explicit `source_workspace_id`.
+  explicitly named open siblings before querying another unresolved workspace.
+  Pane-cwd and `source_checkout_path` fallbacks apply only to the queried
+  workspace, preventing a parent response from absorbing a distinct nested
+  repository.
 - A scoped cycle timeout now fails clearly instead of widening the report to
   unrelated repositories or comparing Herdr-provided repository keys with
   Git-derived identity.

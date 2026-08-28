@@ -1010,6 +1010,97 @@ fn source_checkout_path_never_maps_an_unrelated_linked_workspace_to_main() {
     );
 }
 
+#[test]
+fn parent_repo_response_does_not_absorb_pending_nested_repo_workspace() {
+    let _guard = env_lock();
+    let list_reply = |repo_key: &str,
+                      repo_root: &str,
+                      source_workspace_id: &str,
+                      checkout_path: &str,
+                      branch: &str| {
+        Reply::Line(
+            json!({
+                "id": "collide:list",
+                "result": {
+                    "type": "worktree_list",
+                    "source": {
+                        "repo_key": repo_key,
+                        "repo_name": branch,
+                        "repo_root": repo_root,
+                        "source_checkout_path": checkout_path,
+                        "source_workspace_id": source_workspace_id
+                    },
+                    "worktrees": [{
+                        "branch": branch,
+                        "is_bare": false,
+                        "is_detached": false,
+                        "is_linked_worktree": false,
+                        "is_prunable": false,
+                        "label": branch,
+                        "path": checkout_path
+                    }]
+                }
+            })
+            .to_string(),
+        )
+    };
+    let server = TestServer::start(vec![
+        snapshot_reply(json!({
+            "protocol": 19,
+            "version": "0.8.2",
+            "layouts": [],
+            "tabs": [],
+            "agents": [],
+            "workspaces": [
+                {"workspace_id": "wa", "label": "parent", "number": 1, "agent_status": "idle",
+                 "focused": true, "pane_count": 1, "tab_count": 1, "active_tab_id": "wa:t1"},
+                {"workspace_id": "wb", "label": "nested", "number": 2, "agent_status": "idle",
+                 "focused": false, "pane_count": 1, "tab_count": 1, "active_tab_id": "wb:t1"}
+            ],
+            "panes": [
+                {"pane_id": "wa:p1", "workspace_id": "wa", "tab_id": "wa:t1",
+                 "terminal_id": "term_a", "focused": true, "revision": 1,
+                 "agent_status": "idle", "cwd": "/repo"},
+                {"pane_id": "wb:p1", "workspace_id": "wb", "tab_id": "wb:t1",
+                 "terminal_id": "term_b", "focused": false, "revision": 1,
+                 "agent_status": "idle", "cwd": "/repo/vendor/lib"}
+            ]
+        })),
+        list_reply("/repo/.git", "/repo", "wa", "/repo", "parent"),
+        list_reply(
+            "/repo/vendor/lib/.git",
+            "/repo/vendor/lib",
+            "wb",
+            "/repo/vendor/lib",
+            "nested",
+        ),
+    ]);
+    let mut client = server.client();
+
+    let checkouts = client.checkouts().expect("nested checkout discovery");
+
+    assert_eq!(checkouts.len(), 2);
+    assert_eq!(checkouts[0].workspace_id, "wa");
+    assert_eq!(checkouts[0].repo_key.0, "/repo/.git");
+    assert_eq!(checkouts[0].checkout_path, PathBuf::from("/repo"));
+    assert_eq!(checkouts[1].workspace_id, "wb");
+    assert_eq!(checkouts[1].repo_key.0, "/repo/vendor/lib/.git");
+    assert_eq!(
+        checkouts[1].checkout_path,
+        PathBuf::from("/repo/vendor/lib")
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        parse_framed(&requests[1])["params"],
+        json!({"workspace_id": "wa"})
+    );
+    assert_eq!(
+        parse_framed(&requests[2])["params"],
+        json!({"workspace_id": "wb"})
+    );
+}
+
 /// A workspace herdr says is a repo but whose worktree object we cannot address
 /// is dropped — silently, before this, which made the session look smaller than
 /// it is. The count is what turns that into a note the daemon can print.

@@ -148,7 +148,8 @@ impl Herdr {
 
             let mut mapped = Vec::new();
             for (position, (snapshot_index, candidate)) in pending.iter().enumerate() {
-                if let Some(checkout) = reduce_worktree_list(snapshot, candidate, &agents, &listed)
+                if let Some(checkout) =
+                    reduce_worktree_list(snapshot, candidate, &agents, &listed, workspace_id)
                 {
                     checkouts.push((*snapshot_index, checkout));
                     mapped.push(position);
@@ -377,13 +378,16 @@ fn tidy_path(raw: &str) -> PathBuf {
 }
 
 /// Joins one 0.8.2 workspace summary to a `worktree.list` response. Public
-/// `open_workspace_id` mappings win, followed by pane cwd containment. The
-/// response's source checkout belongs only to its explicit source workspace.
+/// `open_workspace_id` mappings may consume any pending workspace. Pane-cwd and
+/// source-checkout fallbacks belong only to the workspace whose list request
+/// produced this response; applying them to another workspace can collapse a
+/// nested repository into its parent.
 fn reduce_worktree_list(
     snapshot: &Value,
     workspace: &Value,
     agents: &[(String, String)],
     listed: &Value,
+    queried_workspace_id: &str,
 ) -> Option<Checkout> {
     let workspace_id = text(workspace, "workspace_id")?;
     let source = listed.get("source")?.as_object()?;
@@ -393,48 +397,52 @@ fn reduce_worktree_list(
         return None;
     }
     let worktrees = listed.get("worktrees")?.as_array()?;
-    let mut panes: Vec<&Value> = array(snapshot, "panes")
-        .iter()
-        .filter(|pane| text(pane, "workspace_id") == Some(workspace_id))
-        .collect();
-    let active_tab_id = text(workspace, "active_tab_id");
-    panes.sort_by_key(|pane| {
-        if pane.get("focused").and_then(Value::as_bool) == Some(true) {
-            0
-        } else if text(pane, "tab_id") == active_tab_id {
-            1
-        } else {
-            2
-        }
-    });
-    let pane_cwds = panes.iter().flat_map(|pane| {
-        [text(pane, "foreground_cwd"), text(pane, "cwd")]
-            .into_iter()
-            .flatten()
-    });
-    let fallback = if source
-        .get("source_workspace_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        == Some(workspace_id)
-    {
-        source
-            .get("source_checkout_path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-    } else {
-        None
-    };
     let listed_workspace = worktrees
         .iter()
         .find(|worktree| text(worktree, "open_workspace_id") == Some(workspace_id))
         .and_then(|worktree| text(worktree, "path").map(|path| (tidy_path(path), worktree)));
-    let (checkout_path, worktree) = listed_workspace.or_else(|| {
-        pane_cwds
-            .chain(fallback)
-            .find_map(|cwd| containing_worktree(cwd, worktrees))
-    })?;
+    let (checkout_path, worktree) = match listed_workspace {
+        Some(mapped) => mapped,
+        None if workspace_id != queried_workspace_id => return None,
+        None => {
+            let mut panes: Vec<&Value> = array(snapshot, "panes")
+                .iter()
+                .filter(|pane| text(pane, "workspace_id") == Some(workspace_id))
+                .collect();
+            let active_tab_id = text(workspace, "active_tab_id");
+            panes.sort_by_key(|pane| {
+                if pane.get("focused").and_then(Value::as_bool) == Some(true) {
+                    0
+                } else if text(pane, "tab_id") == active_tab_id {
+                    1
+                } else {
+                    2
+                }
+            });
+            let pane_cwds = panes.iter().flat_map(|pane| {
+                [text(pane, "foreground_cwd"), text(pane, "cwd")]
+                    .into_iter()
+                    .flatten()
+            });
+            let fallback = if source
+                .get("source_workspace_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                == Some(workspace_id)
+            {
+                source
+                    .get("source_checkout_path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+            } else {
+                None
+            };
+            pane_cwds
+                .chain(fallback)
+                .find_map(|cwd| containing_worktree(cwd, worktrees))?
+        }
+    };
 
     Some(Checkout {
         workspace_id: workspace_id.to_string(),
