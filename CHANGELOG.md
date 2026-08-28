@@ -16,6 +16,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Worktree/workspace lifecycle event hooks now wake an enabled updater through
   an internal `--refresh`/`SIGUSR1` path. Ordinary edits continue polling
   because herdr exposes no filesystem event.
+- The `--watch`/`detail` surface is now an interactive ratatui pane. Keyboard
+  and mouse navigation focus checkout and shared-file rows; Enter opens
+  degraded checkout detail or the existing `--why` explanation from the exact
+  retained prediction tree. Refreshes preserve cursor and open-hunk identity,
+  and the new `open-detail` action provides a bindable pane front door.
 
 ### Changed
 

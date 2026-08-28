@@ -66,6 +66,13 @@ placement = "overlay"
 command = ["./target/release/collide", "--watch"]
 
 [[actions]]
+id = "open-detail"
+title = "Collide: open shared files"
+description = "Open the interactive shared-file detail pane."
+contexts = ["global", "workspace"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin moneycaringcoder.collide --entrypoint detail"]
+
+[[actions]]
 id = "report"
 title = "Collide: report"
 description = "One-shot collision snapshot for the focused repo."

@@ -2,7 +2,7 @@
 //!
 //! Verb dispatch only; every verb is implemented in the library crate.
 
-use collide::{collide as analysis, config, daemon, history, render, setup, Result};
+use collide::{collide as analysis, config, daemon, history, setup, tui, Result};
 
 const USAGE: &str = "\
 collide — cross-worktree collision warnings for herdr
@@ -146,7 +146,7 @@ fn run(args: &[String]) -> Result<()> {
     match verb {
         "--once" => analysis::run_once(&config::load_with_args(args)?),
         "--json" => analysis::run_json(&config::load_with_args(args)?),
-        "--watch" => render::run_watch(&config::load_with_args(args)?),
+        "--watch" => tui::run_watch(&config::load_with_args(args)?),
         "--why" => {
             let path = config::value_arg(args, "--why")?.ok_or("--why needs a value")?;
             if path.trim().is_empty() {

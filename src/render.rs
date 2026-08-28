@@ -1,14 +1,12 @@
-//! Rendering: the badge string that rides a workspace token, and the live
-//! detail pane.
+//! Plain-text rendering and display-width helpers.
 //!
-//! Nothing here emits colour. herdr renders a token's *value* as flat text and
-//! cannot colour by content, so severity travels in the token *name*
-//! (`Severity::token_name`) and the strings below stay plain — see
-//! `docs/herdr-protocol.md`. The detail pane is likewise plain text: there is no
-//! colour library in this crate's dependency set.
+//! This module itself emits no colour. herdr renders a token's *value* as flat
+//! text and cannot colour by content, so badge severity travels in the token
+//! *name* (`Severity::token_name`). The interactive ratatui pane lives in
+//! `crate::tui` and reuses the width and wording helpers here.
 //!
-//! The formatting half of the module is pure and is what `tests/render.rs`
-//! exercises. Only `run_watch` talks to herdr or git.
+//! The formatting in this module is pure and is what `tests/render.rs`
+//! exercises.
 //!
 //! # Width model
 //!
@@ -21,20 +19,14 @@
 //! every other user, so the narrow reading stands.
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
-use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::Config;
 use crate::git;
 use crate::model::{
     ChangeSet, Checkout, FileVerdict, Pairing, RepoKey, Report, Severity, TargetVerdict,
     WorkspaceStatus,
 };
-use crate::Result;
 
 /// A badge sits in the sidebar next to a branch name. Six display columns is
 /// the budget; anything longer starts pushing the branch out of view.
@@ -298,13 +290,10 @@ pub fn detail_with_notes(report: &Report, notes: &[String], columns: usize) -> S
             .filter(|p| pairing_repo(p, &checkout_by_id) == Some(repo_key))
             .filter(|p| !p.shared.is_empty())
             .collect();
-        // Worst first. The pane does not scroll and `draw` cuts the tail, so
-        // with twenty worktrees — a hundred and ninety pairings — an
-        // alphabetical order put the one conflicting pair off the bottom of the
-        // screen behind six screens of clean overlaps.
-        // Re-tie equal severities on labels because this pane is read by humans;
+        // Worst first so a bounded consumer sees the most consequential pairs.
+        // Re-tie equal severities on labels because this text is read by humans;
         // the model's id tie-break instead serves scriptable output. Both keys
-        // are total, so neither view can flicker between cycles.
+        // are total, so neither rendering order can flicker between cycles.
         pairings.sort_by_key(|p| {
             (
                 p.severity_rank_key(),
@@ -508,7 +497,7 @@ fn sort_key(checkout: &Checkout) -> (&str, &str) {
     (label_of(checkout), checkout.workspace_id.as_str())
 }
 
-fn label_of(checkout: &Checkout) -> &str {
+pub(crate) fn label_of(checkout: &Checkout) -> &str {
     let label = checkout.workspace_label.trim();
     if label.is_empty() {
         &checkout.workspace_id
@@ -542,7 +531,11 @@ fn pairing_repo<'a>(
 /// it at all. Here the badge is reserved first, the `runaway` word is the slack
 /// that gets dropped when the line will not fit, and the identity on the left is
 /// truncated around what is left.
-fn worktree_line(checkout: &Checkout, status: Option<&WorkspaceStatus>, width: usize) -> String {
+pub(crate) fn worktree_line(
+    checkout: &Checkout,
+    status: Option<&WorkspaceStatus>,
+    width: usize,
+) -> String {
     let branch = checkout
         .branch
         .as_deref()
@@ -604,7 +597,7 @@ fn worktree_line(checkout: &Checkout, status: Option<&WorkspaceStatus>, width: u
 /// matched and turned into a full explanation; git's own text is kept because
 /// it names the branch or ref involved. An unrecognised code falls through to
 /// git's text verbatim rather than being swallowed.
-fn degraded_notes(change_set: Option<&ChangeSet>, checkout: &Checkout) -> Vec<String> {
+pub(crate) fn degraded_notes(change_set: Option<&ChangeSet>, checkout: &Checkout) -> Vec<String> {
     let Some(change_set) = change_set else {
         // No change set at all: the only signal left is the missing branch.
         return if checkout.branch.is_none() {
@@ -669,7 +662,7 @@ fn explain_reason(reason: &str) -> String {
     }
 }
 
-fn is_unmerged(change_set: Option<&ChangeSet>) -> bool {
+pub(crate) fn is_unmerged(change_set: Option<&ChangeSet>) -> bool {
     change_set
         .and_then(|set| set.degraded_reason.as_deref())
         .map(|reason| {
@@ -680,7 +673,10 @@ fn is_unmerged(change_set: Option<&ChangeSet>) -> bool {
         .unwrap_or(false)
 }
 
-fn uncomparable_submodule_paths<'a>(report: &Report, pairing: &'a Pairing) -> Vec<&'a str> {
+pub(crate) fn uncomparable_submodule_paths<'a>(
+    report: &Report,
+    pairing: &'a Pairing,
+) -> Vec<&'a str> {
     pairing
         .shared
         .iter()
@@ -705,7 +701,7 @@ fn uncomparable_submodule_paths<'a>(report: &Report, pairing: &'a Pairing) -> Ve
         .collect()
 }
 
-fn verdict_rank(verdict: FileVerdict) -> u8 {
+pub(crate) fn verdict_rank(verdict: FileVerdict) -> u8 {
     match verdict {
         FileVerdict::Conflict => 0,
         FileVerdict::Unknown => 1,
@@ -713,7 +709,7 @@ fn verdict_rank(verdict: FileVerdict) -> u8 {
     }
 }
 
-fn verdict_marks(verdict: FileVerdict) -> (&'static str, &'static str) {
+pub(crate) fn verdict_marks(verdict: FileVerdict) -> (&'static str, &'static str) {
     match verdict {
         FileVerdict::Conflict => (CONFLICT_MARK, "conflict"),
         FileVerdict::Unknown => (UNKNOWN_MARK, "unknown"),
@@ -991,116 +987,6 @@ fn push_wrapped(out: &mut String, first: &str, rest: &str, text: &str, width: us
     }
 }
 
-// ---------------------------------------------------------------------------
-// Watch loop
-// ---------------------------------------------------------------------------
-
-const CLEAR_SCREEN: &str = "\u{1b}[H\u{1b}[2J";
-const HIDE_CURSOR: &str = "\u{1b}[?25l";
-const SHOW_CURSOR: &str = "\u{1b}[?25h";
-const RESET_ATTRS: &str = "\u{1b}[0m";
-
-static CURSOR_PANIC_HOOK: Once = Once::new();
-
-fn restore_stdout() {
-    let mut out = std::io::stdout();
-    let _ = write!(out, "{SHOW_CURSOR}{RESET_ATTRS}");
-    let _ = out.flush();
-}
-
-/// Restores terminal presentation on every ordinary return, including an I/O
-/// error or a signal-driven stop.
-struct CursorGuard;
-
-impl Drop for CursorGuard {
-    fn drop(&mut self) {
-        restore_stdout();
-    }
-}
-
-/// The release profile aborts on panic, so `Drop` cannot cover that path.
-/// Install one process-wide hook before hiding the cursor and restore it before
-/// the normal diagnostic hook runs.
-fn install_cursor_panic_hook() {
-    CURSOR_PANIC_HOOK.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            restore_stdout();
-            previous(info);
-        }));
-    });
-}
-
-/// `--watch`: render the detail view on an interval until interrupted.
-///
-/// This runs inside a herdr overlay pane, so it clears and redraws in place
-/// rather than scrolling, sizes itself from the real terminal every frame, and
-/// restores the cursor on ordinary return, SIGINT, SIGTERM, SIGHUP, and the
-/// release profile's abort-on-panic path.
-pub fn run_watch(config: &Config) -> Result<()> {
-    let stop = Arc::new(AtomicBool::new(false));
-    register_stop_signals(&stop)?;
-    install_cursor_panic_hook();
-    let _cursor = CursorGuard;
-
-    let mut out = std::io::stdout();
-    let _ = write!(out, "{HIDE_CURSOR}");
-    let _ = out.flush();
-
-    watch_loop(config, &stop, &mut out)
-}
-
-fn watch_loop(config: &Config, stop: &AtomicBool, out: &mut impl Write) -> Result<()> {
-    while !stop.load(Ordering::Relaxed) {
-        let (columns, rows) = terminal_size();
-        // `collide::gather` is the one gathering pipeline; the pane renders what
-        // it produces rather than assembling a second, subtly different one.
-        let frame = match crate::collide::gather(config) {
-            Ok(cycle) => detail_with_notes(&cycle.report, &cycle.notes, columns),
-            Err(err) => error_frame(&err.to_string(), columns),
-        };
-        draw(out, &frame, rows)?;
-        if !sleep_interruptibly(config.interval, stop) {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn draw(out: &mut impl Write, frame: &str, rows: usize) -> Result<()> {
-    // One line is left free so the last row cannot scroll the screen up.
-    let budget = rows.saturating_sub(1).max(1);
-    let total = frame.lines().count();
-
-    let mut buffer = String::with_capacity(frame.len() + 64);
-    buffer.push_str(CLEAR_SCREEN);
-    if total <= budget {
-        buffer.push_str(frame);
-    } else {
-        for line in frame.lines().take(budget.saturating_sub(1)) {
-            buffer.push_str(line);
-            buffer.push('\n');
-        }
-        buffer.push_str(&format!("... {} more lines\n", total - (budget - 1)));
-    }
-
-    out.write_all(buffer.as_bytes())?;
-    out.flush()?;
-    Ok(())
-}
-
-fn error_frame(message: &str, columns: usize) -> String {
-    let width = columns.max(MIN_COLUMNS);
-    let mut out = String::new();
-    push_line(&mut out, TITLE, width);
-    out.push('\n');
-    push_wrapped(&mut out, "", "", "Could not read the session:", width);
-    push_wrapped(&mut out, "  ", "  ", message, width);
-    out.push('\n');
-    push_wrapped(&mut out, "", "", "Retrying on the next refresh.", width);
-    out
-}
-
 /// Non-fatal problems the gathering pass collected — a checkout that vanished,
 /// a pair whose prediction failed. They belong on screen: silently dropping
 /// them renders as a suspiciously clean report.
@@ -1115,72 +1001,6 @@ fn notes_section(notes: &[String], width: usize) -> String {
         push_wrapped(&mut out, "  ", "    ", note, width);
     }
     out
-}
-
-fn sleep_interruptibly(interval: Duration, stop: &AtomicBool) -> bool {
-    let slice = Duration::from_millis(100);
-    let mut remaining = interval;
-    while !remaining.is_zero() {
-        if stop.load(Ordering::Relaxed) {
-            return false;
-        }
-        let step = slice.min(remaining);
-        std::thread::sleep(step);
-        remaining -= step;
-    }
-    !stop.load(Ordering::Relaxed)
-}
-
-#[cfg(unix)]
-fn register_stop_signals(stop: &Arc<AtomicBool>) -> Result<()> {
-    for signal in [
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-    ] {
-        signal_hook::flag::register(signal, Arc::clone(stop))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn register_stop_signals(_stop: &Arc<AtomicBool>) -> Result<()> {
-    Ok(())
-}
-
-/// Terminal size in (columns, rows). The pane may be narrower than we would
-/// like, so this is read every frame rather than cached.
-fn terminal_size() -> (usize, usize) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-
-        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-        let fd = std::io::stdout().as_raw_fd();
-        // SAFETY: `size` is a correctly sized, owned `winsize`.
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) };
-        if rc == 0 && size.ws_col > 0 {
-            let rows = if size.ws_row > 0 {
-                size.ws_row as usize
-            } else {
-                24
-            };
-            return (size.ws_col as usize, rows);
-        }
-    }
-    env_terminal_size()
-}
-
-fn env_terminal_size() -> (usize, usize) {
-    let columns = crate::config::non_empty_env("COLUMNS")
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|c| *c > 0)
-        .unwrap_or(DEFAULT_COLUMNS);
-    let rows = crate::config::non_empty_env("LINES")
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|r| *r > 0)
-        .unwrap_or(24);
-    (columns, rows)
 }
 
 #[cfg(test)]

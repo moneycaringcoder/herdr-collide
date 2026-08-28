@@ -752,6 +752,37 @@ fn gather_retained(config: &Config) -> Result<RetainedGather> {
     Ok(gathered)
 }
 
+/// One live-pane refresh, including the temporary object store and merge trees
+/// that produced its verdicts. Keeping this opaque prevents presentation code
+/// from reaching into prediction internals while still letting Enter explain
+/// the exact cycle currently on screen.
+pub(crate) struct InteractiveGather {
+    retained: RetainedGather,
+}
+
+impl InteractiveGather {
+    pub(crate) fn cycle(&self) -> &Cycle {
+        &self.retained.cycle
+    }
+
+    pub(crate) fn explain(&self, path: &str) -> Result<WhyReport> {
+        explain_path(&self.retained, path)
+    }
+}
+
+/// Gathers the interactive pane's report and retains its prediction trees.
+///
+/// The pane always predicts: its drill-down promises the same answer as
+/// `--why`, which likewise enables prediction even when passive badge
+/// prediction was disabled in configuration.
+pub(crate) fn gather_interactive(config: &Config) -> Result<InteractiveGather> {
+    let mut gather_config = config.clone();
+    gather_config.predict_conflicts = true;
+    Ok(InteractiveGather {
+        retained: gather_retained(&gather_config)?,
+    })
+}
+
 /// The ref one checkout's change set is measured against.
 ///
 /// A `base_ref` the user actually set wins outright, whether it resolves or
