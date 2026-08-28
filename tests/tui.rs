@@ -242,7 +242,7 @@ fn refresh_preserves_cursor_and_open_hunk_path_then_reports_disappearance() {
 }
 
 #[test]
-fn hunks_view_renders_real_diff3_markers_from_the_conflicting_fixture() {
+fn hunks_view_renders_real_conflict_markers_from_the_fixture() {
     let fixture = Fixture::new("tui-hunks");
     let pair = fixture.committed_conflict_pair();
     let config = Config {
@@ -256,6 +256,10 @@ fn hunks_view_renders_real_diff3_markers_from_the_conflicting_fixture() {
         checkout("right-worktree", &pair.1, &key.0),
     ];
     let why = why_for(checkouts.clone(), &config, "conflict.txt").expect("why report");
+    // Git versions differ on whether merge-tree includes the base (`|||||||`)
+    // section. The TUI contract is to preserve the existing why output, not
+    // invent a marker that Git did not produce.
+    let has_diff3_base = why.text.contains("|||||||");
     let cycle = gather_for(checkouts, &config).expect("collision report");
     let detail = show_hunks(
         adopt(Detail::empty(), &cycle.report),
@@ -265,8 +269,11 @@ fn hunks_view_renders_real_diff3_markers_from_the_conflicting_fixture() {
     );
 
     let rendered = draw(&detail, Some(&cycle), 100, 24).text;
-    for marker in ["<<<<<<<", "|||||||", "=======", ">>>>>>>"] {
+    for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
         assert!(rendered.contains(marker), "missing {marker}:\n{rendered}");
+    }
+    if has_diff3_base {
+        assert!(rendered.contains("|||||||"), "{rendered}");
     }
     assert!(rendered.contains("ALPHA-A"), "{rendered}");
     assert!(rendered.contains("ALPHA-B"), "{rendered}");
